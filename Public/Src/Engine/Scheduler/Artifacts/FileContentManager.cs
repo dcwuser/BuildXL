@@ -1954,20 +1954,27 @@ namespace BuildXL.Scheduler.Artifacts
                 // start of the build on a distributed worker
                 state.RemoveCompletedMaterializations();
 
+                /*
                 success &= await TryLoadAvailableContentAsync(
                     operationContext,
                     pipInfo,
                     state);
+                */
 
                 if (!materialize)
                 {
+                    success &= await TryLoadAvailableContentAsync(
+                        operationContext,
+                        pipInfo,
+                        state);
+
                     return success;
                 }
 
                 // Remove the failures
                 // After calling TryLoadAvailableContentAsync some files may be marked completed (as failures)
                 // we need to remove them so we don't try to place them
-                state.RemoveCompletedMaterializations();
+                //state.RemoveCompletedMaterializations();
 
                 // Maybe we didn't manage to fetch all of the remote content. However, for the content that was fetched,
                 // we still are mandated to finish materializing if possible and eventually complete the materialization task.
@@ -2053,6 +2060,27 @@ namespace BuildXL.Scheduler.Artifacts
                                                     fileName: fileName,
                                                     symlinkTarget: symlinkTarget,
                                                     reparsePointInfo: materializationInfo.ReparsePointInfo);
+                                                    
+                                                if (!possiblyPlaced.Succeeded)
+                                                {
+                                                    // If placement failed due to content not available, try to recover the content
+                                                    // and, if successful, re-place the file.
+                                                    // TODO: Can we make this check distinguish between content-not-found
+                                                    // failures and other failure modes?
+                                                    bool isRecovered = await TryRecoverContentAsync(operationContext, pipInfo.UnderlyingPip, state.MaterializingOutputs, hash, file, state, materializationFileIndex);
+                                                    if (isRecovered)
+                                                    {
+                                                      possiblyPlaced = await LocalDiskContentStore.TryMaterializeAsync(
+                                                      ArtifactContentCache,
+                                                      fileRealizationModes: GetFileRealizationMode(allowReadOnly: allowReadOnly),
+                                                      path: file.Path,
+                                                      contentHash: hash,
+                                                      fileName: fileName,
+                                                      symlinkTarget: symlinkTarget,
+                                                      reparsePointInfo: materializationInfo.ReparsePointInfo);
+                                                    }
+                                                }
+
                                                 possiblyPlaced = WithLineInfo(possiblyPlaced);
                                             }
                                         }
@@ -2180,6 +2208,187 @@ namespace BuildXL.Scheduler.Artifacts
         }
 
         /// <summary>
+        /// Tries to recover content that was wanted but not found in the cache.
+        /// </summary>
+        private async Task<bool> TryRecoverContentAsync(
+            OperationContext operationContext,
+            Pip pip,
+            bool materializingOutputs,
+            ContentHash contentHash,
+            FileArtifact fileArtifact,
+            PipArtifactsState state,
+            int currentFileIndex
+        )
+        {
+            Interlocked.Increment(ref m_stats.FileRecoveryAttempts);
+
+            bool isAvailable = false;
+
+            Possible<ContentDiscoveryResult, Failure>? existingContent = null;
+
+            bool isPreservedOutputFile = IsPreservedOutputFile(pip, materializingOutputs, fileArtifact);
+            bool shouldDiscoverContentOnDisk =
+                Configuration.Schedule.ReuseOutputsOnDisk ||
+                !Configuration.Schedule.StoreOutputsToCache ||
+                isPreservedOutputFile;
+
+            if (shouldDiscoverContentOnDisk)
+            {
+                using (operationContext.StartOperation(OperationCounter.FileContentManagerDiscoverExistingContent, fileArtifact))
+                {
+                    // Discover the existing file (if any) and get its content hash
+                    existingContent =
+                        await LocalDiskContentStore.TryDiscoverAsync(fileArtifact);
+                }
+            }
+
+            if (existingContent.HasValue &&
+                existingContent.Value.Succeeded &&
+                existingContent.Value.Result.TrackedFileContentInfo.FileContentInfo.Hash == contentHash)
+            {
+                Contract.Assert(shouldDiscoverContentOnDisk);
+
+                //targetLocationUpToDate = TargetUpToDate;
+
+                if (isPreservedOutputFile || !Configuration.Schedule.StoreOutputsToCache)
+                {
+                    // If file should be preserved, then we do not restore its content back to the cache.
+                    // If the preserved file is copied using a copy-file pip, then the materialization of
+                    // the copy-file destination relies on the else-clause below where we try to get
+                    // other file using TryGetFileArtifactForHash.
+                    // If we don't store outputs to cache, then we should not include cache operation to determine
+                    // if the content is available. However, we just checked, by TryDiscoverAsync above, that the content 
+                    // is available with the expected content hash. Thus, we can safely say that the content is available.
+                    isAvailable = true;
+                }
+                else
+                {
+                    // The file has the correct hash so we can restore it back into the cache for future use/retention.
+                    // But don't restore files that need to be preserved because they were not stored to the cache.
+                    var possiblyStored =
+                        await RestoreContentInCacheAsync(
+                            operationContext,
+                            pip,
+                            materializingOutputs,
+                            fileArtifact,
+                            contentHash,
+                            fileArtifact);
+
+                    // Try to be conservative here due to distributed builds (e.g., the files may not exist on other machines).
+                    isAvailable = possiblyStored.Succeeded;
+                }
+
+                if (isAvailable)
+                {
+                    // Content is up to date and available, so just mark the file as successfully materialized.
+                    state?.SetMaterializationSuccess(currentFileIndex, ContentMaterializationOrigin.UpToDate, operationContext);
+                }
+            }
+            else
+            {
+                //if (shouldDiscoverContentOnDisk)
+                //{
+                //    targetLocationUpToDate = TargetNotUpToDate;
+                //}
+
+                // If the up-to-dateness of file on disk is not checked, or the file on disk is not up-to-date,
+                // then fall back to using the cache.
+
+                // Attempt to find a materialized file for the hash and store that
+                // into the cache to ensure the content is available
+                // This is mainly used for incremental scheduling which does not account
+                // for content which has been evicted from the cache when performing copies
+                FileArtifact otherFile = TryGetFileArtifactForHash(contentHash);
+                if (!otherFile.IsValid)
+                {
+                    FileArtifact copyOutput = fileArtifact;
+                    FileArtifact copySource;
+                    while (m_host.TryGetCopySourceFile(copyOutput, out copySource))
+                    {
+                        // Use the source of the copy file as the file to restore
+                        otherFile = copySource;
+
+                        if (copySource.IsSourceFile)
+                        {
+                            // Reached a source file. Just abort rather than calling the host again. 
+                            break;
+                        }
+
+                        // Try to keep going back through copy chain
+                        copyOutput = copySource;
+                    }
+                }
+
+                if (otherFile.IsValid)
+                {
+                    if (otherFile.IsSourceFile || IsFileMaterialized(otherFile))
+                    {
+                        var possiblyStored =
+                            await RestoreContentInCacheAsync(
+                                operationContext,
+                                pip,
+                                materializingOutputs,
+                                otherFile,
+                                contentHash,
+                                fileArtifact);
+
+                        isAvailable = possiblyStored.Succeeded;
+                    }
+                    else if (state != null && m_host.CanMaterializeFile(otherFile))
+                    {
+                        // Add the file containing the required content to the list of files to be materialized.
+                        // The added to the list rather than inlining the materializing to prevent duplicate/concurrent
+                        // materializations of the same file. It also ensures that the current file waits on the materialization
+                        // of the other file before attempting materialization.
+
+                        if (!TryGetInputContent(otherFile, out var otherFileMaterializationInfo))
+                        {
+                            // Need to set the materialization info in case it is not set on the current machine (i.e. distributed worker)
+                            // This can happen with copied write file outputs. Since the hash of the write file output will not be transferred to worker
+                            // but instead the copied output consumed by the pip will be transferred. We use the hash from the copied file since it is
+                            // the same. We recreate without the file name because copied files can have different names that the originating file.
+                            otherFileMaterializationInfo = FileMaterializationInfo.CreateWithUnknownName(state.MaterializationFiles[currentFileIndex].MaterializationInfo.FileContentInfo);
+                            ReportInputContent(otherFile, otherFileMaterializationInfo);
+                        }
+
+                        // Example (dataflow graph)
+                        // W[F_W0] -> C[F_C0] -> P1,P2
+                        // Where 'W' is a write file which writes an output 'F_W0' with hash '#W0'
+                        // Where 'C' is a copy file which copies 'F_W0' to 'F_C0' (with hash '#W0').
+                        // Where 'P1' and 'P2' are consumers of 'F_C0'
+
+                        // In this case when P1 materializes inputs,
+                        // This list of materialized files are:
+                        // 0: F_C0 = #W0 (i.e. materialize file with hash #W0 at the location F_C0)
+
+                        // When processing F_C0 (currentFileIndex=0) we enter this call and
+                        // The add file materialization call adds an entry to the list of files to materialize
+                        // and modifies F_C0 entry to wait for the completion of F_W0
+                        // 0: C0 = #W0 (+ wait for F_W0 to complete materialization)
+                        // + 1: F_W0 = #W0
+
+                        AddFileMaterialization(
+                            state,
+                            otherFile,
+                            allowReadOnlyOverride: null,
+                            symlinkTarget: AbsolutePath.Invalid,
+                            // Ensure that the current file waits on the materialization before attempting its materialization.
+                            // This ensures that content is present in the cache
+                            dependentFileIndex: currentFileIndex);
+                        isAvailable = true;
+                    }
+                }
+            }
+
+            if (isAvailable)
+            {
+                Interlocked.Increment(ref m_stats.FileRecoverySuccesses);
+            }
+
+            return isAvailable;
+        }
+
+        /// <summary>
         /// Attempt to bring multiple file contents into the local cache.
         /// </summary>
         /// <remarks>
@@ -2195,8 +2404,10 @@ namespace BuildXL.Scheduler.Artifacts
             bool onlyLogUnavailableContent = false,
             PipArtifactsState state = null)
         {
+            /*
             const string TargetUpToDate = "True";
             const string TargetNotUpToDate = "False";
+            */
             const string TargetNotChecked = "Not Checked";
 
             bool success = true;
@@ -2253,6 +2464,10 @@ namespace BuildXL.Scheduler.Artifacts
 
                         if (!isAvailable)
                         {
+                            // Try to recover content that has disappeared from the cache.
+                            isAvailable = await TryRecoverContentAsync(operationContext, pipInfo.UnderlyingPip, materializingOutputs, contentHash, fileArtifact, state, currentFileIndex);
+
+                            /*
                             Possible<ContentDiscoveryResult, Failure>? existingContent = null;
 
                             bool isPreservedOutputFile = IsPreservedOutputFile(pipInfo.UnderlyingPip, materializingOutputs, fileArtifact);
@@ -2407,6 +2622,7 @@ namespace BuildXL.Scheduler.Artifacts
                                     }
                                 }
                             }
+                            */
                         }
 
                         // Log the result of each requested hash
