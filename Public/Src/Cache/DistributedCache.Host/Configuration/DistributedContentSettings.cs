@@ -17,6 +17,26 @@ namespace BuildXL.Cache.Host.Configuration
     [DataContract]
     public class DistributedContentSettings
     {
+        private const int DefaultMaxConcurrentCopyOperations = 512;
+
+        internal static readonly int[] DefaultRetryIntervalForCopiesMs = 
+            new int[]
+            {
+                // retry the first 2 times quickly.
+                20,
+                200,
+
+                // then back-off exponentially.
+                1000,
+                5000,
+                10000,
+                30000,
+
+                // Borrowed from Empirical CacheV2 determined to be appropriate for general remote server restarts.
+                60000,
+                120000,
+            };
+
         [JsonConstructor]
         private DistributedContentSettings()
         {
@@ -74,6 +94,17 @@ namespace BuildXL.Cache.Host.Configuration
         [DataMember]
         public int ContentHashBumpTimeMinutes { get; set; } = 2880;
 
+        private int _redisMemoizationExpiryTimeMinutes;
+
+        /// <summary>
+        /// TTL to be set in Redis for memoization entries.
+        /// </summary>
+        [DataMember]
+        public int RedisMemoizationExpiryTimeMinutes {
+            get => _redisMemoizationExpiryTimeMinutes == 0 ? ContentHashBumpTimeMinutes : _redisMemoizationExpiryTimeMinutes;
+            set => _redisMemoizationExpiryTimeMinutes = value;
+        }
+
         /// <summary>
         /// The map of environment to connection secrets
         /// </summary>
@@ -103,6 +134,9 @@ namespace BuildXL.Cache.Host.Configuration
         [DataMember]
         public bool CheckLocalFiles { get; set; } = false;
 
+        [DataMember]
+        public int MaxShutdownDurationInMinutes { get; set; } = 30;
+
         /// <summary>
         /// Whether to use old (original) implementation of QuotaKeeper or to use the new one.
         /// </summary>
@@ -114,6 +148,24 @@ namespace BuildXL.Cache.Host.Configuration
         /// </summary>
         [DataMember]
         public bool StartPurgingAtStartup { get; set; } = true;
+
+        /// <summary>
+        /// If true, then content store will start a self-check to validate that the content in cache is valid at startup.
+        /// </summary>
+        [DataMember]
+        public bool StartSelfCheckAtStartup { get; set; } = false;
+
+        /// <summary>
+        /// An interval between self checks performed by a content store to make sure that all the data on disk matches it's hashes.
+        /// </summary>
+        [DataMember]
+        public int SelfCheckFrequencyInMinutes { get; set; } = (int)TimeSpan.FromDays(1).TotalMinutes;
+
+        /// <summary>
+        /// An epoch used for reseting self check of a content directory.
+        /// </summary>
+        [DataMember]
+        public string SelfCheckEpoch { get; set; } = "E0";
 
         /// <summary>
         /// Whether to use native (unmanaged) file enumeration or not.
@@ -148,6 +200,42 @@ namespace BuildXL.Cache.Host.Configuration
         [DataMember]
         public long MaxBlobCapacity { get; set; } = 1024 * 1024 * 1024;
 
+        /// <summary>
+        /// Indicates the window size for executing eviction.
+        /// </summary>
+        [DataMember]
+        public int EvictionWindowSize { get; set; } = 500;
+
+        private int[] _retryIntervalForCopiesMs =
+            new int[]
+            {
+                // retry the first 2 times quickly.
+                20,
+                200,
+
+                // then back-off exponentially.
+                1000,
+                5000,
+                10000,
+                30000,
+
+                // Borrowed from Empirical CacheV2 determined to be appropriate for general remote server restarts.
+                60000,
+                120000,
+            };
+
+        /// <summary>
+        /// Delays for retries for file copies
+        /// </summary>
+        [DataMember]
+        public int[] RetryIntervalForCopiesMs
+        {
+            get => _retryIntervalForCopiesMs ?? DefaultRetryIntervalForCopiesMs;
+            set => _retryIntervalForCopiesMs = value;
+        }
+
+        public IReadOnlyList<TimeSpan> RetryIntervalForCopies => RetryIntervalForCopiesMs.Select(ms => TimeSpan.FromMilliseconds(ms)).ToList();
+
         #region Grpc Copier
         /// <summary>
         /// Use GRPC for file copies between CASaaS.
@@ -160,6 +248,24 @@ namespace BuildXL.Cache.Host.Configuration
         /// </summary>
         [DataMember]
         public bool UseCompressionForCopies { get; set; } = false;
+
+        /// <summary>
+        /// Upper bound on number of cached GRPC clients.
+        /// </summary>
+        [DataMember]
+        public int MaxGrpcClientCount { get; set; } = DefaultMaxConcurrentCopyOperations;
+
+        /// <summary>
+        /// Maximum cached age for GRPC clients.
+        /// </summary>
+        [DataMember]
+        public int MaxGrpcClientAgeMinutes { get; set; } = 55;
+
+        /// <summary>
+        /// Time between GRPC cache cleanups.
+        /// </summary>
+        [DataMember]
+        public int GrpcClientCleanupDelayMinutes { get; set; } = 17;
         #endregion
 
         #region Distributed Eviction
@@ -266,26 +372,50 @@ namespace BuildXL.Cache.Host.Configuration
         public bool? UseIncrementalCheckpointing { get; set; }
 
         [DataMember]
+        public int? IncrementalCheckpointDegreeOfParallelism { get; set; }
+
+        [DataMember]
         public int? ContentLocationDatabaseGcIntervalMinutes { get; set; }
 
         [DataMember]
         public int? ContentLocationDatabaseEntryTimeToLiveMinutes { get; set; }
+
+        [DataMember]
+        public bool? ContentLocationDatabaseCacheEnabled { get; set; }
+
+        [DataMember]
+        public int? ContentLocationDatabaseFlushDegreeOfParallelism { get; set; }
+
+        [DataMember]
+        public bool? ContentLocationDatabaseFlushSingleTransaction { get; set; }
+
+        [DataMember]
+        public double? ContentLocationDatabaseFlushPreservePercentInMemory { get; set; }
+
+        [DataMember]
+        public int? ContentLocationDatabaseCacheMaximumUpdatesPerFlush { get; set; }
+
+        [DataMember]
+        public TimeSpan? ContentLocationDatabaseCacheFlushingMaximumInterval { get; set; }
+
+        [DataMember]
+        public int? FullRangeCompactionIntervalMinutes { get; set; }
 
         // Key Vault Settings
         [DataMember]
         public string KeyVaultSettingsString { get; set; }
 
         [DataMember]
-        public int KeyVaultRetryCount { get; set; } = 5;
+        public int SecretsRetrievalRetryCount { get; set; } = 5;
 
         [DataMember]
-        public int KeyVaultMinBackoffSeconds { get; set; } = 10;
+        public int SecretsRetrievalMinBackoffSeconds { get; set; } = 10;
 
         [DataMember]
-        public int KeyVaultMaxBackoffSeconds { get; set; } = 60;
+        public int SecretsRetrievalMaxBackoffSeconds { get; set; } = 60;
 
         [DataMember]
-        public int KeyVaultDeltaBackoffSeconds { get; set; } = 10;
+        public int SecretsRetrievalDeltaBackoffSeconds { get; set; } = 10;
 
         [DataMember]
         public string EventHubSecretName { get; set; }
@@ -294,10 +424,19 @@ namespace BuildXL.Cache.Host.Configuration
         public int? MaxEventProcessingConcurrency { get; set; }
 
         [DataMember]
+        public int? EventBatchSize { get; set; }
+
+        [DataMember]
+        public int? EventProcessingMaxQueueSize { get; set; }
+
+        [DataMember]
         public string[] AzureStorageSecretNames { get; set; }
 
         [DataMember]
         public string AzureStorageSecretName { get; set; }
+
+        [DataMember]
+        public bool AzureBlobStorageUseSasTokens { get; set; } = false;
 
         [DataMember]
         public string EventHubEpoch { get; set; } = ".LLS_V1.2";
@@ -367,12 +506,48 @@ namespace BuildXL.Cache.Host.Configuration
         public bool EmptyFileHashShortcutEnabled { get; set; } = false;
 
         [DataMember]
-        public int MaxConcurrentCopyOperations { get; set; } = 512;
+        public bool UseRedundantPutFileShortcut { get; set; } = false;
+
+        [DataMember]
+        public int MaxConcurrentCopyOperations { get; set; } = DefaultMaxConcurrentCopyOperations;
+
+        [DataMember]
+        public int MaxConcurrentProactiveCopyOperations { get; set; } = DefaultMaxConcurrentCopyOperations;
+
+        /// <summary>
+        /// Gets or sets whether to override Unix file access modes.
+        /// </summary>
+        [DataMember]
+        public bool OverrideUnixFileAccessMode { get; set; } = false;
+
+        /// <summary>
+        /// Valid values: Disabled, InsideRing, OutsideRing, Both (See ProactiveCopyMode enum)
+        /// </summary>
+        [DataMember]
+        public string ProactiveCopyMode { get; set; } = "Disabled";
+
+        [DataMember]
+        public int ProactiveCopyLocationsThreshold { get; set; } = 1;
+
+        [DataMember]
+        public int MaximumConcurrentPutFileOperations { get; set; } = 512;
+
+        [DataMember]
+        public bool EnableMetadataStore { get; set; } = false;
+
+        [DataMember]
+        public int MaximumNumberOfMetadataEntriesToStore { get; set; } = 500_000;
+
+        [DataMember]
+        public bool UseRedisMetadataStore{ get; set; } = false;
+
+        [DataMember]
+        public int TimeoutForProactiveCopiesMinutes { get; set; } = 15;
 
         #endregion
 
         /// <summary>
-        /// Gets the secret name to connect to redis for a particular CloudBuild stamp.
+        /// Gets the secret name to connect to Redis for a particular CloudBuild stamp.
         /// </summary>
         /// <param name="stampId">The ID of the stamp.</param>
         /// <returns>The secret name in the AP secret store.</returns>

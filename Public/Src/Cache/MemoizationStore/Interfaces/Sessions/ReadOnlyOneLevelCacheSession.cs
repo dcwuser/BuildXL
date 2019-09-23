@@ -1,9 +1,12 @@
 // Copyright (c) Microsoft. All rights reserved.
 // Licensed under the MIT license. See LICENSE file in the project root for full license information.
 
+extern alias Async;
+
 using System;
 using System.Collections.Generic;
 using System.Diagnostics.ContractsLight;
+using System.Linq;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -13,6 +16,7 @@ using BuildXL.Cache.ContentStore.Interfaces.Results;
 using BuildXL.Cache.ContentStore.Interfaces.Sessions;
 using BuildXL.Cache.ContentStore.Interfaces.Stores;
 using BuildXL.Cache.ContentStore.Interfaces.Tracing;
+using BuildXL.Cache.ContentStore.Sessions;
 using BuildXL.Cache.MemoizationStore.Interfaces.Results;
 using BuildXL.Cache.MemoizationStore.Interfaces.Stores;
 
@@ -21,7 +25,7 @@ namespace BuildXL.Cache.MemoizationStore.Interfaces.Sessions
     /// <summary>
     ///     An IReadOnlyCacheSession implemented with one level of content and memoization.
     /// </summary>
-    public class ReadOnlyOneLevelCacheSession : IReadOnlyCacheSessionWithLevelSelectors
+    public class ReadOnlyOneLevelCacheSession : IReadOnlyCacheSessionWithLevelSelectors, IHibernateContentSession
     {
         /// <summary>
         ///     Auto-pinning behavior configuration.
@@ -85,14 +89,14 @@ namespace BuildXL.Cache.MemoizationStore.Interfaces.Sessions
         public virtual async Task<BoolResult> StartupAsync(Context context)
         {
             StartupStarted = true;
-            
+
             var startupContentResult = await _contentReadOnlySession.StartupAsync(context).ConfigureAwait(false);
             if (!startupContentResult.Succeeded)
             {
                 StartupCompleted = true;
                 return new BoolResult(startupContentResult, "Content session startup failed");
             }
-            
+
             var startupMemoizationResult = await _memoizationReadOnlySession.StartupAsync(context).ConfigureAwait(false);
             if (!startupMemoizationResult.Succeeded)
             {
@@ -180,7 +184,7 @@ namespace BuildXL.Cache.MemoizationStore.Interfaces.Sessions
 
 
         /// <inheritdoc />
-        public IAsyncEnumerable<GetSelectorResult> GetSelectors(Context context, Fingerprint weakFingerprint, CancellationToken cts, UrgencyHint urgencyHint = UrgencyHint.Nominal)
+        public Async::System.Collections.Generic.IAsyncEnumerable<GetSelectorResult> GetSelectors(Context context, Fingerprint weakFingerprint, CancellationToken cts, UrgencyHint urgencyHint = UrgencyHint.Nominal)
         {
             return this.GetSelectorsAsAsyncEnumerable(context, weakFingerprint, cts, urgencyHint);
         }
@@ -246,6 +250,22 @@ namespace BuildXL.Cache.MemoizationStore.Interfaces.Sessions
         public Task<IEnumerable<Task<Indexed<PlaceFileResult>>>> PlaceFileAsync(Context context, IReadOnlyList<ContentHashWithPath> hashesWithPaths, FileAccessMode accessMode, FileReplacementMode replacementMode, FileRealizationMode realizationMode, CancellationToken cts, UrgencyHint urgencyHint = UrgencyHint.Nominal)
         {
             return _contentReadOnlySession.PlaceFileAsync(context, hashesWithPaths, accessMode, replacementMode, realizationMode, cts, urgencyHint);
+        }
+
+        /// <inheritdoc />
+        public IEnumerable<ContentHash> EnumeratePinnedContentHashes()
+        {
+            return _contentReadOnlySession is IHibernateContentSession session
+                ? session.EnumeratePinnedContentHashes()
+                : Enumerable.Empty<ContentHash>();
+        }
+
+        /// <inheritdoc />
+        public Task PinBulkAsync(Context context, IEnumerable<ContentHash> contentHashes)
+        {
+            return _contentReadOnlySession is IHibernateContentSession session
+                ? session.PinBulkAsync(context, contentHashes)
+                : Task.FromResult(0);
         }
     }
 }

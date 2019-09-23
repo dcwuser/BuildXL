@@ -37,7 +37,7 @@ namespace BuildXL.Engine
         /// <summary>
         /// Specifies the factory for creating the cache to use.
         /// </summary>
-        public Func<PipExecutionContext, EngineCache> CacheFactory { get; set; }
+        public Func<EngineCache> CacheFactory { get; set; }
 
         /// <summary>
         /// The scheduler used by the Engine
@@ -72,7 +72,7 @@ namespace BuildXL.Engine
         /// <summary>
         /// The temp directory the Engine used for initializing its <see cref="TempCleaner"/>
         /// The <see cref="TempCleaner"/>'s temp directory is passed into 
-        /// <see cref="BuildXL.Native.IO.FileUtilities.DeleteFile(string, bool, BuildXL.Native.IO.ITempDirectoryCleaner)"/>
+        /// <see cref="BuildXL.Native.IO.FileUtilities.DeleteFile(string, bool, BuildXL.Native.IO.ITempCleaner)"/>
         /// for move-deleting files
         /// </summary>
         public string TempCleanerTempDirectory { get; set; } = null;

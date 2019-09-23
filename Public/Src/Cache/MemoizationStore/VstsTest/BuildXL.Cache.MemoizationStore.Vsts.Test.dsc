@@ -7,7 +7,7 @@ namespace VstsTest {
         assemblyName: "BuildXL.Cache.MemoizationStore.Vsts.Test",
         sources: globR(d`.`,"*.cs"),
         appConfig: f`App.Config`,
-        skipTestRun: BuildXLSdk.restrictTestRunToDebugNet461OnWindows,
+        skipTestRun: BuildXLSdk.restrictTestRunToSomeQualifiers,
         references: [
             ...addIfLazy(BuildXLSdk.isFullFramework, () => [
                 NetFx.System.Xml.dll,
@@ -31,8 +31,8 @@ namespace VstsTest {
 
             importFrom("Newtonsoft.Json.v10").pkg,
             importFrom("StackExchange.Redis.StrongName").pkg,
-            importFrom("Microsoft.VisualStudio.Services.ArtifactServices.Shared").pkg,
             importFrom("Microsoft.VisualStudio.Services.Client").pkg,
+            ...BuildXLSdk.visualStudioServicesArtifactServicesSharedPkg,
             ...BuildXLSdk.fluentAssertionsWorkaround,
         ],
         deploymentOptions: {

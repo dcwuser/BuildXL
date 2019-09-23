@@ -5,6 +5,7 @@ import * as Deployment from "Sdk.Deployment";
 import * as Shared     from "Sdk.Managed.Shared";
 import * as Frameworks from "Sdk.Managed.Frameworks";
 import * as Csc        from "Sdk.Managed.Tools.Csc";
+import * as Ilc        from "Sdk.Managed.Tools.ILCompiler";
 import * as ResGen     from "Sdk.Managed.Tools.ResGen.Lite";
 import * as AppPatcher from "Sdk.Managed.Tools.AppHostPatcher";
 import * as Xml        from "Sdk.Xml";
@@ -13,6 +14,11 @@ import * as Xml        from "Sdk.Xml";
 export * from "Sdk.Managed.Shared";
 
 export declare const qualifier : Shared.TargetFrameworks.All;
+
+/**
+ * The define constants to conditionalize managed code based on target runtime platform to compile
+ */
+const targetRuntimeDefines = getTargetRuntimeDefines();
 
 @@public
 export interface Template {
@@ -112,7 +118,7 @@ export function assembly(args: Arguments, targetType: Csc.TargetType) : Result {
     let appConfig = args.appConfig;
     if (args.assemblyBindingRedirects) {
 
-        let bindigRedirectElements = args.assemblyBindingRedirects.map(bindingRedirect => 
+        let bindigRedirectElements = args.assemblyBindingRedirects.map(bindingRedirect =>
             Xml.elem("dependentAssembly",
                 Xml.elem("assemblyIdentity",
                     Xml.attr("name", bindingRedirect.name),
@@ -126,7 +132,7 @@ export function assembly(args: Arguments, targetType: Csc.TargetType) : Result {
             ));
 
         // TODO: Figure out how to fail with good error if appConfig is not a sourcefile.
-        let configuration = appConfig 
+        let configuration = appConfig
             ? Xml.read(f`${appConfig}`).nodes.filter(n => Xml.isElement(n) && Xml.nameEquals(n.name, "configuration"))[0] as Xml.Element
             : Xml.elem("configuration",
                 Xml.elem("startup",
@@ -138,16 +144,16 @@ export function assembly(args: Arguments, targetType: Csc.TargetType) : Result {
               );
 
         let patchedConfiguration = Xml.updateOrAddChildElement(
-            configuration, 
-            "runtime", 
+            configuration,
+            "runtime",
             runtime =>  Xml.updateOrAddChildElement(
-                runtime, 
-                Xml.name("assemblyBinding", "urn:schemas-microsoft-com:asm.v1"), 
-                assemblyBinding => 
+                runtime,
+                Xml.name("assemblyBinding", "urn:schemas-microsoft-com:asm.v1"),
+                assemblyBinding =>
                     Xml.addNodes(assemblyBinding, bindigRedirectElements)
             )
         );
-        
+
         let updatedAppConfigPath = p`${Context.getNewOutputDirectory("assemblyBindingRedirects")}/app.config`;
         appConfig = Xml.write(updatedAppConfigPath, Xml.doc(patchedConfiguration));
     }
@@ -167,12 +173,11 @@ export function assembly(args: Arguments, targetType: Csc.TargetType) : Result {
         resourceFiles: resources.filter(r => r.file !== undefined && r.logicalName === undefined).map(r => r.file),
         treatWarningsAsErrors: qualifier.configuration === "release",
         optimize: qualifier.configuration === "release",
-        checked: qualifier.configuration === "debug",
+        checked: true,
         doc: args.skipDocumentationGeneration === true ? undefined : name + ".xml",
         out: outputFileName,
         pdb: name + ".pdb",
         debugType: framework.requiresPortablePdb ? "portable" : "full",
-        platform: args.platform || "anycpu",
         allowUnsafeBlocks: args.allowUnsafeBlocks || false,
         appConfig: appConfig,
         implicitSources: args.implicitSources,
@@ -180,21 +185,28 @@ export function assembly(args: Arguments, targetType: Csc.TargetType) : Result {
         defines: [
             ...(qualifier.configuration === "debug" ? ["DEBUG"] : []),
             "TRACE",
+            ...framework.conditionalCompileDefines,
+            ...targetRuntimeDefines,
             ...(args.defineConstants || []),
             // Defining a special symbol that can be used in C# code for using new API available in .NET 4.6.1+
             ...(qualifier.targetFramework !== "net451" ? ["NET461Plus"] : []),
-        ]
+        ],
+        nullable: args.nullable,
+        nullabilityContext: args.nullabilityContext,
     };
+
+    const references = [
+        ...(args.references || []),
+        ...framework.standardReferences,
+    ];
+
     if (args.tools && args.tools.csc) {
         cscArgs = Object.merge(args.tools.csc, cscArgs);
     }
 
-    let cscResult =  Csc.compile(cscArgs);
+    cscArgs = Object.merge(Helpers.patchReferencesForSystemInteractiveAsync(references), cscArgs);
 
-    let references = [
-        ...(args.references || []),
-        ...framework.standardReferences,
-    ];
+    let cscResult =  Csc.compile(cscArgs);
 
     let runtimeConfigFiles = undefined;
     let runtimeContent = args.runtimeContent;
@@ -206,7 +218,7 @@ export function assembly(args: Arguments, targetType: Csc.TargetType) : Result {
 
     if (targetType === "exe")
     {
-        runtimeConfigFiles = RuntimeConfigFiles.createFiles(framework, name, runtimeBinary, references, appConfig);
+        runtimeConfigFiles = RuntimeConfigFiles.createFiles(framework, name, runtimeBinary, references, args.runtimeContentToSkip, appConfig);
         if (framework.applicationDeploymentStyle === "selfContained")
         {
             const frameworkRuntimeFiles = framework.runtimeContentProvider(qualifier.targetRuntime);
@@ -319,6 +331,12 @@ export interface Arguments {
     /** Platform to build. */
     platform?: Csc.Platform;
 
+    /** Specify nullable context option enable|disable. */
+    nullable?: boolean;
+    
+    /** Specify nullable context option enable|disable|safeonly|warnings|safeonlywarnings.*/
+    nullabilityContext?: Csc.NullabilityContext;
+    
     noConfig?: boolean;
 
     /** Extra content/files to be deployed with the assembly when running. i.e. native dlls that are p-invoked, config files etc. */
@@ -339,11 +357,14 @@ export interface Arguments {
 
     /** Settings for nested tools */
     tools?: {
-        /** Default argument for Csc invocation. */
+        /** Csc default args. */
         csc?: Csc.Arguments;
 
-        /** ResGen default args*/
+        /** ResGen default args */
         resgen?: ResGen.Arguments;
+
+        /** Ilc default args */
+        ilc?: Ilc.Arguments;
     };
 
     /** Options that control how this compiled assembly gets deployed */
@@ -388,7 +409,7 @@ export interface AssemblyBindingRedirect {
      */
     name: string,
 
-    /** 
+    /**
      * The public key if the assembly to redirect is signed
      */
     publicKeyToken?: string,
@@ -397,7 +418,7 @@ export interface AssemblyBindingRedirect {
      * The culture of the assembly to redirect. Typically this is 'neutral'.
      */
     culture?: string,
-    
+
     /**
      * The old version. This can be a range i.e. '0.0.0.0-1.3.0.0'
      */
@@ -460,3 +481,19 @@ function concatNamespaceFragments(parent: string, child: string): string {
     if (child === undefined || child === "") return parent;
     return parent + "." + child;
 }
+
+/**
+ * The define constants to conditionalize managed code based on target runtime platform to compile
+ */
+function getTargetRuntimeDefines() : string[] {
+    switch (qualifier.targetRuntime)
+    {
+        case "win-x64":
+            return ["PLATFORM_WIN", "PLATFORM_X64"];
+        case "osx-x64":
+            return ["PLATFORM_OSX", "PLATFORM_X64"];
+        default:
+            Contract.fail("Unexpected targetRuntime");
+    }
+}
+

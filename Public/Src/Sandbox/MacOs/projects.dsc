@@ -1,5 +1,5 @@
 import {Cmd, Artifact, Transformer} from "Sdk.Transformers";
-import * as XCode from "Sdk.MacOS";
+import {XCode} from "Sdk.MacOS";
 
 namespace Sandbox {
     export declare const qualifier : {
@@ -21,13 +21,23 @@ namespace Sandbox {
         derivedDataOutDir: StaticDirectory
     }
 
-    const sandboxSealDir = Transformer.sealSourceDirectory(
-        d`${Context.getMount("Sandbox").path}`,
-        Transformer.SealSourceDirectoryOption.allDirectories);
+    const sourceFileDependencies = (() =>
+    {
+        const sandboxDir = d`${Context.getMount("Sandbox").path}`;
+        const thirdPartyDir = d`../../../../third_party`;
 
-    const thirdPartySealDir = Transformer.sealSourceDirectory(
-        d`../../../../third_party`,
-        Transformer.SealSourceDirectoryOption.allDirectories);
+        const sourceSealOptions =  Transformer.SealSourceDirectoryOption.allDirectories;
+        const globPattern = "*";
+
+        return BuildXLSdk.Flags.isMicrosoftInternal ?
+            [
+                Transformer.sealSourceDirectory(sandboxDir, sourceSealOptions),
+                Transformer.sealSourceDirectory(thirdPartyDir, sourceSealOptions)
+            ] : [
+                ...Transformer.sealDirectory(sandboxDir, globR(sandboxDir, globPattern)).contents,
+                ...Transformer.sealDirectory(thirdPartyDir, globR(thirdPartyDir, globPattern)).contents
+            ];
+    })();
 
     export function build(args: Args): Result {
         const conf = args.configuration || qualifier.configuration;
@@ -45,10 +55,10 @@ namespace Sandbox {
             ],
             dependencies: [
                 ...(args.dependencies || []),
-                sandboxSealDir,
-                thirdPartySealDir
+                ...sourceFileDependencies
             ]
         });
+
         return {
             outFiles: outFilePaths.map(result.getOutputFile),
             derivedDataOutDir: result.getOutputDirectory(outDir)
@@ -60,24 +70,26 @@ namespace Sandbox {
         : f`BundleInfo.xcconfig`;
 
     const isMacOs = Context.getCurrentHost().os === "macOS";
+
     const interopXcodeproj = Transformer.sealDirectory({
-        root: d`Interop/Interop.xcodeproj`, 
+        root: d`Interop/Interop.xcodeproj`,
         files: globR(d`Interop/Interop.xcodeproj`, "*")
     });
+
     const sandboxXcodeproj = Transformer.sealDirectory({
-        root: d`Sandbox/Sandbox.xcodeproj`, 
+        root: d`Sandbox/Sandbox.xcodeproj`,
         files: globR(d`Sandbox/Sandbox.xcodeproj`, "*")
     });
 
-    const ariaPkg = importFrom("Aria.Cpp.SDK.osx-x64");
+    const ariaPkg = importFrom("Aria.Cpp.SDK");
     const ariaXcconfig = Transformer.writeData({
         outputPath: p`${Context.getNewOutputDirectory("xcconfig")}/Aria.xcconfig`,
         contents: {
             separator: "\n",
             contents: [
                 "GCC_PREPROCESSOR_DEFINITIONS = MICROSOFT_INTERNAL",
-                { separator: "", contents: ["LIBRARY_SEARCH_PATHS = $(inherited) \"", ariaPkg.Contents.all.root, "/tools"]},
-                { separator: "", contents: ["HEADER_SEARCH_PATHS = $(inherited) \"", ariaPkg.Contents.all.root, "/tools/include"]},
+                { separator: "", contents: ["LIBRARY_SEARCH_PATHS = $(inherited) \"", ariaPkg.Contents.all.root, "/osx-x64/tools"]},
+                { separator: "", contents: ["HEADER_SEARCH_PATHS = $(inherited) \"", ariaPkg.Contents.all.root, "/osx-x64/tools/include"]},
                 "OTHER_LDFLAGS = $(inherited) -laria_osx_objc_cpp"
             ]
         }
@@ -93,19 +105,13 @@ namespace Sandbox {
         dependencies: [ ariaPkg.Contents.all ]
     }).outFiles[0];
 
-    function buildLibInterop(bundleInfo?: File): DerivedFile {
-        return build({
-            project: interopXcodeproj,
-            scheme: "InteropLibrary",
-            outFiles: [ a`libBuildXLInterop.dylib` ],
-            xcconfig: bundleInfo || bundleInfoXCConfig
-        }).outFiles[0];
-    }
-
-    const testConfigurationName = "debugTest";
-
     @@public
-    export const libInterop = isMacOs && buildLibInterop(bundleInfoXCConfig);
+    export const libInterop = isMacOs && build({
+        project: interopXcodeproj,
+        scheme: "InteropLibrary",
+        outFiles: [ a`libBuildXLInterop.dylib` ],
+        xcconfig: bundleInfoXCConfig
+    }).outFiles[0];
 
     @@public
     export const coreDumpTester = isMacOs && build({
@@ -118,7 +124,8 @@ namespace Sandbox {
     export const monitor = isMacOs && build({
         project: sandboxXcodeproj,
         scheme: "SandboxMonitor",
-        outFiles: [ a`SandboxMonitor` ]
+        outFiles: [ a`SandboxMonitor` ],
+        xcconfig: bundleInfoXCConfig
     }).outFiles[0];
 
     interface KextFiles {

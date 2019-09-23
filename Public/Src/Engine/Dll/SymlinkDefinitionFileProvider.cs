@@ -36,7 +36,7 @@ namespace BuildXL.Engine
             MasterService masterService,
             CacheInitializationTask cacheInitializerTask,
             PipExecutionContext context,
-            ITempDirectoryCleaner tempDirectoryCleaner = null)
+            ITempCleaner tempDirectoryCleaner = null)
         {
             var pathTable = context.PathTable;
             bool isDistributedMaster = configuration.Distribution.BuildRole == DistributedBuildRoles.Master;
@@ -77,7 +77,7 @@ namespace BuildXL.Engine
 
                 var possibleStore = await TryStoreToCacheAsync(
                     loggingContext,
-                    cache: possibleCacheInitializer.Result.CreateCacheForContext(context).ArtifactContentCache,
+                    cache: possibleCacheInitializer.Result.CreateCacheForContext().ArtifactContentCache,
                     symlinkFile: symlinkFile);
 
                 if (!possibleStore.Succeeded)

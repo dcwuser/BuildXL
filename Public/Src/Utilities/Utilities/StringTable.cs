@@ -81,7 +81,7 @@ namespace BuildXL.Utilities
         /// <summary>
         /// Captures the size in bytes of the table after invalidation
         /// </summary>
-        private int m_sizeInBytes;
+        private long m_sizeInBytes;
 
         /// <summary>
         /// Whether StringTable is being serialized
@@ -558,7 +558,10 @@ namespace BuildXL.Utilities
                 bufferNum++;
 
                 // Make sure we don't overflow the buffer we're indexing into
-                Contract.Assert(bufferNum < NumByteBuffers, $"Exceeded the number of ByteBuffers allowed in this StringTable: {bufferNum} >= {NumByteBuffers}");
+                if (bufferNum >= NumByteBuffers)
+                {
+                    Contract.Assert(false, $"Exceeded the number of ByteBuffers allowed in this StringTable: {bufferNum} >= {NumByteBuffers}");
+                }
 
                 lock (m_byteBuffers)
                 {
@@ -946,13 +949,13 @@ namespace BuildXL.Utilities
         /// <remarks>
         /// This assumes the table has been frozen as the data that gets freed when freezing is not counted here.
         /// </remarks>
-        public int SizeInBytes
+        public long SizeInBytes
         {
             get
             {
                 if (IsValid())
                 {
-                    int size = m_byteBuffers.Length * 8; // pointers to the individual buffers
+                    long size = m_byteBuffers.Length * 8L; // pointers to the individual buffers
                     size += 12; // array overhead
                     foreach (var t in m_byteBuffers)
                     {
@@ -1143,9 +1146,12 @@ namespace BuildXL.Utilities
 
         internal static void GetBufferIndex(int nextId, out int indexOfPartiallyFilledBuffer, out int lengthInPartiallyFilledBuffer)
         {
-            // Need to cast nextId to a unit to prevent the right shift from bringing in ones if the leftmost bit is a 1
-            indexOfPartiallyFilledBuffer = (int)((uint)nextId >> BytesPerBufferBits);
-            lengthInPartiallyFilledBuffer = (int)((uint)nextId & BytesPerBufferMask);
+            unchecked
+            {
+                // Need to cast nextId to a unit to prevent the right shift from bringing in ones if the leftmost bit is a 1
+                indexOfPartiallyFilledBuffer = (int)((uint)nextId >> BytesPerBufferBits);
+                lengthInPartiallyFilledBuffer = (int)((uint)nextId & BytesPerBufferMask);
+            }
         }
 #endregion
 

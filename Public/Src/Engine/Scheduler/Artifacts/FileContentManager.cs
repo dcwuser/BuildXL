@@ -17,6 +17,7 @@ using BuildXL.Pips;
 using BuildXL.Pips.Artifacts;
 using BuildXL.Pips.Operations;
 using BuildXL.Processes;
+using BuildXL.Scheduler.ChangeAffectedOutput;
 using BuildXL.Scheduler.Fingerprints;
 using BuildXL.Scheduler.Tracing;
 using BuildXL.Storage;
@@ -69,7 +70,7 @@ namespace BuildXL.Scheduler.Artifacts
     public sealed class FileContentManager : IQueryableFileContentManager
     {
         private const int MAX_SYMLINK_TRAVERSALS = 100;
-        private readonly ITempDirectoryCleaner m_tempDirectoryCleaner;
+        private readonly ITempCleaner m_tempDirectoryCleaner;
 
         #region Internal State
 
@@ -231,6 +232,11 @@ namespace BuildXL.Scheduler.Artifacts
         private static readonly SortedReadOnlyArray<FileArtifact, OrdinalFileArtifactComparer> s_emptySealContents =
             SortedReadOnlyArray<FileArtifact, OrdinalFileArtifactComparer>.CloneAndSort(new FileArtifact[0], OrdinalFileArtifactComparer.Instance);
 
+        /// <summary>
+        /// Holds change affected artifacts of the build
+        /// </summary>
+        public SourceChangeAffectedContents SourceChangeAffectedContents { get; }
+
         #endregion
 
         /// <summary>
@@ -241,7 +247,7 @@ namespace BuildXL.Scheduler.Artifacts
             IFileContentManagerHost host,
             IOperationTracker operationTracker,
             SymlinkDefinitions symlinkDefinitions = null,
-            ITempDirectoryCleaner tempDirectoryCleaner = null)
+            ITempCleaner tempDirectoryCleaner = null)
         {
             m_host = host;
             ArtifactContentCache = new ElidingArtifactContentCacheWrapper(host.ArtifactContentCache);
@@ -254,6 +260,8 @@ namespace BuildXL.Scheduler.Artifacts
             {
                 m_outputMaterializationExclusionMap.TryAdd(outputMaterializationExclusionRoot.Value, Unit.Void);
             }
+
+            SourceChangeAffectedContents = new SourceChangeAffectedContents(host.Context.PathTable, this);
         }
 
         /// <summary>
@@ -281,6 +289,10 @@ namespace BuildXL.Scheduler.Artifacts
             Contract.Assert(IsDistributedWorker);
 
             SetFileArtifactContentHashResult result = SetFileArtifactContentHash(artifact, info, PipOutputOrigin.NotMaterialized);
+
+            // Notify the host with content that was reported
+            m_host.ReportContent(artifact, info, PipOutputOrigin.NotMaterialized);
+
             if (result == SetFileArtifactContentHashResult.HasConflictingExistingEntry)
             {
                 var existingInfo = m_fileArtifactContentHashes[artifact];
@@ -461,6 +473,13 @@ namespace BuildXL.Scheduler.Artifacts
                             operationContext,
                             pip.GetDescription(Context),
                             state.GetFailure().DescribeIncludingInnerFailures());
+
+                        ExecutionLog?.CacheMaterializationError(new CacheMaterializationErrorEventData()
+                        {
+                            PipId = pip.PipId,
+                            FailedFiles = state.FailedFiles.ToReadOnlyArray()
+                        });
+
                         return false;
                     default:
                         // Catch-all error for non-cache dependency materialization failures
@@ -913,7 +932,7 @@ namespace BuildXL.Scheduler.Artifacts
         public async Task<FileContentInfo?> TryQuerySealedOrUndeclaredInputContentAsync(AbsolutePath path, string consumerDescription, bool allowUndeclaredSourceReads)
         {
             FileOrDirectoryArtifact declaredArtifact;
-            
+
             var isDynamicallyObservedSource = false;
 
             if (!m_sealedFiles.TryGetValue(path, out FileArtifact sealedFile))
@@ -927,7 +946,7 @@ namespace BuildXL.Scheduler.Artifacts
                         // No source seal directory found
                         return null;
                     }
-                    else 
+                    else
                     {
                         // If undeclared source reads is enabled but the path does not exist, then we can just shortcut
                         // the query here. This matches the declared case when no static artifact is found that contains
@@ -1030,13 +1049,12 @@ namespace BuildXL.Scheduler.Artifacts
         /// <summary>
         /// Attempts to materialize the given file
         /// </summary>
-        public async Task<bool> TryMaterializeFile(FileArtifact outputFile)
+        public async Task<ArtifactMaterializationResult> TryMaterializeFileAsync(FileArtifact outputFile)
         {
             var producer = GetDeclaredProducer(outputFile);
             using (var operationContext = OperationTracker.StartOperation(PipExecutorCounter.FileContentManagerTryMaterializeFileDuration, m_host.LoggingContext))
             {
-                return ArtifactMaterializationResult.Succeeded
-                    == await TryMaterializeFilesAsync(producer, operationContext, new[] { outputFile }, materializatingOutputs: true, isDeclaredProducer: true);
+                return await TryMaterializeFilesAsync(producer, operationContext, new[] { outputFile }, materializatingOutputs: true, isDeclaredProducer: true);
             }
         }
 
@@ -1212,7 +1230,10 @@ namespace BuildXL.Scheduler.Artifacts
                 foreach (var file in ListSealedDirectoryContents(directory))
                 {
                     var addedFile = m_sealedFiles.GetOrAdd(file.Path, file).Item.Value;
-                    Contract.Assert(addedFile == file, "Attempted to seal path twice with different rewrite counts");
+                    if (addedFile != file)
+                    {
+                        Contract.Assert(false, $"Attempted to seal path twice with different rewrite counts ({addedFile.RewriteCount} != {file.RewriteCount}): {addedFile.Path.ToString(Context.PathTable)}");
+                    }
 
                     if (sealDirectoryKind.IsDynamicKind())
                     {
@@ -1247,7 +1268,7 @@ namespace BuildXL.Scheduler.Artifacts
                             string.Join(Environment.NewLine, unsealedFiles.Select(f => "\t" + f)));
                     }
 
-                }           
+                }
                 else if (sealDirectoryKind.IsSourceSeal())
                 {
                     m_sealedSourceDirectories.TryAdd(directory.Path, directory);
@@ -1272,7 +1293,7 @@ namespace BuildXL.Scheduler.Artifacts
         /// a file produced inside a dynamic directory so its 'declared' producer will be the
         /// producer of the dynamic directory
         /// </summary>
-        private Pip GetDeclaredProducer(FileArtifact file)
+        public Pip GetDeclaredProducer(FileArtifact file)
         {
             return m_host.GetProducer(GetDeclaredArtifact(file));
         }
@@ -1321,8 +1342,8 @@ namespace BuildXL.Scheduler.Artifacts
                         // Directory artifact contents are not hashed since they will be hashed dynamically
                         // if the pip accesses them, so the file is the declared artifact
                         state.HashTasks.Add(TryQueryContentAsync(
-                            file, 
-                            operationContext, 
+                            file,
+                            operationContext,
                             declaredArtifact: file,
                             allowUndeclaredSourceReads));
                     }
@@ -1575,9 +1596,12 @@ namespace BuildXL.Scheduler.Artifacts
 
                     if (sealDirectoryKind == SealDirectoryKind.Opaque)
                     {
-                        // Dynamic directories must be deleted before materializing files
-                        // We don't want this to happen for shared dynamic ones
-                        AddDirectoryDeletion(state, artifact.DirectoryArtifact);
+                        if (Configuration.Sandbox.UnsafeSandboxConfiguration.PreserveOutputs != PreserveOutputsMode.Enabled || !PipArtifacts.IsPreservedOutputByPip(state.PipInfo.UnderlyingPip, directory.Path, Context.PathTable))
+                        {
+                            // Dynamic directories must be deleted before materializing files
+                            // We don't want this to happen for shared dynamic ones
+                            AddDirectoryDeletion(state, artifact.DirectoryArtifact);
+                        }
 
                         // For dynamic directories we need to specify the value of
                         // allow read only since the host will not know about the
@@ -1715,10 +1739,10 @@ namespace BuildXL.Scheduler.Artifacts
         /// <param name="dependentFileIndex">the index of a file (in the list of materialized files) which requires the materialization of this file as
         /// a prerequisite (if any). This is used when restoring content into cache for a host materialized file (i.e. write file output).</param>
         private void AddFileMaterialization(
-            PipArtifactsState state, 
-            FileArtifact file, 
-            bool? allowReadOnlyOverride, 
-            AbsolutePath symlinkTarget, 
+            PipArtifactsState state,
+            FileArtifact file,
+            bool? allowReadOnlyOverride,
+            AbsolutePath symlinkTarget,
             int? dependentFileIndex = null)
         {
             bool shouldMaterializeSourceFile = (IsDistributedWorker && SourceFileMaterializationEnabled) || symlinkTarget.IsValid;
@@ -1852,7 +1876,7 @@ namespace BuildXL.Scheduler.Artifacts
         /// </summary>
         /// <remarks>
         /// Creating empty directories when they don't exist ensures the correctness of replaying pip outputs. Those existence of such directories may be needed
-        /// by downstream pips. Empty directories are not stored into the cache, but their paths are stored in the pip itself and are collected when we populate <see cref="PipArtifactsState"/>. 
+        /// by downstream pips. Empty directories are not stored into the cache, but their paths are stored in the pip itself and are collected when we populate <see cref="PipArtifactsState"/>.
         /// If the pip outputs are removed, then to replay the empty output directories in the next build, when we have a cache hit, those directories need to be created.
         /// </remarks>
         private async Task<bool> PrepareDirectoriesAsync(PipArtifactsState state, OperationContext operationContext)
@@ -1914,7 +1938,7 @@ namespace BuildXL.Scheduler.Artifacts
                             destinationPath: directory.Path.ToString(Context.PathTable),
                             errorMessage: ex.LogEventMessage);
                         state.AddFailedDirectory(directory);
-                        
+
                         success = false;
 
                         m_dynamicDirectoryDeletionTasks[directory] = BoolTask.False;
@@ -2035,7 +2059,10 @@ namespace BuildXL.Scheduler.Artifacts
 
                                                 if (possiblyStream.Succeeded)
                                                 {
+#pragma warning disable AsyncFixer02
                                                     possiblyStream.Result.Dispose();
+#pragma warning restore AsyncFixer02
+
                                                     possiblyPlaced =
                                                         new Possible<ContentMaterializationResult>(
                                                             new ContentMaterializationResult(
@@ -2501,7 +2528,7 @@ namespace BuildXL.Scheduler.Artifacts
                                     // the copy-file destination relies on the else-clause below where we try to get
                                     // other file using TryGetFileArtifactForHash.
                                     // If we don't store outputs to cache, then we should not include cache operation to determine
-                                    // if the content is available. However, we just checked, by TryDiscoverAsync above, that the content 
+                                    // if the content is available. However, we just checked, by TryDiscoverAsync above, that the content
                                     // is available with the expected content hash. Thus, we can safely say that the content is available.
                                     isAvailable = true;
                                 }
@@ -2554,7 +2581,7 @@ namespace BuildXL.Scheduler.Artifacts
 
                                         if (copySource.IsSourceFile)
                                         {
-                                            // Reached a source file. Just abort rather than calling the host again. 
+                                            // Reached a source file. Just abort rather than calling the host again.
                                             break;
                                         }
 
@@ -2767,10 +2794,10 @@ namespace BuildXL.Scheduler.Artifacts
                 {
                     // Start the task to hash input
                     state.HashTasks.Add(TryQueryContentAsync(
-                        file, 
-                        operationContext, 
-                        declaredArtifact: file, 
-                        pipInfo.UnderlyingPip.ProcessAllowsUndeclaredSourceReads, 
+                        file,
+                        operationContext,
+                        declaredArtifact: file,
+                        pipInfo.UnderlyingPip.ProcessAllowsUndeclaredSourceReads,
                         verifyingHash: true));
                 }
                 else
@@ -3068,7 +3095,7 @@ namespace BuildXL.Scheduler.Artifacts
 
                 if (possibleProbeResult.Result == PathExistence.ExistsAsFile)
                 {
-                    Possible<ContentDiscoveryResult> possiblyDiscovered = 
+                    Possible<ContentDiscoveryResult> possiblyDiscovered =
                         await LocalDiskContentStore.TryDiscoverAsync(fileArtifact, artifactExpandedPath);
 
                     DiscoveredContentHashOrigin origin;
@@ -3160,7 +3187,7 @@ namespace BuildXL.Scheduler.Artifacts
                     fileTrackedHash = TrackedFileContentInfo.CreateUntrackedWithUnknownLength(WellKnownContentHashes.AbsentFile, possibleProbeResult.Result);
                 }
 
-                if (BuildXL.Scheduler.ETWLogger.Log.IsEnabled(BuildXL.Tracing.Diagnostics.EventLevel.Verbose, Events.Keywords.Diagnostics))
+                if (BuildXL.Scheduler.ETWLogger.Log.IsEnabled(BuildXL.Tracing.Diagnostics.EventLevel.Verbose, Keywords.Diagnostics))
                 {
                     if (fileArtifact.IsSourceFile)
                     {
@@ -3244,9 +3271,9 @@ namespace BuildXL.Scheduler.Artifacts
                 // the flag supressed a double write violation detection. So let's just warn
                 // and move on.
                 Logger.Log.FileArtifactContentMismatch(
-                    m_host.LoggingContext, 
-                    fileArtifact.Path.ToString(Context.PathTable), 
-                    existingInfo.Hash.ToHex(), 
+                    m_host.LoggingContext,
+                    fileArtifact.Path.ToString(Context.PathTable),
+                    existingInfo.Hash.ToHex(),
                     fileMaterializationInfo.Hash.ToHex());
 
                 return false;
@@ -3301,7 +3328,7 @@ namespace BuildXL.Scheduler.Artifacts
                     Contract.Assert(false,
                         $"File length mismatch for file '{fileMaterializationInfo.FileName}' :: " +
                         $"arg = {{ hash: {fileMaterializationInfo.Hash.ToHex()}, length: {fileMaterializationInfo.Length} }}, " +
-                        $"stored = {{ hash: {storedFileContentInfo.Hash.ToHex()}, length: {storedFileContentInfo.Length}, rawLength: {storedFileContentInfo.RawLength}, existence: {storedFileContentInfo.Existence} }}");
+                        $"stored = {{ hash: {storedFileContentInfo.Hash.ToHex()}, length: {storedFileContentInfo.Length}, serializedLength: {storedFileContentInfo.SerializedLengthAndExistence}, existence: '{storedFileContentInfo.Existence}' }}");
                 }
             }
 
@@ -3377,15 +3404,6 @@ namespace BuildXL.Scheduler.Artifacts
             return m_host.AllowArtifactReadOnly(declaredArtifact);
         }
 
-        private bool IsPreservedOutputFile(FileArtifact file)
-        {
-            Contract.Requires(file.IsValid);
-
-            // File can be a dynamic output. First get the declared artifact.
-            FileOrDirectoryArtifact declaredArtifact = GetDeclaredArtifact(file);
-            return m_host.IsPreservedOutputArtifact(declaredArtifact);
-        }
-
         private bool IsPreservedOutputFile(Pip pip, bool materializingOutput, FileArtifact file)
         {
             Contract.Requires(file.IsValid);
@@ -3397,18 +3415,17 @@ namespace BuildXL.Scheduler.Artifacts
 
             if (!materializingOutput)
             {
-                return IsPreservedOutputFile(file);
+                // File can be a dynamic output. First get the declared artifact.
+                FileOrDirectoryArtifact declaredArtifact = GetDeclaredArtifact(file);
+                return m_host.IsPreservedOutputArtifact(declaredArtifact);
             }
 
             var pipId = m_host.TryGetProducerId(file);
-            if (pipId.IsValid)
-            {
-                Contract.Assert(pipId == pip.PipId);
-                return PipArtifacts.IsPreservedOutputsPip(pip);
-            }
+            // If the producer is invalid, the file is a dynamic output under a directory output.
+            // As the pip did not run yet and sealContents is not populated, we cannot easily get 
+            // declared directory artifact for the given dynamic file.
 
-            // Invalid pip id indicates that the file is a dynamic output.
-            return false;
+            return PipArtifacts.IsPreservedOutputByPip(pip, file, Context.PathTable, isDynamicFileOutput: !pipId.IsValid);
         }
 
         /// <summary>
@@ -3457,7 +3474,7 @@ namespace BuildXL.Scheduler.Artifacts
         private void LogOutputOrigin(OperationContext operationContext, string pipDescription, string path, in FileMaterializationInfo info, PipOutputOrigin origin)
         {
             string hashHex = info.Hash.ToHex();
-            string reparsePointInfo = info.ReparsePointInfo.ToString();
+            string reparsePointInfo = info.ReparsePointInfo.IsActionableReparsePoint ? info.ReparsePointInfo.ToString() : string.Empty;
 
             switch (origin)
             {
@@ -3757,8 +3774,8 @@ namespace BuildXL.Scheduler.Artifacts
             /// <summary>
             /// Files which failed to materialize
             /// </summary>
-            private readonly List<(FileArtifact, ContentHash)> m_failedFiles = new List<(FileArtifact, ContentHash)>();
-            
+            public readonly List<(FileArtifact, ContentHash)> FailedFiles = new List<(FileArtifact, ContentHash)>();
+
             /// <summary>
             /// Directories which failed to materialize
             /// </summary>
@@ -3804,7 +3821,7 @@ namespace BuildXL.Scheduler.Artifacts
                 HashTasks.Clear();
                 PendingPlacementTasks.Clear();
                 PlacementTasks.Clear();
-                m_failedFiles.Clear();
+                FailedFiles.Clear();
                 m_failedDirectories.Clear();
 
                 InnerFailure = null;
@@ -3817,8 +3834,8 @@ namespace BuildXL.Scheduler.Artifacts
             /// </summary>
             public ArtifactMaterializationFailure GetFailure()
             {
-                Contract.Assert(m_failedFiles.Count != 0 || m_failedDirectories.Count != 0);
-                return new ArtifactMaterializationFailure(m_failedFiles.ToReadOnlyArray(), m_failedDirectories.ToReadOnlyArray(), m_manager.m_host.Context.PathTable, InnerFailure);
+                Contract.Assert(FailedFiles.Count != 0 || m_failedDirectories.Count != 0);
+                return new ArtifactMaterializationFailure(FailedFiles.ToReadOnlyArray(), m_failedDirectories.ToReadOnlyArray(), m_manager.m_host.Context.PathTable, InnerFailure);
             }
 
             /// <summary>
@@ -3837,12 +3854,12 @@ namespace BuildXL.Scheduler.Artifacts
             /// </summary>
             public void AddFailedFile(FileArtifact file, ContentHash contentHash)
             {
-                lock (m_failedFiles)
+                lock (FailedFiles)
                 {
-                    m_failedFiles.Add((file, contentHash));
+                    FailedFiles.Add((file, contentHash));
                 }
             }
-            
+
             /// <summary>
             /// Adds a failed directory
             /// </summary>

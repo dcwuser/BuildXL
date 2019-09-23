@@ -22,6 +22,7 @@ using BuildXL.Cache.ContentStore.Stores;
 using BuildXL.Cache.ContentStore.Tracing;
 using BuildXL.Cache.ContentStore.Tracing.Internal;
 using BuildXL.Cache.ContentStore.Utils;
+using BuildXL.Utilities.Tasks;
 
 namespace BuildXL.Cache.ContentStore.Distributed.Stores
 {
@@ -29,10 +30,14 @@ namespace BuildXL.Cache.ContentStore.Distributed.Stores
     /// A store that is based on content locations for opaque file locations.
     /// </summary>
     /// <typeparam name="T">The content locations being stored.</typeparam>
-    public class DistributedContentStore<T> : StartupShutdownBase, IContentStore, IRepairStore, IDistributedLocationStore, IStreamStore
+    public class DistributedContentStore<T> : StartupShutdownBase, IContentStore, IRepairStore, IDistributedLocationStore, IStreamStore, ICopyRequestHandler
         where T : PathBase
     {
-        private readonly byte[] _localMachineLocation;
+        /// <summary>
+        /// The location of the local cache root
+        /// </summary>
+        public MachineLocation LocalMachineLocation { get; }
+
         private readonly IContentLocationStoreFactory _contentLocationStoreFactory;
         private readonly ContentStoreTracer _tracer = new ContentStoreTracer(nameof(DistributedContentStore<T>));
         private readonly ReadOnlyDistributedContentSession<T>.ContentAvailabilityGuarantee _contentAvailabilityGuarantee;
@@ -42,8 +47,6 @@ namespace BuildXL.Cache.ContentStore.Distributed.Stores
         private readonly bool _enableDistributedEviction;
         private readonly PinCache _pinCache;
         private readonly bool _enableRepairHandling;
-
-        private readonly MachinePerformanceCollector _performanceCollector = new MachinePerformanceCollector();
 
         /// <summary>
         /// Flag for testing using local Redis instance.
@@ -61,8 +64,21 @@ namespace BuildXL.Cache.ContentStore.Distributed.Stores
 
         private readonly DistributedContentStoreSettings _settings;
 
+        /// <summary>
+        /// If true, _postInitializationCompletion task is set to completion when StartupAsync is done.
+        /// </summary>
+        private readonly bool _setPostInitializationCompletionAfterStartup;
+
+        /// <summary>
+        /// Task source that is set to completion state when the system is fully initialized.
+        /// The main goal of this field is to avoid the race condition when eviction is triggered during startup
+        /// when hibernated sessions are not fully reloaded.
+        /// </summary>
+        private readonly TaskSourceSlim<BoolResult> _postInitializationCompletion = TaskSourceSlim.Create<BoolResult>();
+
         private DistributedContentCopier<T> _distributedCopier;
         private readonly Func<IContentLocationStore, DistributedContentCopier<T>> _distributedCopierFactory;
+        private Lazy<Task<Result<IReadOnlyContentSession>>> _proactiveCopySession;
 
         /// <nodoc />
         public DistributedContentStore(
@@ -72,57 +88,7 @@ namespace BuildXL.Cache.ContentStore.Distributed.Stores
             IFileExistenceChecker<T> fileExistenceChecker,
             IFileCopier<T> fileCopier,
             IPathTransformer<T> pathTransform,
-            ReadOnlyDistributedContentSession<T>.ContentAvailabilityGuarantee contentAvailabilityGuarantee,
-            AbsolutePath tempFolderForCopies,
-            IAbsFileSystem fileSystem,
-            int locationStoreBatchSize,
-            IReadOnlyList<TimeSpan> retryIntervalForCopies = null,
-            PinConfiguration pinConfiguration = null,
-            int? replicaCreditInMinutes = null,
-            IClock clock = null,
-            bool enableRepairHandling = false,
-            TimeSpan? contentHashBumpTime = null,
-            bool useTrustedHash = false,
-            int trustedHashFileSizeBoundary = -1,
-            long parallelHashingFileSizeBoundary = -1,
-            int maxConcurrentCopyOperations = 512,
-            ContentStoreSettings contentStoreSettings = null)
-            : this (
-                  localMachineLocation,
-                  innerContentStoreFunc,
-                  contentLocationStoreFactory,
-                  fileExistenceChecker,
-                  fileCopier,
-                  pathTransform,
-                  contentAvailabilityGuarantee,
-                  tempFolderForCopies,
-                  fileSystem,
-                  locationStoreBatchSize,
-                  new DistributedContentStoreSettings()
-                  {
-                      UseTrustedHash = useTrustedHash,
-                      TrustedHashFileSizeBoundary = trustedHashFileSizeBoundary,
-                      ParallelHashingFileSizeBoundary = parallelHashingFileSizeBoundary,
-                      MaxConcurrentCopyOperations = maxConcurrentCopyOperations,
-                      RetryIntervalForCopies = retryIntervalForCopies,
-                      PinConfiguration = pinConfiguration,
-                  },
-                  replicaCreditInMinutes,
-                  clock,
-                  enableRepairHandling,
-                  contentHashBumpTime,
-                  contentStoreSettings)
-        {
-        }
-
-        /// <nodoc />
-        public DistributedContentStore(
-            byte[] localMachineLocation,
-            Func<NagleQueue<ContentHash>, DistributedEvictionSettings, ContentStoreSettings, TrimBulkAsync, IContentStore> innerContentStoreFunc,
-            IContentLocationStoreFactory contentLocationStoreFactory,
-            IFileExistenceChecker<T> fileExistenceChecker,
-            IFileCopier<T> fileCopier,
-            IPathTransformer<T> pathTransform,
+            ICopyRequester copyRequester,
             ReadOnlyDistributedContentSession<T>.ContentAvailabilityGuarantee contentAvailabilityGuarantee,
             AbsolutePath tempFolderForCopies,
             IAbsFileSystem fileSystem,
@@ -132,11 +98,13 @@ namespace BuildXL.Cache.ContentStore.Distributed.Stores
             IClock clock = null,
             bool enableRepairHandling = false,
             TimeSpan? contentHashBumpTime = null,
-            ContentStoreSettings contentStoreSettings = null)
+            ContentStoreSettings contentStoreSettings = null,
+            bool setPostInitializationCompletionAfterStartup = false)
         {
             Contract.Requires(settings != null);
 
-            _localMachineLocation = localMachineLocation;
+            _setPostInitializationCompletionAfterStartup = setPostInitializationCompletionAfterStartup;
+            LocalMachineLocation = new MachineLocation(localMachineLocation);
             _enableRepairHandling = enableRepairHandling;
             _contentLocationStoreFactory = contentLocationStoreFactory;
             _contentAvailabilityGuarantee = contentAvailabilityGuarantee;
@@ -160,6 +128,7 @@ namespace BuildXL.Cache.ContentStore.Distributed.Stores
                     fileSystem,
                     fileCopier,
                     fileExistenceChecker,
+                    copyRequester,
                     pathTransform,
                     contentLocationStore);
             };
@@ -182,6 +151,45 @@ namespace BuildXL.Cache.ContentStore.Distributed.Stores
             }
         }
 
+        private Task<Result<IReadOnlyContentSession>> CreateCopySession(Context context)
+        {
+            var sessionId = Guid.NewGuid();
+            var operationContext = OperationContext(new Context(context, sessionId));
+            return operationContext.PerformOperationAsync(_tracer,
+                async () =>
+                {
+                    // NOTE: We use ImplicitPin.None so that the OpenStream calls triggered by RequestCopy will only pull the content, NOT pin it in the local store.
+                    var sessionResult = CreateReadOnlySession(operationContext, $"{sessionId}-DefaultCopy", ImplicitPin.None).ThrowIfFailure();
+                    var session = sessionResult.Session;
+
+                    await session.StartupAsync(context).ThrowIfFailure();
+                    return Result.Success(session);
+                });
+        }
+
+        /// <inheritdoc />
+        public override Task<BoolResult> StartupAsync(Context context)
+        {
+            var startupTask = base.StartupAsync(context);
+
+            _proactiveCopySession = new Lazy<Task<Result<IReadOnlyContentSession>>>(() => CreateCopySession(context));
+
+            if (_setPostInitializationCompletionAfterStartup)
+            {
+                context.Debug("Linking post-initialization completion task with the result of StartupAsync.");
+                _postInitializationCompletion.LinkToTask(startupTask);
+            }
+
+            return startupTask;
+        }
+
+        /// <inheritdoc />
+        public void PostInitializationCompleted(Context context, BoolResult result)
+        {
+            context.Debug($"Setting result for post-initialization completion task to '{result}'.");
+            _postInitializationCompletion.TrySetResult(result);
+        }
+
         /// <inheritdoc />
         protected override async Task<BoolResult> StartupCoreAsync(OperationContext context)
         {
@@ -190,7 +198,7 @@ namespace BuildXL.Cache.ContentStore.Distributed.Stores
             // so that it can be queried and used to unregister content.
             await _contentLocationStoreFactory.StartupAsync(context).ThrowIfFailure();
 
-            _contentLocationStore = await _contentLocationStoreFactory.CreateAsync();
+            _contentLocationStore = await _contentLocationStoreFactory.CreateAsync(LocalMachineLocation);
 
             _distributedCopier = _distributedCopierFactory(_contentLocationStore);
             await _distributedCopier.StartupAsync(context).ThrowIfFailure();
@@ -236,14 +244,27 @@ namespace BuildXL.Cache.ContentStore.Distributed.Stores
         {
             var results = new List<Tuple<string, BoolResult>>();
 
+            if (_proactiveCopySession?.IsValueCreated == true)
+            {
+                var sessionResult = await _proactiveCopySession.Value;
+                if (sessionResult.Succeeded)
+                {
+                    var proactiveCopySessionShutdownResult = await sessionResult.Value.ShutdownAsync(context);
+                    results.Add(Tuple.Create(nameof(_proactiveCopySession), proactiveCopySessionShutdownResult));
+                }
+            }
+
             var innerResult = await InnerContentStore.ShutdownAsync(context);
             results.Add(Tuple.Create(nameof(InnerContentStore), innerResult));
 
             _evictionNagleQueue?.Dispose();
             _touchNagleQueue?.Dispose();
 
-            var locationStoreResult = await _contentLocationStore.ShutdownAsync(context);
-            results.Add(Tuple.Create(nameof(_contentLocationStore), locationStoreResult));
+            if (_contentLocationStore != null)
+            {
+                var locationStoreResult = await _contentLocationStore.ShutdownAsync(context);
+                results.Add(Tuple.Create(nameof(_contentLocationStore), locationStoreResult));
+            }
 
             var factoryResult = await _contentLocationStoreFactory.ShutdownAsync(context);
             results.Add(Tuple.Create(nameof(_contentLocationStoreFactory), factoryResult));
@@ -271,7 +292,7 @@ namespace BuildXL.Cache.ContentStore.Distributed.Stores
             var contentHashesAndLocations = new List<ContentHashWithSizeAndLocations>();
             foreach (ContentHash contentHash in contentHashes)
             {
-                _tracer.Debug(context, $"[DistributedEviction] Re-adding local location for content hash {contentHash} because it was not evicted");
+                _tracer.Debug(context, $"[DistributedEviction] Re-adding local location for content hash {contentHash.ToShortString()} because it was not evicted");
                 contentHashesAndLocations.Add(new ContentHashWithSizeAndLocations(contentHash));
             }
 
@@ -320,7 +341,7 @@ namespace BuildXL.Cache.ContentStore.Distributed.Stores
                             _contentLocationStore,
                             _contentAvailabilityGuarantee,
                             _distributedCopier,
-                            _localMachineLocation,
+                            LocalMachineLocation,
                             pinCache: _pinCache,
                             contentTrackerUpdater: _contentTrackerUpdater,
                             settings: _settings);
@@ -346,7 +367,7 @@ namespace BuildXL.Cache.ContentStore.Distributed.Stores
                             _contentLocationStore,
                             _contentAvailabilityGuarantee,
                             _distributedCopier,
-                            _localMachineLocation,
+                            LocalMachineLocation,
                             pinCache: _pinCache,
                             contentTrackerUpdater: _contentTrackerUpdater,
                             settings: _settings);
@@ -376,8 +397,6 @@ namespace BuildXL.Cache.ContentStore.Distributed.Stores
                     {
                         counterSet.Merge(_pinCache.GetCounters(context), "PinCache.");
                     }
-
-                    counterSet.Merge(_performanceCollector.GetPerformanceStats(), $"MachinePerf.");
 
                     return new GetStatsResult(counterSet);
                 }
@@ -470,6 +489,12 @@ namespace BuildXL.Cache.ContentStore.Distributed.Stores
         /// <nodoc />
         public IEnumerable<IReadOnlyList<ContentHashWithLastAccessTimeAndReplicaCount>> GetLruPages(Context context, IReadOnlyList<ContentHashWithLastAccessTimeAndReplicaCount> contentHashesWithInfo)
         {
+            // Ensure startup was called then wait for it to complete successfully (or error)
+            // This logic is important to avoid runtime errors when, for instance, QuotaKeeper tries
+            // to evict content right after startup and calls GetLruPages.
+            Contract.Assert(StartupStarted);
+            WaitForPostInitializationCompletionIfNeeded(context);
+
             Contract.Assert(_contentLocationStore is IDistributedLocationStore);
             if (_contentLocationStore is IDistributedLocationStore distributedStore)
             {
@@ -478,6 +503,22 @@ namespace BuildXL.Cache.ContentStore.Distributed.Stores
             else
             {
                 throw Contract.AssertFailure($"Cannot call GetLruPages when CanComputeLru returns false");
+            }
+        }
+
+        private void WaitForPostInitializationCompletionIfNeeded(Context context)
+        {
+            var task = _postInitializationCompletion.Task;
+            if (!task.IsCompleted)
+            {
+                var operationContext = new OperationContext(context);
+                operationContext.PerformOperation(Tracer, () => waitForCompletion(), traceOperationStarted: false).ThrowIfFailure();
+            }
+
+            BoolResult waitForCompletion()
+            {
+                context.Debug($"Post-initialization is not done. Waiting for it to finish...");
+                return task.GetAwaiter().GetResult();
             }
         }
 
@@ -501,6 +542,29 @@ namespace BuildXL.Cache.ContentStore.Distributed.Stores
             }
 
             return new FileExistenceResult(FileExistenceResult.ResultCode.Error, $"{InnerContentStore} does not implement {nameof(IStreamStore)} in {nameof(DistributedContentStore<T>)}.");
+        }
+
+        /// <inheritdoc />
+        public Task<DeleteResult> DeleteAsync(Context context, ContentHash contentHash)
+        {
+            throw new NotImplementedException();
+        }
+
+        /// <inheritdoc />
+        public Task<BoolResult> HandleCopyFileRequestAsync(Context context, ContentHash hash)
+        {
+            var operationContext = OperationContext(context);
+            return operationContext.PerformOperationAsync(Tracer,
+                async () =>
+                {
+                    var session = await _proactiveCopySession.Value.ThrowIfFailureAsync();
+                    using (await session.OpenStreamAsync(context, hash, operationContext.Token).ThrowIfFailureAsync(o => o.Stream))
+                    {
+                        // Opening stream to ensure the content is copied locally. Stream is immediately disposed.
+                    }
+
+                    return BoolResult.Success;
+                });
         }
     }
 }

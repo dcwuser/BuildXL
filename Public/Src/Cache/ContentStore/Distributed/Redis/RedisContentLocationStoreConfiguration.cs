@@ -2,14 +2,14 @@
 // Licensed under the MIT license. See LICENSE file in the project root for full license information.
 
 using System;
-using BuildXL.Cache.ContentStore.Distributed.Utilities;
+using BuildXL.Cache.ContentStore.Utils;
 
 namespace BuildXL.Cache.ContentStore.Distributed.Redis
 {
     /// <summary>
     /// Configuration properties for <see cref="RedisContentLocationStore"/>
     /// </summary>
-    public sealed class RedisContentLocationStoreConfiguration : LocalLocationStoreConfiguration
+    public class RedisContentLocationStoreConfiguration : LocalLocationStoreConfiguration
     {
         /// <summary>
         /// Gets or sets size of batch calls to Redis.
@@ -75,6 +75,11 @@ namespace BuildXL.Cache.ContentStore.Distributed.Redis
         /// Max capacity for blobs in the ContentLocationStore
         /// </summary>
         public long MaxBlobCapacity { get; set; } = 1024 * 1024 * 1024;
+
+        /// <summary>
+        /// Indicates the window size for executing eviction.
+        /// </summary>
+        public int EvictionWindowSize { get; set; } = 500;
 
         /// <summary>
         /// Returns true if Redis can be used for storing small files.

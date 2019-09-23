@@ -491,7 +491,7 @@ namespace Test.BuildXL.Scheduler
                     ReadOnlyArray<DirectoryArtifact>.From(directoryDependencies),
                     m_fileDependencies.ToArray());
 
-                var result = ObservedInputProcessor.ProcessInternal(
+                var result = ObservedInputProcessor.ProcessInternalAsync(
                     OperationContext.CreateUntracked(loggingContext),
                     new Environment(this),
                     new AssertingTarget(this, Context, (target, topOnly) => handled.Add(new Tuple<TestObservation, bool>(target, topOnly))),
@@ -639,6 +639,10 @@ namespace Test.BuildXL.Scheduler
             private class Environment : IObservedInputProcessingEnvironment
             {
                 private readonly Harness m_harness;
+
+                public CacheConfiguration Configuration { get; } = new CacheConfiguration();
+
+                ICacheConfiguration IObservedInputProcessingEnvironment.Configuration => Configuration;
 
                 public Environment(Harness harness)
                 {
@@ -1129,7 +1133,7 @@ namespace Test.BuildXL.Scheduler
                 context.PathTable,
                 AbsolutePath.Create(context.PathTable, Path.Combine(TestOutputDirectory, "config.dc")));
 
-            DummyPipExecutionEnvironment dummy = new DummyPipExecutionEnvironment(LoggingContext, context, config, sandboxedKextConnection: GetSandboxedKextConnection());
+            DummyPipExecutionEnvironment dummy = new DummyPipExecutionEnvironment(LoggingContext, context, config, sandboxConnection: GetSandboxConnection());
             DirectoryMembershipFingerprinter fingerprinter = new DirectoryMembershipFingerprinter(LoggingContext, context);
 
             DirectoryMembershipFingerprinterRule excludeFiles =
@@ -1139,7 +1143,7 @@ namespace Test.BuildXL.Scheduler
                     disableFilesystemEnumeration: true,
                     fileIgnoreWildcards: new string[] { });
 
-            ModuleId testModule = new ModuleId(2, "test");
+            ModuleId testModule = ModuleId.UnsafeCreate(2, "test");
             ModuleConfiguration moduleConfig = new ModuleConfiguration { ModuleId = testModule };
 
             DirectoryMembershipFingerprinterRuleSet parentRuleSet = new DirectoryMembershipFingerprinterRuleSet(

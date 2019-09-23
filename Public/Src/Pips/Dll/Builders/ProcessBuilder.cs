@@ -61,6 +61,7 @@ namespace BuildXL.Pips.Builders
         private readonly PooledObjectWrapper<HashSet<FileArtifact>> m_inputFiles;
         private readonly PooledObjectWrapper<HashSet<DirectoryArtifact>> m_inputDirectories;
         private readonly PooledObjectWrapper<HashSet<PipId>> m_servicePipDependencies;
+        private readonly PooledObjectWrapper<HashSet<PipId>> m_orderPipDependencies;
 
         // Outputs 
         private readonly PooledObjectWrapper<HashSet<FileArtifactWithAttributes>> m_outputFiles;
@@ -95,6 +96,12 @@ namespace BuildXL.Pips.Builders
         /// </summary>
         public int? Weight { get; set; } = null;
 
+        /// <summary>
+        /// The priority value of this pip when scheduling process pips.
+        /// The higher the priority, the sooner it will run.
+        /// </summary>
+        public int? Priority { get; set; } = null;
+
         /// <nodoc />
         public TimeSpan? Timeout { get; set; }
 
@@ -114,7 +121,13 @@ namespace BuildXL.Pips.Builders
         public RegexDescriptor? ErrorRegex { get; set; }
 
         /// <nodoc />
+        public bool EnableMultiLineErrorScanning { get; set; }
+
+        /// <nodoc />
         public Options Options { get; set; }
+
+        /// <nodoc />
+        public ReadOnlyArray<AbsolutePath> PreserveOutputWhitelist { get; set; } = ReadOnlyArray<AbsolutePath>.Empty;
 
         // Container related
 
@@ -163,6 +176,8 @@ namespace BuildXL.Pips.Builders
         private readonly AbsolutePath m_realUserProfilePath;
         private readonly AbsolutePath m_redirectedUserProfilePath;
 
+        private FileArtifact m_changeAffectedInputListWrittenFile;
+
         /// <nodoc />
         private ProcessBuilder(PathTable pathTable, PooledObjectWrapper<PipDataBuilder> argumentsBuilder)
         {
@@ -172,6 +187,7 @@ namespace BuildXL.Pips.Builders
             m_inputFiles = Pools.GetFileArtifactSet();
             m_inputDirectories = Pools.GetDirectoryArtifactSet();
             m_servicePipDependencies = PipPools.PipIdSetPool.GetInstance();
+            m_orderPipDependencies = PipPools.PipIdSetPool.GetInstance();
 
             m_outputFiles = Pools.GetFileArtifactWithAttributesSet();
             m_outputDirectories = Pools.GetDirectoryArtifactSet();
@@ -252,6 +268,14 @@ namespace BuildXL.Pips.Builders
             return ReadOnlyArray<DirectoryArtifact>.From(m_inputDirectories.Instance);
         }
 
+        /// <summary>
+        /// Returns the untracked directory scopes that have been added so far.
+        /// </summary>
+        public ReadOnlyArray<DirectoryArtifact> GetUntrackedDirectoryScopesSoFar()
+        {
+            return ReadOnlyArray<DirectoryArtifact>.From(m_untrackedDirectoryScopes.Instance);
+        }
+
         /// <nodoc />
         public void AddOutputFile(AbsolutePath file, FileExistence attribute)
         {
@@ -317,6 +341,16 @@ namespace BuildXL.Pips.Builders
             m_servicePipDependencies.Instance.Add(pipId);
         }
 
+        /// <summary>
+        /// This is for testing purposes only.
+        /// </summary>        
+        public void AddOrderDependency(PipId pipId)
+        {
+            Contract.Requires(pipId.IsValid);
+
+            m_orderPipDependencies.Instance.Add(pipId);
+        }
+
         /// <nodoc />
         public void AddUntrackedFile(AbsolutePath file)
         {
@@ -380,6 +414,16 @@ namespace BuildXL.Pips.Builders
         }
 
         /// <nodoc />
+        public void SetChangeAffectedInputListWrittenFile(AbsolutePath path)
+        {
+            Contract.Requires(path.IsValid);
+            Contract.Assert(!m_changeAffectedInputListWrittenFile.IsValid, "Value already set");
+
+            AddOutputFile(path, FileExistence.Optional);
+            m_changeAffectedInputListWrittenFile = FileArtifact.CreateOutputFile(path);
+        }
+
+        /// <nodoc />
         public void EnableTempDirectory()
         {
             if (!TempDirectory.IsValid)
@@ -428,7 +472,7 @@ namespace BuildXL.Pips.Builders
             Contract.Requires(key.IsValid);
 
             m_environmentVariables[key] = PipData.Invalid;
-        }
+        }                 
 
         private ReadOnlyArray<EnvironmentVariable> FinishEnvironmentVariables()
         {
@@ -467,6 +511,14 @@ namespace BuildXL.Pips.Builders
         public void SetResponseFileSpecification(ResponseFileSpecification specification)
         {
             m_responseFileSpecification = specification;
+        }
+
+        /// <summary>
+        /// Set the file path that will be used to write the change affected inputs
+        /// </summary>
+        public void SetChangeAffectedInputListWrittenFilePath(FileArtifact path)
+        {
+            m_changeAffectedInputListWrittenFile = path;
         }
 
         private PipData FinishArgumentsAndCreateResponseFileIfNeeded(DirectoryArtifact defaultDirectory)
@@ -588,7 +640,7 @@ namespace BuildXL.Pips.Builders
 
                 dependencies: ReadOnlyArray<FileArtifact>.From(m_inputFiles.Instance),
                 directoryDependencies: ReadOnlyArray<DirectoryArtifact>.From(m_inputDirectories.Instance),
-                orderDependencies: ReadOnlyArray<PipId>.Empty, // There is no code setting this yet.
+                orderDependencies: ReadOnlyArray<PipId>.From(m_orderPipDependencies.Instance),
 
                 outputs: outputFiles,
                 directoryOutputs: directoryOutputs,
@@ -609,6 +661,7 @@ namespace BuildXL.Pips.Builders
                 timeout: Timeout,
                 warningRegex: WarningRegex ?? RegexDescriptor.CreateDefaultForWarnings(m_pathTable.StringTable),
                 errorRegex: ErrorRegex ?? RegexDescriptor.CreateDefaultForErrors(m_pathTable.StringTable),
+                enableMultiLineErrorScanning: EnableMultiLineErrorScanning,
 
                 uniqueOutputDirectory: defaultDirectory,
                 uniqueRedirectedDirectoryRoot: redirectedDirectoryRoot,
@@ -619,7 +672,10 @@ namespace BuildXL.Pips.Builders
                 doubleWritePolicy: DoubleWritePolicy,
                 containerIsolationLevel: ContainerIsolationLevel,
                 absentPathProbeMode: AbsentPathProbeUnderOpaquesMode,
-                weight: Weight);
+                weight: Weight,
+                priority: Priority,
+                preserveOutputWhitelist: PreserveOutputWhitelist,
+                changeAffectedInputListWrittenFilePath: m_changeAffectedInputListWrittenFile);
 
             return true;
         }
@@ -632,6 +688,7 @@ namespace BuildXL.Pips.Builders
             m_inputFiles.Dispose();
             m_inputDirectories.Dispose();
             m_servicePipDependencies.Dispose();
+            m_orderPipDependencies.Dispose();
 
             m_outputFiles.Dispose();
             m_outputDirectories.Dispose();

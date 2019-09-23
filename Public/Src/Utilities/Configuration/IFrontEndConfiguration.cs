@@ -100,6 +100,11 @@ namespace BuildXL.Utilities.Configuration
         int? MaxFrontEndConcurrency { get; }
 
         /// <summary>
+        /// If true, spawn unlimited tasks at once in the front end
+        /// </summary>
+        bool? EnableEvaluationThrottling { get; }
+
+        /// <summary>
         /// The max concurrency to use for restoring nuget packages.
         /// </summary>
         int? MaxRestoreNugetConcurrency { get; }
@@ -288,5 +293,40 @@ namespace BuildXL.Utilities.Configuration
         /// Whether the frontend statistics should contain statistics about the largest files.
         /// </summary>
         bool ShowLargestFilesStatistics { get; }
+
+        /// <summary>
+        /// Wheather or not to release workspace before evaluation.
+        /// </summary>
+        bool ReleaseWorkspaceBeforeEvaluation { get; }
+
+        /// <summary>
+        /// Uses optimized AST conversion.
+        /// </summary>
+        /// <remarks>
+        /// This option is unsafe as it disables analyses and skips converting constructs that are not needed for evaluation, like types.
+        /// This option is suitable if the specs are machine generated.
+        /// </remarks>
+        bool UnsafeOptimizedAstConversion { get; }
+
+        /// <summary>
+        /// Whether or not the frontend is allowed to evaluate methods in the unsafe ambient.
+        /// </summary>
+        bool AllowUnsafeAmbient { get; }
+
+        /// <summary>
+        /// Generates a new cgmaiifest file and overwrites the existing cgmanifest file if it is outdated
+        /// </summary>
+        /// <remarks>
+        /// cgmanifest.json is used for Component Governance in CloudBuild
+        /// </remarks>
+        AbsolutePath GenerateCgManifestForNugets { get; }
+
+        /// <summary>
+        /// Validates the existing cgmaiifest file and throws error on mismatch
+        /// </summary>
+        /// <remarks>
+        /// cgmanifest.json is used for Component Governance in CloudBuild
+        /// </remarks>
+        AbsolutePath ValidateCgManifestForNugets { get; }
     }
 }

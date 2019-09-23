@@ -29,10 +29,15 @@ namespace BuildXL.Engine
     /// This class implements the FrontEndEngineAbstraction
     /// </summary>
     [SuppressMessage("Microsoft.Design", "CA1001:TypesThatOwnDisposableFieldsShouldBeDisposable")]
-    internal sealed class FrontEndEngineImplementation : FrontEndEngineAbstraction, IDisposable
+    public sealed class FrontEndEngineImplementation : FrontEndEngineAbstraction, IDisposable
     {
         private readonly InputTracker m_inputTracker;
+
+        /// <summary>
+        /// Path table.
+        /// </summary>
         public readonly PathTable PathTable;
+
         private FileCombiner m_specCache;
 
         private readonly SnapshotCollector m_snapshotCollector;
@@ -86,7 +91,10 @@ namespace BuildXL.Engine
 
         private readonly LoggingContext m_loggingContext;
 
-        internal FrontEndEngineImplementation(
+        /// <summary>
+        /// Creates an instance of <see cref="FrontEndEngineImplementation"/>.
+        /// </summary>
+        public FrontEndEngineImplementation(
             LoggingContext loggingContext,
             PathTable pathTable,
             IConfiguration configuration,
@@ -138,7 +146,8 @@ namespace BuildXL.Engine
                 PathTable, 
                 m_getFileContentTable(), 
                 m_inputTracker.FileChangeTracker, 
-                directoryTranslator);
+                directoryTranslator,
+                vfsCasRoot: configuration.Cache.VfsCasRoot);
 
             m_localDiskContentStoreConcurrencyLimiter = new ActionBlockSlim<MaterializeFileRequest>(
                 Environment.ProcessorCount,
@@ -248,7 +257,7 @@ namespace BuildXL.Engine
         }
 
         /// <inheritdoc/>
-        public override async Task<ContentHash> GetFileContentHashAsync(string path, bool trackFile = true)
+        public override async Task<ContentHash> GetFileContentHashAsync(string path, bool trackFile = true, HashType hashType = HashType.Unknown)
         {
             // If the tracker knows about this file, then we already have the hash
             ContentHash hash;
@@ -273,13 +282,13 @@ namespace BuildXL.Engine
 
                 VersionedFileIdentityAndContentInfo? maybeKnownIdentityAndHash = fileContentTable.TryGetKnownContentHash(fs);
 
-                if (maybeKnownIdentityAndHash.HasValue)
+                if (maybeKnownIdentityAndHash?.FileContentInfo.MatchesHashType(hashType) ?? false)
                 {
                     return maybeKnownIdentityAndHash.Value.FileContentInfo.Hash;
                 }
 
                 // Finally, if all the above failed, compute the hash and record it for next time
-                hash = await ContentHashingUtilities.HashContentStreamAsync(fs);
+                hash = await ContentHashingUtilities.HashContentStreamAsync(fs, hashType);
                 maybeKnownIdentityAndHash = fileContentTable.RecordContentHash(fs, hash);
 
                 m_specCache?.AddFile(fs, maybeKnownIdentityAndHash.Value.FileContentInfo.Hash, path);
@@ -336,6 +345,7 @@ namespace BuildXL.Engine
             return m_inputTracker.ProbeFileOrDirectoryExistence(physicalPath) == PathExistence.ExistsAsFile;
         }
 
+        /// <inheritdoc />
         public override bool DirectoryExists(AbsolutePath path)
         {
             var physicalPath = path.ToString(PathTable);
@@ -350,6 +360,7 @@ namespace BuildXL.Engine
             m_inputTracker.RegisterFileAccess(path, PathTable);
         }
 
+        /// <inheritdoc />
         public override bool TryGetBuildParameter(string name, string frontEnd, out string value)
         {
             bool success;

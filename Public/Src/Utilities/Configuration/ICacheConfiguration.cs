@@ -121,5 +121,36 @@ namespace BuildXL.Utilities.Configuration
         /// When enabled, the remote cache uses DedupStore instead of BlobStore.
         /// </summary>
         bool UseDedupStore { get; }
+
+        /// <summary>
+        /// Indicates whether minimal graph enumerations should elide absent path probes in the directory root
+        /// </summary>
+        bool ElideMinimalGraphEnumerationAbsentPathProbes { get; }
+
+        /// <summary>
+        /// The maximum number of visited path sets allowed before switching to an 'augmented' weak fingerprint
+        /// computed from common dynamically accessed paths.
+        /// </summary>
+        int AugmentWeakFingerprintPathSetThreshold { get; }
+
+        /// <summary>
+        /// Used to compute the number of times (i.e. <see cref="AugmentWeakFingerprintRequiredPathCommonalityFactor"/> * <see cref="AugmentWeakFingerprintPathSetThreshold"/>) an entry must
+        /// appear among paths in the observed path set in order to be included in the common path set. Value must be (0, 1]
+        /// </summary>
+        double AugmentWeakFingerprintRequiredPathCommonalityFactor { get; }
+
+        /// <summary>
+        /// When enabled, the cache will be responsible for replacing exisiting file during file materialization.
+        /// </summary>
+        bool ReplaceExistingFileOnMaterialization { get; }
+
+        /// <summary>
+        /// Path to the content addressable store used by the BuildXL virtual file system process.
+        /// </summary>
+        /// <remarks>
+        /// For virtualized files, symlinks are placed in target location which point to the content addressabe files under
+        /// this path.
+        /// </remarks>
+        AbsolutePath VfsCasRoot { get; }
     }
 }

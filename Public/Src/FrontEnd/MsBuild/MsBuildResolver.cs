@@ -60,7 +60,10 @@ namespace BuildXL.FrontEnd.MsBuild
                 I($"Wrong type for resolver settings, expected {nameof(IMsBuildResolverSettings)} but got {nameof(resolverSettings.GetType)}"));
 
             m_msBuildWorkspaceResolver = workspaceResolver as MsBuildWorkspaceResolver;
-            Contract.Assert(m_msBuildWorkspaceResolver != null, I($"Wrong type for resolver, expected {nameof(MsBuildWorkspaceResolver)} but got {nameof(workspaceResolver.GetType)}"));
+            if (m_msBuildWorkspaceResolver == null)
+            {
+                Contract.Assert(false, I($"Wrong type for resolver, expected {nameof(MsBuildWorkspaceResolver)} but got {nameof(workspaceResolver.GetType)}"));
+            }
 
             if (!ValidateResolverSettings(m_msBuildResolverSettings))
             {
@@ -153,7 +156,16 @@ namespace BuildXL.FrontEnd.MsBuild
                             .Where(project => ProjectMatchesQualifier(project, qualifier))
                             .ToReadOnlySet();
 
-            var graphConstructor = new PipGraphConstructor(m_context, m_host, result.ModuleDefinition, m_msBuildResolverSettings, result.MsBuildExeLocation, m_frontEndName);
+            var graphConstructor = new PipGraphConstructor(
+                m_context, 
+                m_host, 
+                result.ModuleDefinition, 
+                m_msBuildResolverSettings, 
+                result.MsBuildLocation, 
+                result.DotNetExeLocation,
+                m_frontEndName, 
+                m_msBuildWorkspaceResolver.UserDefinedEnvironment, 
+                m_msBuildWorkspaceResolver.UserDefinedPassthroughVariables);
 
             return graphConstructor.TrySchedulePipsForFilesAsync(filteredBuildFiles, qualifierId);
         }

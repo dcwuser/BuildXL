@@ -44,6 +44,9 @@ namespace BuildXL.Utilities.Configuration.Mutable
             EnableTransitiveProjectReferences = resolverSettings.EnableTransitiveProjectReferences;
             UseLegacyProjectIsolation = resolverSettings.UseLegacyProjectIsolation;
             DoubleWritePolicy = resolverSettings.DoubleWritePolicy;
+            AllowProjectsToNotSpecifyTargetProtocol = resolverSettings.AllowProjectsToNotSpecifyTargetProtocol;
+            MsBuildRuntime = resolverSettings.MsBuildRuntime;
+            DotNetSearchLocations = resolverSettings.DotNetSearchLocations;
         }
 
         /// <inheritdoc/>
@@ -80,7 +83,7 @@ namespace BuildXL.Utilities.Configuration.Mutable
         public IReadOnlyList<string> InitialTargets { get; set; }
 
         /// <inheritdoc/>
-        public IReadOnlyDictionary<string, string> Environment { get; set; }
+        public IReadOnlyDictionary<string, DiscriminatingUnion<string, UnitValue>> Environment { get; set; }
 
         /// <inheritdoc/>
         public IReadOnlyDictionary<string, string> GlobalProperties { get; set; }
@@ -105,5 +108,14 @@ namespace BuildXL.Utilities.Configuration.Mutable
 
         /// <inheritdoc/>
         public DoubleWritePolicy? DoubleWritePolicy { get; set; }
+
+        /// <inheritdoc/>
+        public bool? AllowProjectsToNotSpecifyTargetProtocol { get; set; }
+
+        /// <inheritdoc/>
+        public string MsBuildRuntime { get; set; }
+
+        /// <inheritdoc/>
+        public IReadOnlyList<DirectoryArtifact> DotNetSearchLocations { get; set; }
     }
 }

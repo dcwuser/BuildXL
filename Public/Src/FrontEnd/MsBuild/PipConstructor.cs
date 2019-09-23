@@ -19,6 +19,7 @@ using BuildXL.Utilities.Collections;
 using BuildXL.Utilities.Configuration;
 using BuildXL.Utilities.Instrumentation.Common;
 using BuildXL.Utilities.Qualifier;
+using JetBrains.Annotations;
 using static BuildXL.Utilities.FormattableStringEx;
 using ProjectWithPredictions = BuildXL.FrontEnd.MsBuild.Serialization.ProjectWithPredictions<BuildXL.Utilities.AbsolutePath>;
 
@@ -47,13 +48,18 @@ namespace BuildXL.FrontEnd.MsBuild
             "/p:UseSharedCompilation=false", //  Turn off new MSBuild flag to reuse VBCSCompiler.exe (a feature of Roslyn csc compiler) to compile C# files from different projects
             "/m:1", // Tells MsBuild not to create child processes for building, but instead to simply execute the specified project file within a single process
             "/IgnoreProjectExtensions:.sln", // Tells MSBuild to avoid scanning the local file system for sln files to build, but instead to simply use the provided project file.
-            "/ConsoleLoggerParameters:Verbosity=Minimal" // Minimize the console logger
+            "/ConsoleLoggerParameters:Verbosity=Minimal", // Minimize the console logger
+            "/noAutoResponse", // do not include any MSBuild.rsp file automatically,
+            "/nodeReuse:false" // Even though we are already passing /m:1, when an MSBuild task is requested with an architecture that doesn't match the one of the host process, /nodeReuse will be true unless set otherwise
         };
 
         private AbsolutePath Root => m_resolverSettings.Root;
 
-        private readonly AbsolutePath m_msBuildExePath;
+        private readonly AbsolutePath m_msBuildPath;
+        private readonly AbsolutePath m_dotnetExePath;
         private readonly string m_frontEndName;
+        private readonly IEnumerable<KeyValuePair<string, string>> m_userDefinedEnvironment;
+        private readonly IEnumerable<string> m_userDefinedPassthroughVariables;
 
         private PathTable PathTable => m_context.PathTable;
         private FrontEndEngineAbstraction Engine => m_frontEndHost.Engine;
@@ -66,28 +72,41 @@ namespace BuildXL.FrontEnd.MsBuild
         /// </remarks>
         internal const string OutputCacheFileName = "output.cache";
 
+        // All projects should contain this property since the build graph is created by MSBuild under the /graph option
+        // TODO: it would be better if MSBuild provided the property name
+        internal const string s_isGraphBuildProperty = "IsGraphBuild";
+
         /// <nodoc/>
         public PipConstructor(
             FrontEndContext context,
             FrontEndHost frontEndHost,
             ModuleDefinition moduleDefinition,
             IMsBuildResolverSettings resolverSettings,
-            AbsolutePath pathToMsBuildExe,
-            string frontEndName)
+            AbsolutePath pathToMsBuild,
+            AbsolutePath pathToDotnetExe,
+            string frontEndName,
+            IEnumerable<KeyValuePair<string, string>> userDefinedEnvironment,
+            IEnumerable<string> userDefinedPassthroughVariables)
         {
             Contract.Requires(context != null);
             Contract.Requires(frontEndHost != null);
             Contract.Requires(moduleDefinition != null);
             Contract.Requires(resolverSettings != null);
-            Contract.Requires(pathToMsBuildExe.IsValid);
+            Contract.Requires(pathToMsBuild.IsValid);
+            Contract.Requires(!resolverSettings.ShouldRunDotNetCoreMSBuild() || pathToDotnetExe.IsValid);
             Contract.Requires(!string.IsNullOrEmpty(frontEndName));
-            
+            Contract.Requires(userDefinedEnvironment != null);
+            Contract.Requires(userDefinedPassthroughVariables != null);
+
             m_context = context;
             m_frontEndHost = frontEndHost;
             m_moduleDefinition = moduleDefinition;
             m_resolverSettings = resolverSettings;
-            m_msBuildExePath = pathToMsBuildExe;
+            m_msBuildPath = pathToMsBuild;
+            m_dotnetExePath = pathToDotnetExe;
             m_frontEndName = frontEndName;
+            m_userDefinedEnvironment = userDefinedEnvironment;
+            m_userDefinedPassthroughVariables = userDefinedPassthroughVariables;
         }
 
         /// <summary>
@@ -145,12 +164,9 @@ namespace BuildXL.FrontEnd.MsBuild
             // Check UseSynchronousLogging on https://github.com/Microsoft/msbuild
             env[BuildEnvironmentConstants.MsBuildLogAsyncEnvVar] = "1";
 
-            // If the resolver settings environment was not specified, we expose the whole process environment
-            var environment = m_resolverSettings.Environment ?? 
-                Environment.GetEnvironmentVariables().Cast<DictionaryEntry>().Select(
-                    entry => new KeyValuePair<string, string>((string)entry.Key, (string)entry.Value));
-
-            foreach (var input in environment)
+            // Observe there is no need to inform the engine this environment is being used since
+            // the same environment was used during graph construction, and the engine is already tracking them
+            foreach (var input in m_userDefinedEnvironment)
             {
                 string envVarName = input.Key;
 
@@ -162,9 +178,6 @@ namespace BuildXL.FrontEnd.MsBuild
                 }
 
                 env[envVarName] = input.Value;
-
-                // We don't actually need the value, but we need to tell the engine that the value is being used
-                Engine.TryGetBuildParameter(envVarName, m_frontEndName, out _);
             }
 
             //
@@ -250,6 +263,37 @@ namespace BuildXL.FrontEnd.MsBuild
                     projectOutputs = MSBuildProjectOutputs.CreateIsolated(outputDirectories, cacheFileArtifact);
                 }
                 
+                // If the project is not implementing the target protocol, emit corresponding warn/verbose 
+                if (!project.ImplementsTargetProtocol)
+                {
+                    if (project.ProjectReferences.Count != 0)
+                    {
+                        // Let's warn about this. Targets of the referenced projects may not be accurate
+                        Tracing.Logger.Log.ProjectIsNotSpecifyingTheProjectReferenceProtocol(
+                            m_context.LoggingContext,
+                            Location.FromFile(project.FullPath.ToString(PathTable)),
+                            project.FullPath.GetName(m_context.PathTable).ToString(m_context.StringTable));
+                    }
+                    else
+                    { 
+                        // Just a verbose message in this case
+                        Tracing.Logger.Log.LeafProjectIsNotSpecifyingTheProjectReferenceProtocol(
+                            m_context.LoggingContext,
+                            Location.FromFile(project.FullPath.ToString(PathTable)),
+                            project.FullPath.GetName(m_context.PathTable).ToString(m_context.StringTable));
+                    }
+                }
+
+                // Warn if default targets were appended to the targets to execute
+                if (project.PredictedTargetsToExecute.IsDefaultTargetsAppended)
+                {
+                    Tracing.Logger.Log.ProjectPredictedTargetsAlsoContainDefaultTargets(
+                            m_context.LoggingContext,
+                            Location.FromFile(project.FullPath.ToString(PathTable)),
+                            project.FullPath.GetName(m_context.PathTable).ToString(m_context.StringTable),
+                            $"[{string.Join(";", project.PredictedTargetsToExecute.AppendedDefaultTargets)}]");
+                }
+
                 m_processOutputsPerProject[project] = projectOutputs;
 
                 failureDetail = string.Empty;
@@ -269,9 +313,29 @@ namespace BuildXL.FrontEnd.MsBuild
             ProjectWithPredictions project, 
             ProcessBuilder processBuilder)
         {
-            // Add all predicted inputs
+            // Predicted output directories for all direct dependencies, plus the output directories for the given project itself
+            var knownOutputDirectories = project.ProjectReferences.SelectMany(reference => reference.PredictedOutputFolders).Union(project.PredictedOutputFolders);
+
+            // Add all predicted inputs that are recognized as true source files
+            // This is done to make the weak fingerprint stronger. Pips are scheduled so undeclared source reads are allowed. This means
+            // we don't actually need accurate (or in fact any) input predictions to run successfully. But we are trying to avoid the degenerate case
+            // of a very small weak fingerprint with too many candidates, that can slow down two-phase cache look-up.
             foreach (AbsolutePath buildInput in project.PredictedInputFiles)
             {
+                // If any of the predicted inputs is under the predicted output folder of a dependency, then there is a very good chance the predicted input is actually an intermediate file
+                // In that case, don't add the input as a source file to stay on the safe side. Otherwise we will have a file that is both declared as a source file and contained in a directory
+                // dependency.
+                if (knownOutputDirectories.Any(outputFolder => buildInput.IsWithin(PathTable, outputFolder)))
+                {
+                    continue;
+                }
+
+                // If any of the predicted inputs is under an untracked directory scope, don't add it as an input
+                if (processBuilder.GetUntrackedDirectoryScopesSoFar().Any(untrackedDirectory => buildInput.IsWithin(PathTable, untrackedDirectory)))
+                {
+                    continue;
+                }
+
                 processBuilder.AddInputFile(FileArtifact.CreateSourceFile(buildInput));
             }
 
@@ -291,7 +355,7 @@ namespace BuildXL.FrontEnd.MsBuild
                 // Add all known explicit inputs from project references. But rule out
                 // projects that have a known empty list of targets: those projects are not scheduled, so
                 // there is nothing to consume from them.
-                references = project.ProjectReferences.Where(projectReference => !projectReference.PredictedTargetsToExecute.TargetsAreKnownToBeEmpty);
+                references = project.ProjectReferences.Where(projectReference => projectReference.PredictedTargetsToExecute.Targets.Count != 0);
             }
 
             var argumentsBuilder = processBuilder.ArgumentsBuilder;
@@ -334,7 +398,7 @@ namespace BuildXL.FrontEnd.MsBuild
                 return;
             }
 
-            foreach (ProjectWithPredictions dependency in project.ProjectReferences.Where(projectReference => !projectReference.PredictedTargetsToExecute.TargetsAreKnownToBeEmpty))
+            foreach (ProjectWithPredictions dependency in project.ProjectReferences.Where(projectReference => projectReference.PredictedTargetsToExecute.Targets.Count != 0))
             {
                 accumulatedDependencies.Add(dependency);
                 ComputeTransitiveDependenciesFor(dependency, accumulatedDependencies);
@@ -397,15 +461,26 @@ namespace BuildXL.FrontEnd.MsBuild
                     // Casing for paths is not stable as reported by BuildPrediction. So here we try to guess if the value
                     // represents a path, and normalize it
                     string value = kvp.Value;
-                    if (!string.IsNullOrEmpty(value) && value.TryCreateNormalizedAbsolutePath(PathTable, out var absolutePath))
+                    if (!string.IsNullOrEmpty(value) && AbsolutePath.TryCreate(PathTable, value, out var absolutePath))
                     {
-                        value = absolutePath.ToString(PathTable);
+                        envPipData.Add(absolutePath);
                     }
-
-                    envPipData.Add(value);
+                    else
+                    {
+                        envPipData.Add(value);
+                    }
+                    
                     processBuilder.SetEnvironmentVariable(
                         StringId.Create(m_context.StringTable, kvp.Key),
                         envPipData.ToPipData(string.Empty, PipDataFragmentEscaping.NoEscaping));
+                }
+            }
+
+            if (m_userDefinedPassthroughVariables != null)
+            {
+                foreach (string passThroughVariable in m_userDefinedPassthroughVariables)
+                {
+                    processBuilder.SetPassthroughEnvironmentVariable(StringId.Create(m_context.StringTable, passThroughVariable));
                 }
             }
         }
@@ -493,18 +568,22 @@ namespace BuildXL.FrontEnd.MsBuild
             // Just let it be killed.
             // TODO: Can we stop it running? https://stackoverflow.microsoft.com/questions/74425/how-to-disable-vctip-exe-in-vc14
             //
-            // conhost.exe: This process needs a little bit more time to finish after the main process. We shouldn't be allowing
-            // this one to survive, we just need the timeout to be slightly more than zero. This will also be beneficial to other 
-            // arbitrary processeses that need a little bit more time. But, apparently, setting a timeout has a perf impact that is 
-            // being investigated. TODO: revisit this once this is fixed.
+            // conhost.exe: This process needs a little bit more time to finish after the main process, but killing it right away
+            // is inconsequential. 
             //
             // All child processes: Don't wait to kill the processes.
             // CODESYNC: CloudBuild repo TrackerExecutor.cs "info.NestedProcessTerminationTimeout = TimeSpan.Zero"
             processBuilder.AllowedSurvivingChildProcessNames = ReadOnlyArray<PathAtom>.FromWithoutCopy(
                 PathAtom.Create(m_context.StringTable, "mspdbsrv.exe"),
                 PathAtom.Create(m_context.StringTable, "vctip.exe"),
-                PathAtom.Create(m_context.StringTable, "conhost.exe"));
-            processBuilder.NestedProcessTerminationTimeout = TimeSpan.Zero;
+                PathAtom.Create(m_context.StringTable, "conhost.exe"),
+                PathAtom.Create(m_context.StringTable, "VBCSCompiler.exe"));
+            // There are some cases (e.g. a 64-bit MSBuild launched as a child process from a 32-bit MSBuild instance) where
+            // processes need a little bit more time to finish. Increasing the timeout does not affect job objects where no child
+            // processes survive, or job object where the only surviving processes are the ones explicitly allowed to survive (which
+            // are killed immediately). So overall, this non-zero timeout will only make some pips that would have failed to take a little
+            // bit longer (and hopefully succeed)
+            processBuilder.NestedProcessTerminationTimeout = TimeSpan.FromMilliseconds(500);
 
             SetProcessEnvironmentVariables(CreateEnvironment(logDirectory, project), processBuilder);
 
@@ -546,27 +625,13 @@ namespace BuildXL.FrontEnd.MsBuild
             }
 
             // Targets to execute.
-            // If the prediction is available, there should be at least one target (otherwise it makes no sense to schedule the project, and we should have caught this earlier)
-            // If the prediction is not available, we fallback to call default targets (which means not passing any specific /t:). A more strict policy would be to bail out
-            // here saying that the project is not complying to the target protocol specification. We leave it relaxed for now, but we log it.
-            // https://github.com/Microsoft/msbuild/blob/master/documentation/specs/static-graph.md
-            if (project.PredictedTargetsToExecute.IsPredictionAvailable)
+            var targets = project.PredictedTargetsToExecute.Targets;
+            Contract.Assert(targets.Count > 0);
+            foreach (string target in targets)
             {
-                var targets = project.PredictedTargetsToExecute.Targets;
-                Contract.Assert(targets.Count > 0);
-                foreach (string target in targets)
-                {
-                    pipDataBuilder.Add(PipDataAtom.FromString($"/t:{target}"));
-                }
+                pipDataBuilder.Add(PipDataAtom.FromString($"/t:{target}"));
             }
-            else
-            {
-                // The prediction for the targets to execute is not available. Just log this as a warning for now, defaults targets will be used.
-                Tracing.Logger.Log.ProjectIsNotSpecifyingTheProjectReferenceProtocol(
-                    m_context.LoggingContext,
-                    Location.FromFile(project.FullPath.ToString(PathTable)),
-                    project.FullPath.GetName(m_context.PathTable).ToString(m_context.StringTable));
-            }
+
 
             // Pass the output result cache file if present
             if (outputResultCacheFile != AbsolutePath.Invalid)
@@ -652,7 +717,7 @@ namespace BuildXL.FrontEnd.MsBuild
 
             if (Engine.TryGetBuildParameter("PUBLIC", m_frontEndName, out string publicDir))
             {             
-                processBuilder.AddUntrackedDirectoryScope(DirectoryArtifact.CreateWithZeroPartialSealId(publicDir.ToNormalizedAbsolutePath(PathTable)));
+                processBuilder.AddUntrackedDirectoryScope(DirectoryArtifact.CreateWithZeroPartialSealId(AbsolutePath.Create(PathTable, publicDir)));
             }
 
             PipConstructionUtilities.UntrackUserConfigurableArtifacts(processBuilder, m_resolverSettings);
@@ -672,8 +737,11 @@ namespace BuildXL.FrontEnd.MsBuild
             var success = Root.TryGetRelative(PathTable, projectFile.FullPath, out var inFolderPathFromEnlistmentRoot);
             Contract.Assert(success);
 
-            // We hardcode the log to go under Logs (and follow the project structure underneath)
-            var result = m_frontEndHost.Configuration.Logging.LogsDirectory
+            // We hardcode the log to go under the output directory Logs/MSBuild (and follow the project structure underneath)
+            // The 'official' log directory (defined by Configuration.Logging) is not stable in CloudBuild across machines, and therefore it would
+            // introduce cache misses
+            var result = m_frontEndHost.Configuration.Layout.OutputDirectory
+                .Combine(PathTable, "Logs")
                 .Combine(PathTable, "MSBuild")
                 .Combine(PathTable, inFolderPathFromEnlistmentRoot);
 
@@ -681,7 +749,7 @@ namespace BuildXL.FrontEnd.MsBuild
             // Projects can be evaluated multiple times with different global properties (but same qualifiers), so just
             // the qualifier name is not enough
             List<string> values = qualifier.Values.Select(value => value.ToString(m_context.StringTable))
-                .Union(projectFile.GlobalProperties.Values)
+                .Union(projectFile.GlobalProperties.Where(kvp => kvp.Key != s_isGraphBuildProperty).Select(kvp => kvp.Value))
                 .Select(value => PipConstructionUtilities.SanitizeStringForSymbol(value))
                 .OrderBy(value => value, StringComparer.Ordinal) // Let's make sure we always produce the same string for the same set of values
                 .ToList();
@@ -700,7 +768,17 @@ namespace BuildXL.FrontEnd.MsBuild
             ProcessBuilder processBuilder,
             ProjectWithPredictions project)
         {
-            FileArtifact cmdExeArtifact = FileArtifact.CreateSourceFile(m_msBuildExePath);
+            // If we should use the dotnet core version of msbuild, the executable for the pip is dotnet.exe instead of msbuild.exe, and
+            // the first argument is msbuild.dll
+            FileArtifact cmdExeArtifact;
+            if (m_resolverSettings.ShouldRunDotNetCoreMSBuild())
+            {
+                cmdExeArtifact = FileArtifact.CreateSourceFile(m_dotnetExePath);
+                processBuilder.ArgumentsBuilder.Add(PipDataAtom.FromAbsolutePath(m_msBuildPath));
+            }
+            else {
+                cmdExeArtifact = FileArtifact.CreateSourceFile(m_msBuildPath);
+            }
 
             processBuilder.Executable = cmdExeArtifact;
             processBuilder.AddInputFile(cmdExeArtifact);
@@ -712,8 +790,6 @@ namespace BuildXL.FrontEnd.MsBuild
             // the temp dir is generated in a consistent fashion between BuildXL runs to
             // ensure environment value (and hence pip hash) consistency.
             processBuilder.EnableTempDirectory();
-
-            AbsolutePath toolDir = m_msBuildExePath.GetParent(PathTable);
 
             processBuilder.ToolDescription = StringId.Create(m_context.StringTable, I($"{m_moduleDefinition.Descriptor.Name} - {project.FullPath.ToString(PathTable)}"));
 
@@ -766,7 +842,9 @@ namespace BuildXL.FrontEnd.MsBuild
             var valueName = PipConstructionUtilities.SanitizeStringForSymbol(project.FullPath.GetName(PathTable).ToString(m_context.StringTable));
 
             // If global properties are present, we append to the value name a flatten representation of them
-            if (project.GlobalProperties.Count > 0)
+            // There should always be a 'IsGraphBuild' property, so we count > 1
+            Contract.Assert(project.GlobalProperties.ContainsKey(s_isGraphBuildProperty));
+            if (project.GlobalProperties.Count > 1)
             {
                 valueName += ".";
             }
@@ -775,6 +853,7 @@ namespace BuildXL.FrontEnd.MsBuild
                 project.GlobalProperties
                     // let's sort global properties keys to make sure the same string is generated consistently
                     // case-sensitivity is already handled (and ignored) by GlobalProperties class 
+                    .Where(kvp => kvp.Key != s_isGraphBuildProperty)
                     .OrderBy(kvp => kvp.Key, StringComparer.Ordinal) 
                     .Select(gp => $"{PipConstructionUtilities.SanitizeStringForSymbol(gp.Key)}_{PipConstructionUtilities.SanitizeStringForSymbol(gp.Value)}"));
 
@@ -793,12 +872,8 @@ namespace BuildXL.FrontEnd.MsBuild
                 StringBuilder builder = builderWrapper.Instance;
                 builder.Append(projectWithPredictions.FullPath.ToString(PathTable));
                 builder.Append("|");
-                var predictionsAvailable = projectWithPredictions.PredictedTargetsToExecute.IsPredictionAvailable;
-                builder.Append(predictionsAvailable);
-                if (predictionsAvailable)
-                {
-                    builder.Append(string.Join("|", projectWithPredictions.PredictedTargetsToExecute.Targets));
-                }
+                builder.Append(projectWithPredictions.PredictedTargetsToExecute.IsDefaultTargetsAppended);
+                builder.Append(string.Join("|", projectWithPredictions.PredictedTargetsToExecute.Targets));
  
                 builder.Append("|");
                 builder.Append(string.Join("|", projectWithPredictions.GlobalProperties.Select(kvp => kvp.Key + "|" + kvp.Value)));

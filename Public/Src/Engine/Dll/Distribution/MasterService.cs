@@ -4,6 +4,8 @@
 using System;
 using System.Diagnostics.CodeAnalysis;
 using System.Diagnostics.ContractsLight;
+using System.Diagnostics.Tracing;
+using System.Threading;
 using System.Threading.Tasks;
 using BuildXL.Cache.ContentStore.Hashing;
 using BuildXL.Engine.Cache.Fingerprints;
@@ -15,11 +17,6 @@ using BuildXL.Scheduler.Distribution;
 using BuildXL.Utilities;
 using BuildXL.Utilities.Configuration;
 using BuildXL.Utilities.Instrumentation.Common;
-#if FEATURE_MICROSOFT_DIAGNOSTICS_TRACING
-using Microsoft.Diagnostics.Tracing;
-#else
-using System.Diagnostics.Tracing;
-#endif
 
 namespace BuildXL.Engine.Distribution
 {
@@ -52,11 +49,10 @@ namespace BuildXL.Engine.Distribution
         private IPipExecutionEnvironment m_environment;
         private ExecutionResultSerializer m_resultSerializer;
         private PipGraphCacheDescriptor m_cachedGraphDescriptor;
-        private bool m_hasInfrastructureFailures;
         private readonly ushort m_buildServicePort;
-        private readonly bool m_isGrpcEnabled;
-
         private readonly IServer m_masterServer;
+
+        internal readonly SemaphoreSlim WorkerAttachSemaphore = new SemaphoreSlim(EngineEnvironmentSettings.MaxConcurrentWorkersAttachLimit);
 
         internal readonly DistributionServices DistributionServices;
 
@@ -68,8 +64,6 @@ namespace BuildXL.Engine.Distribution
         {
             Contract.Requires(config != null && config.BuildRole == DistributedBuildRoles.Master);
             Contract.Ensures(m_remoteWorkers != null);
-
-            m_isGrpcEnabled = config.IsGrpcEnabled;
 
             // Create all remote workers
             m_buildServicePort = config.BuildServicePort;
@@ -83,19 +77,10 @@ namespace BuildXL.Engine.Distribution
                 var configWorker = config.BuildWorkers[i];
                 var workerId = i + 1; // 0 represents the local worker.
                 var serviceLocation = new ServiceLocation { IpAddress = configWorker.IpAddress, Port = configWorker.BuildServicePort };
-                m_remoteWorkers[i] = new RemoteWorker(m_isGrpcEnabled, loggingContext, (uint)workerId, this, serviceLocation);
+                m_remoteWorkers[i] = new RemoteWorker(loggingContext, (uint)workerId, this, serviceLocation);
             }
 
-            if (m_isGrpcEnabled)
-            {
-                m_masterServer = new Grpc.GrpcMasterServer(loggingContext, this, buildId);
-            }
-            else
-            {
-#if !DISABLE_FEATURE_BOND_RPC
-                m_masterServer = new InternalBond.BondMasterServer(loggingContext, this);
-#endif
-            }
+            m_masterServer = new Grpc.GrpcMasterServer(loggingContext, this, buildId);
         }
 
         /// <summary>
@@ -124,23 +109,6 @@ namespace BuildXL.Engine.Distribution
         /// Content hash of symlink file.
         /// </summary>
         public ContentHash SymlinkFileContentHash { get; set; } = WellKnownContentHashes.AbsentFile;
-
-        /// <summary>
-        /// Remote workers set this flag if they lose connection with remote machines and have to fail pips.
-        /// </summary>
-        internal bool HasInfrastructureFailures
-        {
-            get
-            {
-                return m_hasInfrastructureFailures;
-            }
-
-            set
-            {
-                Contract.Requires(value, "The value can only be set to true.");
-                m_hasInfrastructureFailures = value;
-            }
-        }
 
         /// <summary>
         /// Prepares the master for pips execution
@@ -174,12 +142,11 @@ namespace BuildXL.Engine.Distribution
 
             if (notification.ExecutionLogData != null && notification.ExecutionLogData.Count != 0)
             {
-                // NOTE: We need to log the execution blob synchronously as the order of the execution log events
-                // must be retained for proper deserialization
-                worker.LogExecutionBlob(notification.ExecutionLogData, notification.ExecutionLogBlobSequenceNumber);
+                // The channel is unblocked and ACK is sent after we put the execution blob to the queue in 'LogExecutionBlobAsync' method.
+                await worker.LogExecutionBlobAsync(notification);
             }
 
-            // Return immediately to unblock worker
+            // Return immediately to unblock the channel so that worker can receive the ACK for the sent message
             await Task.Yield();
 
             foreach (var forwardedEvent in notification.ForwardedEvents)
@@ -198,6 +165,7 @@ namespace BuildXL.Engine.Distribution
                                 EventName = forwardedEvent.EventName,
                                 EventKeywords = forwardedEvent.EventKeywords,
                             });
+                        m_loggingContext.SpecifyErrorWasLogged((ushort)forwardedEvent.EventId);
                         break;
                     case EventLevel.Warning:
                         Logger.Log.DistributionWorkerForwardedWarning(

@@ -2,16 +2,13 @@
 // Licensed under the MIT license. See LICENSE file in the project root for full license information.
 
 using System;
+using System.Collections.Generic;
 using System.ComponentModel;
 using System.Diagnostics.ContractsLight;
+using System.Linq;
 using System.Threading.Tasks;
 using BuildXL.Cache.Interfaces;
 using BuildXL.Utilities;
-
-[module: System.Diagnostics.CodeAnalysis.SuppressMessage("Microsoft.Performance", "CA1812:AvoidUninstantiatedInternalClasses",
-    Scope = "type",
-    Target = "BuildXL.Cache.Compositing.CompositingCacheFactory+Config",
-    Justification = "Tool is confused - it is constructed generically")]
 
 namespace BuildXL.Cache.Compositing
 {
@@ -106,6 +103,25 @@ namespace BuildXL.Cache.Compositing
                 Analysis.IgnoreResult(await cas.ShutdownAsync(), justification: "Okay to ignore shutdown status");
                 throw;
             }
+        }
+
+        /// <inheritdoc />
+        public IEnumerable<Failure> ValidateConfiguration(ICacheConfigData cacheData)
+        {
+            return CacheConfigDataValidator.ValidateConfiguration<Config>(cacheData, compositingConfig =>
+            {
+                var failures = new List<Failure>();
+
+                failures.AddRange(
+                    CacheFactory.ValidateConfig(compositingConfig.MetadataCache)
+                        .Select(failure => new Failure<string>($"{nameof(compositingConfig.MetadataCache)} validation failed", failure)));
+
+                failures.AddRange(
+                    CacheFactory.ValidateConfig(compositingConfig.CasCache)
+                        .Select(failure => new Failure<string>($"{nameof(compositingConfig.CasCache)} validation failed", failure)));
+
+                return failures;
+            });
         }
     }
 }

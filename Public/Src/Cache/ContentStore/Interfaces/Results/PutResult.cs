@@ -104,8 +104,16 @@ namespace BuildXL.Cache.ContentStore.Interfaces.Results
         public override string ToString()
         {
             return Succeeded
-                ? $"Success Hash={ContentHash}, Size={ContentSize}"
+                ? $"Success Hash={ContentHash.ToShortString()} Size={ContentSize}{this.GetDiagnosticsMessageForTracing()}"
                 : GetErrorString();
         }
+
+        internal class ExtraMetadata
+        {
+            public TimeSpan GateWaitTime;
+            public int GateOccupiedCount;
+        }
+
+        internal ExtraMetadata Metadata { get; set; }
     }
 }

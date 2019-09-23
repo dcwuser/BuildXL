@@ -75,7 +75,8 @@ namespace ContentStoreTest.Distributed.Sessions
             bool enableDistributedEviction,
             int? replicaCreditInMinutes,
             bool enableRepairHandling,
-            bool emptyFileHashShortcutEnabled)
+            bool emptyFileHashShortcutEnabled,
+            object additionalArgs)
         {
             var rootPath = testDirectory.Path / "Root";
             var tempPath = testDirectory.Path / "Temp";
@@ -130,13 +131,17 @@ namespace ContentStoreTest.Distributed.Sessions
                 fileCopier,
                 fileCopier,
                 pathTransformer,
+                fileCopier,
                 ContentAvailabilityGuarantee,
                 tempPath,
                 FileSystem,
                 RedisContentLocationStoreConstants.DefaultBatchSize,
-                retryIntervalForCopies: DistributedContentSessionTests.DefaultRetryIntervalsForTest,
+                settings: new DistributedContentStoreSettings
+                {
+                    RetryIntervalForCopies = DistributedContentSessionTests.DefaultRetryIntervalsForTest,
+                    PinConfiguration = PinConfiguration,
+                },
                 replicaCreditInMinutes: replicaCreditInMinutes,
-                pinConfiguration: PinConfiguration,
                 clock: TestClock,
                 enableRepairHandling: enableRepairHandling,
                 contentStoreSettings: new ContentStoreSettings()
@@ -144,7 +149,8 @@ namespace ContentStoreTest.Distributed.Sessions
                     CheckFiles = true,
                     UseEmptyFileHashShortcut = emptyFileHashShortcutEnabled,
                     UseLegacyQuotaKeeperImplementation = false,
-                });
+                },
+                setPostInitializationCompletionAfterStartup: true);
 
             distributedContentStore.DisposeContentStoreFactory = false;
             return distributedContentStore;

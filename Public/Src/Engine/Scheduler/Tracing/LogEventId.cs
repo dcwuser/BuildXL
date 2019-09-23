@@ -31,6 +31,7 @@ namespace BuildXL.Scheduler.Tracing
         PipInputVerificationUntrackedInput = 3613,
         StorageRemoveAbsentFileOutputWarning = 3614,
         StorageCacheCleanDirectoryOutputError = 3615,
+        StorageSymlinkDirInOutputDirectoryWarning = 3616,
 
         PipInputVerificationMismatchRecovery = 3617,
         PipInputVerificationMismatchRecoveryExpectedExistence = 3618,
@@ -63,6 +64,8 @@ namespace BuildXL.Scheduler.Tracing
         // Reserved = 3640,
         SavePreservedOutputsTracker = 3641,
 
+        AddAugmentingPathSet = 3651,
+        AugmentedWeakFingerprint = 3652,
         PipTwoPhaseCacheGetCacheEntry = 3653,
         PipTwoPhaseCachePublishCacheEntry = 3654,
         ScheduleProcessNotStoredToWarningsUnderWarnAsError = 3655,
@@ -77,6 +80,8 @@ namespace BuildXL.Scheduler.Tracing
         HistoricMetadataCacheLoadFailed = 3664,
 
         PipCacheMetadataBelongToAnotherPip = 3700,
+
+        PipIpcFailedDueToInfrastructureError = 3701,
 
         // RESERVED TO [5000, 5050] (BuildXL.Scheduler.dll)
 
@@ -131,6 +136,17 @@ namespace BuildXL.Scheduler.Tracing
         AbsentPathProbeInsideUndeclaredOpaqueDirectory = 5043,
 
         AllowedSameContentDoubleWrite = 5044,
+
+        InitiateWorkerRelease = 5045,
+        WorkerReleasedEarly = 5046, 
+        DependencyViolationWriteOnExistingFile = 5047,
+        FailedToAddFragmentPipToGraph = 5048,
+        ExceptionOnAddingFragmentPipToGraph = 5049,
+        ExceptionOnDeserializingPipGraphFragment = 5050,
+        DeserializationStatsPipGraphFragment = 5051,
+        DebugFragment = 5052,
+
+        ProblematicWorkerExit = 5070,
 
         // was DependencyViolationGenericWithRelatedPip_AsError = 25000,
         // was DependencyViolationGeneric_AsError = 25001,

@@ -222,6 +222,7 @@ namespace Test.BuildXL.Processes
             // process is running in an infinite loop, but we have a timeout installed
             SandboxedProcessResult result = await RunProcess(info);
             XAssert.IsTrue(result.TimedOut);
+            XAssert.IsTrue(result.Killed);
             XAssert.AreEqual(ExitCodes.Timeout, result.ExitCode);
         }
 
@@ -1050,7 +1051,7 @@ namespace Test.BuildXL.Processes
             {
                 PipSemiStableHash = 0,
                 PipDescription = DiscoverCurrentlyExecutingXunitTestMethodFQN(),
-                SandboxedKextConnection = GetSandboxedKextConnection()
+                SandboxConnection = GetSandboxConnection()
             };
 
             try
@@ -1110,6 +1111,63 @@ namespace Test.BuildXL.Processes
                 expectedReportedArgs,
                 result.Processes[0].ProcessArgs,
                 "The captured processes arguments are incorrect");
+        }
+
+        [FactIfSupported(requiresUnixBasedOperatingSystem: true)]
+        public async Task TrackVForkAsync()
+        {
+            using (var tempFiles = new TempFileStorage(canGetFileNames: true))
+            {
+                string tempFileName = tempFiles.GetUniqueFileName();
+                var pt = new PathTable();
+                var info =
+                    // 'time' uses vfork on macOS
+                    new SandboxedProcessInfo(pt, tempFiles, "/usr/bin/time", disableConHostSharing: false)
+                    {
+                        PipSemiStableHash = 0,
+                        PipDescription = DiscoverCurrentlyExecutingXunitTestMethodFQN(),
+                        Arguments = $"touch '{tempFileName}'",
+                    };
+                info.FileAccessManifest.PipId = GetNextPipId();
+                info.FileAccessManifest.ReportFileAccesses = true;
+                info.FileAccessManifest.FailUnexpectedFileAccesses = false;
+                info.SandboxConnection = GetSandboxConnection();
+
+                var result = await RunProcess(info);
+                XAssert.AreEqual(0, result.ExitCode);
+                XAssert.IsNotNull(result.FileAccesses);
+
+                // Restrict reports to those of type 'Process' and 'ProcessExit', then 
+                // create a mapping from operation type to reported paths for that operation
+                var ProcessOperations = new[] { ReportedFileOperation.Process, ReportedFileOperation.ProcessExit };
+                Dictionary<ReportedFileOperation, HashSet<string>> op2paths = result
+                    .FileAccesses
+                    .Where(report => ProcessOperations.Contains(report.Operation))
+                    .GroupBy(report => report.Operation)
+                    .ToDictionary(
+                        grp => grp.Key,
+                        grp => grp
+                            .Select(report => report.GetPath(pt))
+                            .Select(Path.GetFileName)
+                            .ToHashSet());
+
+                // assert both 'Process' and 'ProcessExit' operations have been reported
+                XAssert.Contains(op2paths.Keys, ReportedFileOperation.Process, ReportedFileOperation.ProcessExit);
+
+                // assert both 'time' and 'touch' processes have been reported
+                XAssert.Contains(op2paths[ReportedFileOperation.Process], "time", "touch");
+                XAssert.Contains(op2paths[ReportedFileOperation.ProcessExit], "time", "touch");
+
+                // assert that all accesses to 'tempFileName' were done by the 'touch' process
+                var accessesToTempFile = result
+                    .FileAccesses
+                    .Where(report => report.GetPath(pt) == tempFileName)
+                    .Select(report => report.Process.Path)
+                    .Select(Path.GetFileName)
+                    .Distinct()
+                    .ToList();
+                XAssert.SetEqual(accessesToTempFile, new[] { "touch" });
+            }
         }
 
         private void AssertReportedAccessesIsEmpty(PathTable pathTable, IEnumerable<ReportedFileAccess> result)

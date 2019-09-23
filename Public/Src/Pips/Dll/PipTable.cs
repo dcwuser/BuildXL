@@ -43,12 +43,12 @@ namespace BuildXL.Pips
             protected override BuildXLWriter CreateWriter(Stream stream, bool leaveOpen)
             {
                 Contract.Requires(CanWrite);
-                return new PipWriter(this, stream, leaveOpen, logStats: true);
+                return new PipWriter(Debug, stream, leaveOpen, logStats: true);
             }
 
             protected override BuildXLReader CreateReader(Stream stream, bool leaveOpen)
             {
-                return new PipReader(this, stream, leaveOpen);
+                return new PipReader(Debug, StringTable, stream, leaveOpen);
             }
 
             public static async Task<PageablePipStore> DeserializeAsync(BuildXLReader reader, Task<PathTable> pathTableTask, Task<SymbolTable> symbolTableTask, int initialBufferSize)
@@ -545,6 +545,17 @@ namespace BuildXL.Pips
             Contract.Requires(!IsDisposed);
             Contract.Requires(IsValid(pipId));
             return m_mutables[pipId.Value].SemiStableHash;
+        }
+
+        /// <summary>
+        /// Get a scheduling priority for a pip
+        /// </summary>
+        public int GetPipPriority(PipId pipId)
+        {
+            Contract.Requires(!IsDisposed);
+            Contract.Requires(IsValid(pipId));
+            var mutablePipState = m_mutables[pipId.Value];
+            return mutablePipState.PipType == PipType.Process ? ((ProcessMutablePipState)mutablePipState).Priority : 0;
         }
 
         /// <summary>

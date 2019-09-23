@@ -2,6 +2,7 @@
 // Licensed under the MIT license. See LICENSE file in the project root for full license information.
 
 import * as Native from "Sdk.Native";
+import {Transformer} from "Sdk.Transformers";
 
 namespace Core {
     export declare const qualifier: BuildXLSdk.PlatformDependentQualifier;
@@ -34,7 +35,9 @@ namespace Core {
         f`PolicySearch.h`,
         f`DeviceMap.h`,
         f`DetouredProcessInjector.h`,
-        f`UniqueHandle.h`
+        f`UniqueHandle.h`,
+        f`SubstituteProcessExecution.h`,
+        f`FilesCheckedForAccess.h`,
     ];
 
     export const pathToDeviceMapLib: PathAtom = a`${qualifier.platform.replace("x", qualifier.configuration)}`;
@@ -82,6 +85,7 @@ namespace Core {
                 f`DeviceMap.cpp`,
                 f`SendReport.cpp`,
                 f`DetouredProcessInjector.cpp`,
+                f`SubstituteProcessExecution.cpp`,
             ],
 
             exports: [
@@ -123,6 +127,8 @@ namespace Core {
                 f`PolicySearch.cpp`,
                 f`DeviceMap.cpp`,
                 f`DetouredProcessInjector.cpp`,
+                f`SubstituteProcessExecution.cpp`,
+                f`FilesCheckedForAccess.cpp`,
             ],
 
             exports: [

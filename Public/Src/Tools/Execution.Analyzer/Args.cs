@@ -5,9 +5,12 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Diagnostics.ContractsLight;
+using System.Diagnostics.Tracing;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
+using BuildXL.Pips.Operations;
 using BuildXL.Storage;
 using BuildXL.ToolSupport;
 using BuildXL.Utilities;
@@ -18,6 +21,19 @@ using HelpLevel = BuildXL.ToolSupport.HelpLevel;
 
 namespace BuildXL.Execution.Analyzer
 {
+    internal class ConsoleEventListener : FormattingEventListener
+    {
+        public ConsoleEventListener(Events eventSource, DateTime baseTime, WarningMapper warningMapper = null, EventLevel level = EventLevel.Verbose, bool captureAllDiagnosticMessages = false, TimeDisplay timeDisplay = TimeDisplay.None, EventMask eventMask = null, DisabledDueToDiskWriteFailureEventHandler onDisabledDueToDiskWriteFailure = null, bool listenDiagnosticMessages = false, bool useCustomPipDescription = false)
+            : base(eventSource, baseTime, warningMapper, level, captureAllDiagnosticMessages, timeDisplay, eventMask, onDisabledDueToDiskWriteFailure, listenDiagnosticMessages, useCustomPipDescription)
+        {
+        }
+
+        protected override void Output(EventLevel level, int id, string eventName, EventKeywords eventKeywords, string text, bool doNotTranslatePaths = false)
+        {
+            Console.WriteLine($"[{DateTime.Now:HH:mm:ss.ff}] {text}");
+        }
+    }
+
     internal sealed partial class Args : CommandLineUtilities
     {
         private static readonly string[] s_helpStrings = new[] { "?", "help" };
@@ -34,6 +50,7 @@ namespace BuildXL.Execution.Analyzer
 
         public readonly LoggingContext LoggingContext = new LoggingContext("BuildXL.Execution.Analyzer");
         public readonly TrackingEventListener TrackingEventListener = new TrackingEventListener(Events.Log);
+        public readonly ConsoleEventListener ConsoleListener = new ConsoleEventListener(Events.Log, DateTime.UtcNow);
 
         // Variables that are unused without full telemetry
         private readonly bool m_telemetryDisabled = false;
@@ -141,8 +158,8 @@ namespace BuildXL.Execution.Analyzer
                 throw Error("Additional executionLog to compare parameter is required");
             }
 
-            // The fingerprint store based cache miss analyzer only uses graph information from the newer build,
-            // so skip loading the graph for the earlier build
+            // The fingerprint store based cache miss analyzer
+            // only uses graph information from the newer build, so skip loading the graph for the earlier build
             if (m_mode.Value != AnalysisMode.CacheMiss)
             {
                 if (!m_analysisInput.LoadCacheGraph(cachedGraphDirectory))
@@ -295,6 +312,9 @@ namespace BuildXL.Execution.Analyzer
                 case AnalysisMode.PipFingerprint:
                     m_analyzer = InitializePipFingerprintAnalyzer(m_analysisInput);
                     break;
+                case AnalysisMode.RequiredDependencies:
+                    m_analyzer = InitializeRequiredDependencyAnalyzer();
+                    break;
                 case AnalysisMode.ScheduledInputsOutputs:
                     m_analyzer = InitializeScheduledInputsOutputsAnalyzer();
                     break;
@@ -316,6 +336,22 @@ namespace BuildXL.Execution.Analyzer
                 case AnalysisMode.DumpMounts:
                     m_analyzer = InitializeDumpMountsAnalyzer();
                     break;
+                case AnalysisMode.CopyFile:
+                    m_analyzer = InitializeCopyFilesAnalyzer();
+                    break;
+#if NET_FRAMEWORK
+                case AnalysisMode.ContentPlacement:
+                    m_analyzer = InitializeContentPlacementAnalyzer();
+                    break;
+#endif
+                case AnalysisMode.XlgToDb:
+                    m_analyzer = InitializeXLGToDBAnalyzer();
+                    break;
+                case AnalysisMode.DebugLogs:
+                    ConsoleListener.RegisterEventSource(ETWLogger.Log);
+                    ConsoleListener.RegisterEventSource(FrontEnd.Script.Debugger.ETWLogger.Log);
+                    m_analyzer = InitializeDebugLogsAnalyzer();
+                    break;
                 default:
                     Contract.Assert(false, "Unhandled analysis mode");
                     break;
@@ -331,6 +367,14 @@ namespace BuildXL.Execution.Analyzer
             }
         }
 
+        public static void TruncatedXlgWarning()
+        {
+            ConsoleColor originalColor = Console.ForegroundColor;
+            Console.ForegroundColor = ConsoleColor.Yellow;
+            Console.Error.WriteLine("WARNING: Execution log file possibly truncated, results may be incomplete!");
+            Console.ForegroundColor = originalColor;
+        }
+
         public int Analyze()
         {
             if (m_analyzer == null)
@@ -339,14 +383,15 @@ namespace BuildXL.Execution.Analyzer
             }
 
             m_analyzer.Prepare();
+            bool dataIsComplete = true;
             if (m_analysisInput.ExecutionLogPath != null)
             {
                 // NOTE: We call Prepare above so we don't need to prepare as a part of reading the execution log
-                var reader = Task.Run(() => m_analyzer.ReadExecutionLog(prepare: false));
+                var reader = Task.Run(() => dataIsComplete &= m_analyzer.ReadExecutionLog(prepare: false));
                 if (m_mode == AnalysisMode.LogCompare)
                 {
                     m_analyzerOther.Prepare();
-                    var otherReader = Task.Run(() => m_analyzerOther.ReadExecutionLog());
+                    var otherReader = Task.Run(() => dataIsComplete &= m_analyzerOther.ReadExecutionLog());
                     otherReader.Wait();
                 }
 
@@ -354,7 +399,7 @@ namespace BuildXL.Execution.Analyzer
                 {
                     var start = DateTime.Now;
                     Console.WriteLine($"[{start}] Reading compare to Log");
-                    var otherReader = Task.Run(() => m_analyzerOther.ReadExecutionLog());
+                    var otherReader = Task.Run(() => dataIsComplete &= m_analyzerOther.ReadExecutionLog());
                     otherReader.Wait();
                     var duration = DateTime.Now - start;
                     Console.WriteLine($"Done reading compare to log : duration = [{duration}]");
@@ -365,13 +410,18 @@ namespace BuildXL.Execution.Analyzer
                 if (m_mode == AnalysisMode.CacheMissLegacy)
                 {
                     // First pass just to read in PipCacheMissType data
-                    var otherReader = Task.Run(() => m_analyzerOther.ReadExecutionLog());
+                    var otherReader = Task.Run(() => dataIsComplete &= m_analyzerOther.ReadExecutionLog());
                     otherReader.Wait();
 
                     // Second pass to do fingerprint differences analysis
-                    otherReader = Task.Run(() => m_analyzerOther.ReadExecutionLog());
+                    otherReader = Task.Run(() => dataIsComplete &= m_analyzerOther.ReadExecutionLog());
                     otherReader.Wait();
                 }
+            }
+
+            if (!dataIsComplete)
+            {
+                TruncatedXlgWarning();
             }
 
             var exitCode = m_analyzer.Analyze();
@@ -400,7 +450,7 @@ namespace BuildXL.Execution.Analyzer
             return exitCode;
         }
 
-        #region Telemetry
+#region Telemetry
 
         private void HandleUnhandledFailure(Exception exception)
         {
@@ -450,7 +500,7 @@ namespace BuildXL.Execution.Analyzer
             }
         }
 
-        #endregion Telemetry
+#endregion Telemetry
 
         private AnalysisInput GetAnalysisInput()
         {
@@ -571,11 +621,35 @@ namespace BuildXL.Execution.Analyzer
 
             writer.WriteLine("");
             WriteCosineDumpPipHelp(writer);
+
+            writer.WriteLine("");
+            WriteCopyFilesAnalyzerHelp(writer);
+
+            writer.WriteLine("");
+            WriteXLGToDBHelp(writer);
+
+//writer.WriteLine("");
+//WriteDominoInvocationHelp(writer);
+#if NET_FRAMEWORK
+            writer.WriteLine("");
+            WriteContentPlacementAnalyzerHelp(writer);
+#endif
         }
 
         public void LogEventSummary()
         {
             Tracing.Logger.Log.ExecutionAnalyzerEventCount(LoggingContext, TrackingEventListener.ToEventCountDictionary());
+        }
+
+        public long ParseSemistableHash(Option opt)
+        {
+            var adjustedOption = new Option() { Name = opt.Name, Value = opt.Value.ToUpper().Replace(Pip.SemiStableHashPrefix.ToUpper(), "") };
+            if (!Int64.TryParse(ParseStringOption(adjustedOption), NumberStyles.HexNumber, CultureInfo.InvariantCulture, out long sshValue) || sshValue == 0)
+            {
+                throw Error("Invalid pip: {0}. Id must be a semistable hash that starts with Pip i.e.: PipC623BCE303738C69", opt.Value);
+            }
+
+            return sshValue;
         }
     }
 

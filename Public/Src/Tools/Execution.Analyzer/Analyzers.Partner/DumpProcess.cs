@@ -44,7 +44,7 @@ namespace BuildXL.Execution.Analyzer
                 else if (opt.Name.StartsWith("pip", StringComparison.OrdinalIgnoreCase) ||
                    opt.Name.StartsWith("p", StringComparison.OrdinalIgnoreCase))
                 {
-                    semistableHash = Convert.ToInt64(ParseStringOption(opt), 16);
+                    semistableHash = ParseSemistableHash(opt);
                 }
                 else if (opt.Name.StartsWith("root", StringComparison.OrdinalIgnoreCase) ||
                     opt.Name.StartsWith("r", StringComparison.OrdinalIgnoreCase))
@@ -196,7 +196,7 @@ namespace BuildXL.Execution.Analyzer
 
                                     writer.WriteStartElement("Process");
                                     writer.WriteAttributeString("Name", pip.Executable.Path.ToString(PathTable, rootExpander));
-                                    writer.WriteAttributeString("CMD", GetArgumentsDataFromProcess(pip).ToString(expandRoot, PathTable.StringTable, PipData.MaxMonikerRenderer));
+                                    writer.WriteAttributeString("CMD", RenderProcessArguments(pip));
                                     writer.WriteElementString("Description", pip.GetDescription(PipGraph.Context));
 
                                     writer.WriteStartElement("EnvironmentVariables");

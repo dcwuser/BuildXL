@@ -612,9 +612,14 @@ namespace BuildXL.Scheduler
         OutputsWithNoFileAccessRetriesCount,
 
         /// <summary>
-        /// Counts the number of retries for pips because of mismatche of detours message count.
+        /// Counts the number of retries for pips because of mismatches of detours message count.
         /// </summary>
         MismatchMessageRetriesCount,
+
+        /// <summary>
+        /// Counts the number of retries for pips because of Azure Watson's 0xDEAD exit code.
+        /// </summary>
+        AzureWatsonExitCodeRetriesCount,
 
         /// <summary>
         /// Counts the number of retries for pips because users allow them to be retried, e.g., based on their exit codes.
@@ -1020,6 +1025,16 @@ namespace BuildXL.Scheduler
         RemoteWorker_BuildRequestSendDuration,
 
         /// <nodoc/>
+        [CounterType(CounterType.Stopwatch)]
+        RemoteWorker_AwaitExecutionBlobCompletionDuration,
+
+        /// <nodoc/>
+        RemoteWorker_EarlyReleaseDrainDurationMs,
+
+        /// <nodoc/>
+        RemoteWorker_EarlyReleaseSavingDurationMs,
+
+        /// <nodoc/>
         BuildRequestBatchesSentToWorkers,
 
         /// <nodoc/>
@@ -1092,7 +1107,13 @@ namespace BuildXL.Scheduler
         MinCacheEntriesVisitedForMiss,
 
         /// <nodoc/>
-        NumPipsUsingMinimalGraphFileSystem
+        NumPipsUsingMinimalGraphFileSystem,
+
+        /// <nodoc/>
+        NumFilesFailedToMaterialize,
+
+        /// <nodoc/>
+        NumFilesFailedToMaterializeDueToEarlyWorkerRelease
     }
 
     /// <summary>

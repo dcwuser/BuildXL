@@ -53,6 +53,11 @@ export interface Assembly extends Deployment.Deployable {
     runtime?: Binary;
 
     /**
+     * Optional native executable (for programs compiled to native with ILCompiler)
+     */
+    nativeExecutable?: File;
+
+    /**
      * The direct references of the assembly.
      */
     references: Reference[];
@@ -124,18 +129,26 @@ export interface LinkResource {
 }
 
 @@public
-export function isBinary(item: Reference) : item is Binary {
+export function isBinary(item: any) : item is Binary {
     return item["binary"] !== undefined;
 }
 
 @@public
-export function isAssembly(item: Reference) : item is Assembly {
+export function isAssembly(item: any) : item is Assembly {
     return item["name"] !== undefined &&
-    (item["compile"] !== undefined || item["runtime"] !== undefined) &&
-    item["contents"] === undefined; // Exclude nuget packages
+           (item["compile"] !== undefined || item["runtime"] !== undefined) &&
+           item["contents"] === undefined; // Exclude nuget packages
 }
 
 @@public
-export function isManagedPackage(item: NugetPackage) : item is ManagedNugetPackage {
-    return item["compile"] !== undefined || item["runtime"] !== undefined || item["runtimeContent"] !== undefined || item["analyzers"] !== undefined;
+export function isManagedPackage(item: any) : item is ManagedNugetPackage {
+    return item["compile"] !== undefined ||
+           item["runtime"] !== undefined ||
+           item["runtimeContent"] !== undefined ||
+           item["analyzers"] !== undefined;
+}
+
+@@public
+export function getExecutable(assembly: Assembly): File {
+    return assembly.nativeExecutable || assembly.runtime.binary;
 }

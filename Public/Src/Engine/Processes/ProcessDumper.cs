@@ -10,13 +10,11 @@ using System.Globalization;
 using System.IO;
 using System.IO.Compression;
 using System.Linq;
+using System.Management;
 using System.Runtime.InteropServices;
 using BuildXL.Native.IO;
 using BuildXL.Native.Processes.Windows;
 using BuildXL.Utilities;
-#if !DISABLE_FEATURE_SYSTEM_MANAGEMENT
-using System.Management;
-#endif
 
 namespace BuildXL.Processes
 {
@@ -95,7 +93,7 @@ namespace BuildXL.Processes
 
                 if (compress)
                 {
-                    uncompressedDumpPath = dumpPath + ".tmp";
+                    uncompressedDumpPath = dumpPath + ".dmp.tmp";
                     Analysis.IgnoreResult(FileUtilities.TryDeleteFile(uncompressedDumpPath));
                 }
 
@@ -127,7 +125,7 @@ namespace BuildXL.Processes
                     using (FileStream compressedDumpStream = new FileStream(dumpPath, FileMode.Create))
                     using (var archive = new ZipArchive(compressedDumpStream, ZipArchiveMode.Create))
                     {
-                        var entry = archive.CreateEntry(Path.GetFileNameWithoutExtension(dumpPath) + ".dmp");
+                        var entry = archive.CreateEntry(Path.GetFileNameWithoutExtension(dumpPath) + ".dmp", CompressionLevel.Fastest);
 
                         using (FileStream uncompressedDumpStream = File.Open(uncompressedDumpPath, FileMode.Open))
                         using (var entryStream = entry.Open())
@@ -266,28 +264,24 @@ namespace BuildXL.Processes
 
             Process p = maybeProcess.Result;
             result.Add(new KeyValuePair<string, int>("1_" + p.ProcessName + ".exe", p.Id));
-#if !DISABLE_FEATURE_SYSTEM_MANAGEMENT
             foreach (var child in GetChildProcessTreeIds(parentProcessId, maxTreeDepth - 1))
             {
                 result.Add(new KeyValuePair<string, int>("1_" + child.Key, child.Value));
             }
-#endif  // If we don't have access to get the process tree, we'll still at least get the root process. But we need to
 
-        // figure out a way to get the process tree under CoreCLR
             return result;
         }
 
-#if !DISABLE_FEATURE_SYSTEM_MANAGEMENT
         internal static List<KeyValuePair<string, int>> GetChildProcessTreeIds(int parentProcessId, int maxTreeDepth)
         {
             List<KeyValuePair<string, int>> result = new List<KeyValuePair<string, int>>();
 
+            // If we don't have access to get the process tree, we'll still at least get the root process. 
             try
             {
                 if (maxTreeDepth > 0)
                 {
-                    var query = new ObjectQuery("select * from win32_process where ParentProcessId=" + parentProcessId);
-                    using (var searcher = new ManagementObjectSearcher(query))
+                    using (var searcher = new ManagementObjectSearcher("select * from win32_process where ParentProcessId=" + parentProcessId))
                     {
                         var childProcesses = searcher.Get();
 
@@ -317,7 +311,6 @@ namespace BuildXL.Processes
                 throw new BuildXLException("Failed to enumerate child processes", ex);
             }
         }
-#endif
 
         private static Possible<Process> TryGetProcesById(int processId)
         {

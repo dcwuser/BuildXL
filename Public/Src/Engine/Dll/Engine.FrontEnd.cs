@@ -59,9 +59,7 @@ namespace BuildXL.Engine
                 return false;
             }
 
-            m_visualization?.MountsTable.MakeAvailable(mountsTable);
-
-            if ((Configuration.Engine.Phase & EnginePhases.Schedule) != 0)
+            if (Configuration.Engine.Phase.HasFlag(EnginePhases.Schedule))
             {
                 pipGraphBuilder = CreatePipGraphBuilder(loggingContext, mountsTable, reuseResult);
             }
@@ -72,7 +70,7 @@ namespace BuildXL.Engine
             Func<Task<Possible<EngineCache>>> getBuildCacheTask =
                 async () =>
                 {
-                    return (await engineCacheTask).Then(engineCache => engineCache.CreateCacheForContext(Context));
+                    return (await engineCacheTask).Then(engineCache => engineCache.CreateCacheForContext());
                 };
 
             if (!FrontEndController.PopulateGraph(
@@ -267,7 +265,7 @@ namespace BuildXL.Engine
                     if (possibleCacheInitializerForFallback.Succeeded)
                     {
                         CacheInitializer cacheInitializerForFallback = possibleCacheInitializerForFallback.Result;
-                        using (EngineCache cacheForFallback = cacheInitializerForFallback.CreateCacheForContext(Context))
+                        using (EngineCache cacheForFallback = cacheInitializerForFallback.CreateCacheForContext())
                         {
                             var cacheGraphProvider = new CachedGraphProvider(
                                 loggingContext,
@@ -338,7 +336,7 @@ namespace BuildXL.Engine
                     Contract.Assume(possibleCacheInitializerForWorker.Succeeded, "Workers must have a valid cache");
                     CacheInitializer cacheInitializerForWorker = possibleCacheInitializerForWorker.Result;
 
-                    using (EngineCache cacheForWorker = cacheInitializerForWorker.CreateCacheForContext(Context))
+                    using (EngineCache cacheForWorker = cacheInitializerForWorker.CreateCacheForContext())
                     {
                         PipGraphCacheDescriptor schedulerStateDescriptor;
                         if (!m_workerService.TryGetBuildScheduleDescriptor(out schedulerStateDescriptor) ||

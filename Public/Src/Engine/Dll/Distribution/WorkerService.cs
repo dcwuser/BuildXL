@@ -6,6 +6,7 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics.CodeAnalysis;
 using System.Diagnostics.ContractsLight;
+using System.Diagnostics.Tracing;
 using System.IO;
 using System.Linq;
 using System.Threading;
@@ -27,12 +28,6 @@ using BuildXL.Utilities.Instrumentation.Common;
 using BuildXL.Utilities.Tasks;
 using BuildXL.Utilities.Tracing;
 using static BuildXL.Utilities.FormattableStringEx;
-
-#if FEATURE_MICROSOFT_DIAGNOSTICS_TRACING
-using Microsoft.Diagnostics.Tracing;
-#else
-using System.Diagnostics.Tracing;
-# endif
 
 namespace BuildXL.Engine.Distribution
 {
@@ -80,7 +75,7 @@ namespace BuildXL.Engine.Distribution
         /// <summary>
         /// Returns a task representing the completion of the exit operation
         /// </summary>
-        public Task<bool> ExitCompletion => m_exitCompletionSource.Task;
+        private Task<bool> ExitCompletion => m_exitCompletionSource.Task;
 
         /// <summary>
         /// Returns a task representing the completion of the attach operation
@@ -108,7 +103,13 @@ namespace BuildXL.Engine.Distribution
         /// </summary>
         public uint WorkerId { get; private set; }
 
-        private bool m_hasFailures = false;
+        private volatile bool m_hasFailures = false;
+        private volatile string m_masterFailureMessage; 
+
+        /// <summary>
+        /// Whether master is done with the worker by sending a message to worker.
+        /// </summary>
+        private volatile bool m_isMasterExited;
 
         private LoggingContext m_appLoggingContext;
         private ExecutionResultSerializer m_resultSerializer;
@@ -128,14 +129,8 @@ namespace BuildXL.Engine.Distribution
         private readonly BlockingCollection<ExtendedPipCompletionData> m_buildResults = new BlockingCollection<ExtendedPipCompletionData> ();
         private readonly int m_maxMessagesPerBatch = EngineEnvironmentSettings.MaxMessagesPerBatch.Value;
 
-        private readonly bool m_isGrpcEnabled;
         private IMasterClient m_masterClient;
         private readonly IServer m_workerServer;
-
-#if !DISABLE_FEATURE_BOND_RPC
-        private InternalBond.BondMasterClient m_bondMasterClient;
-        private readonly InternalBond.BondWorkerServer m_bondWorkerService;
-#endif
 
         /// <summary>
         /// Class constructor
@@ -146,23 +141,11 @@ namespace BuildXL.Engine.Distribution
         /// <param name="buildId">the build id</param>
         public WorkerService(LoggingContext appLoggingContext, int maxProcesses, IDistributionConfiguration config, string buildId)
         {
-            m_isGrpcEnabled = config.IsGrpcEnabled;
-
             m_appLoggingContext = appLoggingContext;
             m_maxProcesses = maxProcesses;
             m_port = config.BuildServicePort;
             m_services = new DistributionServices(buildId);
-            if (m_isGrpcEnabled)
-            {
-                m_workerServer = new Grpc.GrpcWorkerServer(this, appLoggingContext, buildId);
-            }
-            else
-            {
-#if !DISABLE_FEATURE_BOND_RPC
-                m_bondWorkerService = new InternalBond.BondWorkerServer(appLoggingContext, this, m_port, m_services);
-                m_workerServer = m_bondWorkerService;
-#endif
-            }
+            m_workerServer = new Grpc.GrpcWorkerServer(this, appLoggingContext, buildId);
 
             m_attachCompletionSource = TaskSourceSlim.Create<bool>();
             m_exitCompletionSource = TaskSourceSlim.Create<bool>();
@@ -202,22 +185,31 @@ namespace BuildXL.Engine.Distribution
 
                 using (m_services.Counters.StartStopwatch(DistributionCounter.ReportPipsCompletedDuration))
                 {
-                    m_masterClient.NotifyAsync(new WorkerNotificationArgs
+                    var callResult = m_masterClient.NotifyAsync(new WorkerNotificationArgs
                     {
                         WorkerId = WorkerId,
                         CompletedPips = m_executionResultList.Select(a => a.SerializedData).ToList()
                     },
                     m_executionResultList.Select(a => a.SemiStableHash).ToList()).GetAwaiter().GetResult();
 
-                    foreach (var result in m_executionResultList)
+                    if (callResult.Succeeded)
                     {
-                        m_workerPipStateManager.Transition(result.PipId, WorkerPipState.Reported);
-                        Tracing.Logger.Log.DistributionWorkerFinishedPipRequest(m_appLoggingContext, result.SemiStableHash, ((PipExecutionStep)result.SerializedData.Step).ToString());
-                    }
+                        foreach (var result in m_executionResultList)
+                        {
+                            m_workerPipStateManager.Transition(result.PipId, WorkerPipState.Reported);
+                            Tracing.Logger.Log.DistributionWorkerFinishedPipRequest(m_appLoggingContext, result.SemiStableHash, ((PipExecutionStep)result.SerializedData.Step).ToString());
+                        }
 
-                    numBatchesSent++;
+                        numBatchesSent++;
+                    }
+                    else
+                    {
+                        // Fire-forget exit call with failure.
+                        // If we fail to send notification to master, the worker should fail.
+                        ExitAsync(failure: "Notify event failed to send to master", isUnexpected: true);
+                        break;
+                    }
                 }
-                
             }
 
             m_services.Counters.AddToCounter(DistributionCounter.BuildResultBatchesSentToMaster, numBatchesSent);
@@ -269,6 +261,10 @@ namespace BuildXL.Engine.Distribution
             success &= await ExitCompletion;
 
             success &= !m_hasFailures;
+            if (m_masterFailureMessage != null)
+            {
+                Logger.Log.DistributionWorkerExitFailure(m_appLoggingContext, m_masterFailureMessage);
+            }
 
             m_pipQueue.SetAsFinalized();
 
@@ -286,7 +282,8 @@ namespace BuildXL.Engine.Distribution
             {
                 if ((TimestampUtilities.Timestamp - m_lastHeartbeatTimestamp) > EngineEnvironmentSettings.WorkerAttachTimeout)
                 {
-                    Exit(timedOut: true, failure: "Timed out waiting for attach request from master");
+                    Exit(failure: "Timed out waiting for attach request from master", isUnexpected: true);
+                    Logger.Log.DistributionWorkerTimeoutFailure(m_appLoggingContext);
                     return false;
                 }
             }
@@ -301,19 +298,31 @@ namespace BuildXL.Engine.Distribution
         }
 
         /// <nodoc/>
-        public void BeforeExit()
+        public void ExitCallReceivedFromMaster()
         {
+            m_isMasterExited = true;
             Logger.Log.DistributionExitReceived(m_appLoggingContext);
 
             // Dispose the notify master execution log target to ensure all message are sent to master.
             m_notifyMasterExecutionLogTarget?.Dispose();
+
+            // Dispose the event listener to ensure all events are sent to master.
+            m_forwardingEventListener?.Dispose();
+        }
+
+
+        /// <nodoc/>
+        [System.Diagnostics.CodeAnalysis.SuppressMessage("AsyncUsage", "AsyncFixer03:FireForgetAsyncVoid")]
+        [System.Diagnostics.CodeAnalysis.SuppressMessage("AsyncUsage", "AsyncFixer02:MissingAsyncOpportunity")]
+        public async void ExitAsync(string failure, bool isUnexpected = false)
+        {
+            await Task.Yield();
+            Exit(failure, isUnexpected);
         }
 
         /// <nodoc/>
-        public void Exit(bool timedOut, string failure)
+        public void Exit(string failure, bool isUnexpected = false)
         {
-            Analysis.IgnoreArgument(timedOut);
-
             m_buildResults.CompleteAdding();
             if (m_sendThread.IsAlive)
             {
@@ -329,16 +338,22 @@ namespace BuildXL.Engine.Distribution
                 m_notifyMasterExecutionLogTarget.Dispose();
             }
 
-            m_masterClient?.Close();
+            m_masterClient?.CloseAsync().GetAwaiter().GetResult();
 
             m_attachCompletionSource.TrySetResult(false);
             bool reportSuccess = string.IsNullOrEmpty(failure);
 
             if (!reportSuccess)
             {
-                // Only log the error, if this thread set exit response
-                Logger.Log.DistributionWorkerExitFailure(m_appLoggingContext, failure);
+                m_masterFailureMessage = failure;
                 m_hasFailures = true;
+            }
+
+            if (isUnexpected && m_isMasterExited)
+            {
+                // If the worker unexpectedly exits the build after master exits the build, 
+                // we should log a message to keep track of the frequency.
+                Logger.Log.DistributionWorkerUnexpectedFailureAfterMasterExits(m_appLoggingContext);
             }
 
             m_exitCompletionSource.TrySetResult(reportSuccess);
@@ -360,9 +375,9 @@ namespace BuildXL.Engine.Distribution
             return true;
         }
 
-        internal void AttachCore(BuildStartData buildStartData)
+        internal void AttachCore(BuildStartData buildStartData, string masterName)
         {
-            Logger.Log.DistributionAttachReceived(m_appLoggingContext, buildStartData.SessionId, buildStartData.SenderName, buildStartData.SenderId);
+            Logger.Log.DistributionAttachReceived(m_appLoggingContext, buildStartData.SessionId, masterName);
             BuildStartData = buildStartData;
 
             // The app-level logging context has a wrong session id. Fix it now that we know the right one.
@@ -372,34 +387,16 @@ namespace BuildXL.Engine.Distribution
                 new LoggingContext.SessionInfo(buildStartData.SessionId, m_appLoggingContext.Session.Environment, m_appLoggingContext.Session.RelatedActivityId),
                 m_appLoggingContext);
 
-
-            if (m_isGrpcEnabled)
-            {
-                m_masterClient = new Grpc.GrpcMasterClient(m_appLoggingContext, m_services.BuildId, buildStartData.MasterLocation.IpAddress, buildStartData.MasterLocation.Port);
-            }
-            else
-            {
-#if !DISABLE_FEATURE_BOND_RPC
-                m_bondWorkerService.UpdateLoggingContext(m_appLoggingContext);
-                m_bondMasterClient = new InternalBond.BondMasterClient(m_appLoggingContext, buildStartData.MasterLocation.IpAddress, buildStartData.MasterLocation.Port);
-                m_masterClient = m_bondMasterClient;
-#endif
-            }
-
+            m_masterClient = new Grpc.GrpcMasterClient(m_appLoggingContext, m_services.BuildId, buildStartData.MasterLocation.IpAddress, buildStartData.MasterLocation.Port, OnConnectionTimeOutAsync);
+            
             WorkerId = BuildStartData.WorkerId;
 
             m_attachCompletionSource.TrySetResult(true);
         }
 
+        [System.Diagnostics.CodeAnalysis.SuppressMessage("AsyncUsage", "AsyncFixer02:MissingAsyncOpportunity")]
         private async Task<bool> SendAttachCompletedAfterProcessBuildRequestStartedAsync()
         {
-            if (!m_isGrpcEnabled)
-            {
-#if !DISABLE_FEATURE_BOND_RPC
-                m_bondMasterClient.Start(m_services, OnConnectionTimeOut);
-#endif
-            }
-
             var cacheValidationContent = Guid.NewGuid().ToByteArray();
             var cacheValidationContentHash = ContentHashingUtilities.HashBytes(cacheValidationContent);
 
@@ -414,7 +411,7 @@ namespace BuildXL.Engine.Distribution
                     cacheValidationContentHash.ToHex(),
                     possiblyStored.Failure.DescribeIncludingInnerFailures());
 
-                Exit(timedOut: true, "Failed to validate retrieve content from master via cache");
+                Exit("Failed to validate retrieve content from master via cache", isUnexpected: true);
                 return false;
             }
 
@@ -432,8 +429,7 @@ namespace BuildXL.Engine.Distribution
 
             if (!attachCompletionResult.Succeeded)
             {
-                Logger.Log.DistributionInactiveMaster(m_appLoggingContext, (int)attachCompletionResult.Duration.TotalMinutes);
-                Exit(timedOut: true, "Failed to attach to master");
+                Exit($"Failed to attach to master. Duration: {(int)attachCompletionResult.Duration.TotalMinutes}", isUnexpected: true);
                 return true;
             }
             else
@@ -446,10 +442,12 @@ namespace BuildXL.Engine.Distribution
             return true;
         }
 
-        private void OnConnectionTimeOut(object sender, EventArgs e)
+        private async void OnConnectionTimeOutAsync(object sender, EventArgs e)
         {
+            // Unblock caller to make it a fire&forget event handler.
+            await Task.Yield();
             Logger.Log.DistributionInactiveMaster(m_appLoggingContext, (int)EngineEnvironmentSettings.DistributionInactiveTimeout.Value.TotalMinutes);
-            Exit(timedOut: true, "Connection timed out");
+            ExitAsync("Connection timed out", isUnexpected: true);
         }
 
         internal void SetLastHeartbeatTimestamp()
@@ -749,6 +747,11 @@ namespace BuildXL.Engine.Distribution
                     file = fileArtifactKeyedHash.File;
                 }
 
+                if(fileArtifactKeyedHash.IsSourceAffected)
+                {
+                    fileContentManager.SourceChangeAffectedContents.ReportSourceChangedAffectedFile(file.Path);
+                }
+
                 var materializationInfo = fileArtifactKeyedHash.GetFileMaterializationInfo(m_environment.Context.PathTable);
                 if (!fileContentManager.ReportWorkerPipInputContent(
                     m_appLoggingContext,
@@ -798,11 +801,6 @@ namespace BuildXL.Engine.Distribution
             m_workerPipStateManager?.Dispose();
 
             m_workerServer.Dispose();
-            m_forwardingEventListener?.Dispose();
-
-#if !DISABLE_FEATURE_BOND_RPC
-            m_bondMasterClient?.Dispose();
-#endif
         }
 
         bool IDistributionService.Initialize()

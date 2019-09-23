@@ -5,6 +5,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics.CodeAnalysis;
 using System.Diagnostics.ContractsLight;
+using System.Diagnostics.Tracing;
 using System.Globalization;
 using System.IO;
 using System.Linq;
@@ -19,6 +20,7 @@ using BuildXL.Ipc.Common;
 using BuildXL.Ipc.Interfaces;
 using BuildXL.Native.IO;
 using BuildXL.Pips;
+using BuildXL.Pips.Artifacts;
 using BuildXL.Pips.Operations;
 using BuildXL.Processes;
 using BuildXL.Processes.Containers;
@@ -31,22 +33,18 @@ using BuildXL.Storage.ChangeTracking;
 using BuildXL.Utilities;
 using BuildXL.Utilities.Collections;
 using BuildXL.Utilities.Configuration;
+using BuildXL.Utilities.Instrumentation.Common;
 using BuildXL.Utilities.Tasks;
 using BuildXL.Utilities.Tracing;
 using static BuildXL.Utilities.FormattableStringEx;
 using static BuildXL.Scheduler.FileMonitoringViolationAnalyzer;
-#if FEATURE_MICROSOFT_DIAGNOSTICS_TRACING
-using Microsoft.Diagnostics.Tracing;
-#else
-using System.Diagnostics.Tracing;
-#endif
 
 namespace BuildXL.Scheduler
 {
     /// <summary>
     /// This class brings pips to life
     /// </summary>
-    public static class PipExecutor
+    public static partial class PipExecutor
     {
         /// <summary>
         /// The maximum number of times to retry running a pip due to internal sandboxed process execution failure.
@@ -59,11 +57,21 @@ namespace BuildXL.Scheduler
 
         private static readonly object s_telemetryDetoursHeapLock = new object();
 
+        private static readonly ObjectPool<Dictionary<AbsolutePath, ExtractedPathEntry>> s_pathToObservationEntryMapPool =
+            new ObjectPool<Dictionary<AbsolutePath, ExtractedPathEntry>>(
+                () => new Dictionary<AbsolutePath, ExtractedPathEntry>(),
+                map => { map.Clear(); return map; });
+
+        private static readonly ObjectPool<Dictionary<StringId, int>> s_accessedFileNameToUseCountPool =
+            new ObjectPool<Dictionary<StringId, int>>(
+                () => new Dictionary<StringId, int>(),
+                map => { map.Clear(); return map; });
+
         private static readonly ObjectPool<Dictionary<AbsolutePath, FileOutputData>> s_absolutePathFileOutputDataMapPool =
             new ObjectPool<Dictionary<AbsolutePath, FileOutputData>>(
                 () => new Dictionary<AbsolutePath, FileOutputData>(),
                 map => { map.Clear(); return map; });
-        
+
         private static readonly ObjectPool<List<(AbsolutePath, FileMaterializationInfo)>> s_absolutePathFileMaterializationInfoTuppleListPool = Pools.CreateListPool<(AbsolutePath, FileMaterializationInfo)>();
 
         private static readonly ObjectPool<Dictionary<FileArtifact, Task<Possible<FileMaterializationInfo>>>> s_fileArtifactPossibleFileMaterializationInfoTaskMapPool =
@@ -136,7 +144,7 @@ namespace BuildXL.Scheduler
             var pipInfo = new PipInfo(pip, context);
             var pipDescription = pipInfo.Description;
 
-            
+
 
             string destination = pip.Destination.Path.ToString(pathTable);
             string source = pip.Source.Path.ToString(pathTable);
@@ -342,7 +350,7 @@ namespace BuildXL.Scheduler
 
             var symlinkPath = source.Path;
             var maybeTarget = FileUtilities.ResolveSymlinkTarget(
-                symlinkPath.ToString(environment.Context.PathTable), 
+                symlinkPath.ToString(environment.Context.PathTable),
                 materializationInfo.ReparsePointInfo.GetReparsePointTarget());
 
             if (!maybeTarget.Succeeded)
@@ -407,7 +415,7 @@ namespace BuildXL.Scheduler
                     if (!targetArtifact.IsValid && environment.PipGraphView.IsPathUnderOutputDirectory(targetPath, out _))
                     {
                         return CreateInvalidChainFailure(I($"An element of the chain ('{chainElement}') is inside of an opaque directory."));
-                    } 
+                    }
                 }
 
                 return ReadOnlyArray<AbsolutePath>.From(chain);
@@ -648,6 +656,15 @@ namespace BuildXL.Scheduler
                         connectionString,
                         ipcResult.Payload);
                 }
+                else if (ipcResult.ExitCode == IpcResultStatus.TransmissionError)
+                {
+                    // we separate transmission errors here, so they can be properly classified as InfrastructureErrors
+                    Logger.Log.PipIpcFailedDueToInfrastructureError(
+                        operationContext,
+                        operation.Payload,
+                        connectionString,
+                        ipcResult.Payload);
+                }
                 else
                 {
                     Logger.Log.PipIpcFailed(
@@ -807,7 +824,7 @@ namespace BuildXL.Scheduler
                     else
                     {
                         // Write file pips do not specify execution result since they are not distributed
-                        // (i.e. they only run on the master). Given that, they report directly to the file content manager. 
+                        // (i.e. they only run on the master). Given that, they report directly to the file content manager.
                         fileContentManager.ReportOutputContent(
                             operationContext,
                             pipDescription,
@@ -949,9 +966,9 @@ namespace BuildXL.Scheduler
                 var exclusiveOpaqueDirectories = processExecutionResult.DirectoryOutputs.Where(directoryArtifactWithContent => !directoryArtifactWithContent.directoryArtifact.IsSharedOpaque).ToReadOnlyArray();
 
                 // Regardless of if we will fail the pip or not, maybe analyze them for higher-level dependency violations.
-                if (processExecutionResult.FileAccessViolationsNotWhitelisted != null 
-                    || processExecutionResult.WhitelistedFileAccessViolations != null 
-                    || processExecutionResult.SharedDynamicDirectoryWriteAccesses != null 
+                if (processExecutionResult.FileAccessViolationsNotWhitelisted != null
+                    || processExecutionResult.WhitelistedFileAccessViolations != null
+                    || processExecutionResult.SharedDynamicDirectoryWriteAccesses != null
                     || exclusiveOpaqueDirectories != null
                     || processExecutionResult.AllowedUndeclaredReads != null
                     || processExecutionResult.AbsentPathProbesUnderOutputDirectories != null)
@@ -1039,11 +1056,11 @@ namespace BuildXL.Scheduler
                 // File access violation analysis must be run before reporting the execution result output content.
                 var exclusiveOpaqueContent = executionResult.DirectoryOutputs.Where(directoryArtifactWithContent => !directoryArtifactWithContent.directoryArtifact.IsSharedOpaque).ToReadOnlyArray();
 
-                if ((executionResult.SharedDynamicDirectoryWriteAccesses?.Count > 0 || executionResult.AllowedUndeclaredReads?.Count > 0 || executionResult.AbsentPathProbesUnderOutputDirectories?.Count > 0 || exclusiveOpaqueContent.Length > 0) 
+                if ((executionResult.SharedDynamicDirectoryWriteAccesses?.Count > 0 || executionResult.AllowedUndeclaredReads?.Count > 0 || executionResult.AbsentPathProbesUnderOutputDirectories?.Count > 0 || exclusiveOpaqueContent.Length > 0)
                     && !environment.FileMonitoringViolationAnalyzer.AnalyzeDynamicViolations(
                             pip,
                             exclusiveOpaqueContent,
-                            executionResult.SharedDynamicDirectoryWriteAccesses, 
+                            executionResult.SharedDynamicDirectoryWriteAccesses,
                             executionResult.AllowedUndeclaredReads,
                             executionResult.AbsentPathProbesUnderOutputDirectories,
                             executionResult.OutputContent))
@@ -1053,10 +1070,10 @@ namespace BuildXL.Scheduler
                 }
 
                 ReportExecutionResultOutputContent(
-                    operationContext, 
-                    environment, 
-                    processDescription, 
-                    executionResult, 
+                    operationContext,
+                    environment,
+                    processDescription,
+                    executionResult,
                     pip.PipType == PipType.Process ? ((Process)pip).DoubleWritePolicy.ImpliesDoubleWriteIsWarning() : false);
 
                 if (cacheHitData.Metadata.NumberOfWarnings > 0 && environment.Configuration.Logging.ReplayWarnings)
@@ -1134,8 +1151,9 @@ namespace BuildXL.Scheduler
             int expectedRamUsageMb = 0)
         {
             var context = environment.Context;
+            var counters = environment.Counters;
+            var configuration = environment.Configuration;
             var pathTable = context.PathTable;
-            var symbolTable = context.SymbolTable;
             var processExecutionResult = new ExecutionResult();
             if (fingerprint.HasValue)
             {
@@ -1163,127 +1181,122 @@ namespace BuildXL.Scheduler
             }
 
             // When preserving outputs, we need to make sure to remove any hardlinks to the cache.
-            Func<FileArtifact, Task<bool>> makeOutputPrivate =
-                async artifactNeededPrivate =>
-                      {
-                          string originalPath = artifactNeededPrivate.Path.ToString(environment.Context.PathTable);
+            Func<string, Task<bool>> makeOutputPrivate =
+                async path =>
+                {
+                    try
+                    {
+                        if (!FileUtilities.FileExistsNoFollow(path))
+                        {
+                            // Output file doesn't exist. No need to make it private,
+                            // but return false so BuildXL ensures the output directory is created.
+                            return false;
+                        }
 
-                          try
-                          {
-                              if (!FileUtilities.FileExistsNoFollow(originalPath))
-                              {
-                                  // Output file doesn't exist. No need to make it private, 
-                                  // but return false so BuildXL ensures the output directory is created.
-                                  return false;
-                              }
+                        if (FileUtilities.GetHardLinkCount(path) == 1 &&
+                            FileUtilities.HasWritableAccessControl(path))
+                        {
+                            // Output file is already private. File will not be deleted.
+                            return true;
+                        }
 
-                              if (FileUtilities.GetHardLinkCount(originalPath) == 1 &&
-                                  FileUtilities.HasWritableAccessControl(originalPath))
-                              {
-                                  // Output file is already private. File will not be deleted.
-                                  return true;
-                              }
+                        // We want to use a temp filename that's as short as the original filename.
+                        // To achieve this, we use the random filename generator from System.IO
+                        var maybePrivate = await FileUtilities.TryMakeExclusiveLinkAsync(
+                            path,
+                            optionalTemporaryFileName: Path.GetRandomFileName(),
+                            preserveOriginalTimestamp: true);
 
-                              // We want to use a temp filename that's as short as the original filename.
-                              // To achieve this, we use the original filename and the PathId which is unique across all files in the build. 
-                              // This ensures uniquness, keeps the temp file as short as the original, and tends to keep the file in the same directory 
-                              // as the original.
-                              var maybePrivate = await FileUtilities.TryMakeExclusiveLinkAsync(
-                                  artifactNeededPrivate.Path.ToString(environment.Context.PathTable),
-                                  optionalTemporaryFileName: artifactNeededPrivate.Path.Value.Value.ToString(CultureInfo.InvariantCulture),
-                                  preserveOriginalTimestamp: true);
+                        if (!maybePrivate.Succeeded)
+                        {
+                            maybePrivate.Failure.Throw();
+                        }
 
-                              if (!maybePrivate.Succeeded)
-                              {
-                                  maybePrivate.Failure.Throw();
-                              }
-
-                              return true;
-                          }
-                          catch (BuildXLException ex)
-                          {
-                              Logger.Log.PreserveOutputsFailedToMakeOutputPrivate(
-                                  operationContext,
-                                  processDescription,
-                                  originalPath,
-                                  ex.GetLogEventMessage());
-                              return false;
-                          }
-                      };
+                        return true;
+                    }
+                    catch (BuildXLException ex)
+                    {
+                        Logger.Log.PreserveOutputsFailedToMakeOutputPrivate(
+                            operationContext,
+                            processDescription,
+                            path,
+                            ex.GetLogEventMessage());
+                        return false;
+                    }
+                };
 
             // To do in-place rewrites, we need to make writable, private copies of inputs to be rewritten (they may be read-only hardlinks into the cache, for example).
             Func<FileArtifact, Task<bool>> makeInputPrivate =
                 async artifactNeededPrivate =>
-                      {
-                          FileMaterializationInfo inputMaterializationInfo =
-                              environment.State.FileContentManager.GetInputContent(artifactNeededPrivate);
+                {
+                    FileMaterializationInfo inputMaterializationInfo =
+                        environment.State.FileContentManager.GetInputContent(artifactNeededPrivate);
 
-                          if (inputMaterializationInfo.ReparsePointInfo.IsSymlink)
-                          {
-                              // Do nothing in case of re-writing a symlink --- a process can safely change
-                              // symlink's target since it won't affect things in CAS.
-                              return true;
-                          }
+                    if (inputMaterializationInfo.ReparsePointInfo.IsSymlink)
+                    {
+                        // Do nothing in case of re-writing a symlink --- a process can safely change
+                        // symlink's target since it won't affect things in CAS.
+                        return true;
+                    }
 
-                          ContentHash artifactHash = inputMaterializationInfo.Hash;
+                    ContentHash artifactHash = inputMaterializationInfo.Hash;
 
-                          // Source files aren't guaranteed in cache, until we first have a reason to ingress them.
-                          // Note that this is only relevant for source files rewritten in place, which is only
-                          // used in some team-internal trace-conversion scenarios as of writing.
-                          if (artifactNeededPrivate.IsSourceFile)
-                          {
-                              // We assume that source files cannot be made read-only so we use copy file materialization
-                              // rather than ever hardlinking
-                              var maybeStored = await environment.LocalDiskContentStore.TryStoreAsync(
-                                  environment.Cache.ArtifactContentCache,
-                                  fileRealizationModes: FileRealizationMode.Copy,
-                                  path: artifactNeededPrivate.Path,
-                                  tryFlushPageCacheToFileSystem: false,
-                                  knownContentHash: artifactHash,
+                    // Source files aren't guaranteed in cache, until we first have a reason to ingress them.
+                    // Note that this is only relevant for source files rewritten in place, which is only
+                    // used in some team-internal trace-conversion scenarios as of writing.
+                    if (artifactNeededPrivate.IsSourceFile)
+                    {
+                        // We assume that source files cannot be made read-only so we use copy file materialization
+                        // rather than ever hardlinking
+                        var maybeStored = await environment.LocalDiskContentStore.TryStoreAsync(
+                            environment.Cache.ArtifactContentCache,
+                            fileRealizationModes: FileRealizationMode.Copy,
+                            path: artifactNeededPrivate.Path,
+                            tryFlushPageCacheToFileSystem: false,
+                            knownContentHash: artifactHash,
 
-                                  // Source should have been tracked by hash-source file pip, no need to retrack.
-                                  trackPath: false,
-                                  isSymlink: false);
+                            // Source should have been tracked by hash-source file pip, no need to retrack.
+                            trackPath: false,
+                            isSymlink: false);
 
-                              if (!maybeStored.Succeeded)
-                              {
-                                  Logger.Log.StorageCacheIngressFallbackContentToMakePrivateError(
-                                      operationContext,
-                                      contentHash: artifactHash.ToHex(),
-                                      fallbackPath:
-                                          artifactNeededPrivate.Path.ToString(
-                                              environment.Context.PathTable),
-                                      errorMessage: maybeStored.Failure.DescribeIncludingInnerFailures());
-                                  return false;
-                              }
-                          }
+                        if (!maybeStored.Succeeded)
+                        {
+                            Logger.Log.StorageCacheIngressFallbackContentToMakePrivateError(
+                                operationContext,
+                                contentHash: artifactHash.ToHex(),
+                                fallbackPath:
+                                    artifactNeededPrivate.Path.ToString(pathTable),
+                                errorMessage: maybeStored.Failure.DescribeIncludingInnerFailures());
+                            return false;
+                        }
+                    }
 
-                          // We need a private version of the output - it must be writable and have link count 1.
-                          // We can achieve that property by forcing a copy of the content (by hash) out of cache.
-                          // The content should be in the cache in usual cases. See special case above for source-file rewriting
-                          // (should not be common; only used in some trace-conversion scenarios as of writing).
-                          var maybeMadeWritable =
-                              await
-                                  environment.LocalDiskContentStore
-                                      .TryMaterializeTransientWritableCopyAsync(
-                                          environment.Cache.ArtifactContentCache,
-                                          artifactNeededPrivate.Path,
-                                          artifactHash);
+                    // We need a private version of the output - it must be writable and have link count 1.
+                    // We can achieve that property by forcing a copy of the content (by hash) out of cache.
+                    // The content should be in the cache in usual cases. See special case above for source-file rewriting
+                    // (should not be common; only used in some trace-conversion scenarios as of writing).
+                    var maybeMadeWritable =
+                        await
+                            environment.LocalDiskContentStore
+                                .TryMaterializeTransientWritableCopyAsync(
+                                    environment.Cache.ArtifactContentCache,
+                                    artifactNeededPrivate.Path,
+                                    artifactHash);
 
-                          if (!maybeMadeWritable.Succeeded)
-                          {
-                              Logger.Log.StorageCacheGetContentError(
-                                  operationContext,
-                                  contentHash: artifactHash.ToHex(),
-                                  destinationPath:
-                                      artifactNeededPrivate.Path.ToString(environment.Context.PathTable),
-                                  errorMessage:
-                                      maybeMadeWritable.Failure.DescribeIncludingInnerFailures());
-                              return false;
-                          }
+                    if (!maybeMadeWritable.Succeeded)
+                    {
+                        Logger.Log.StorageCacheGetContentError(
+                            operationContext,
+                            contentHash: artifactHash.ToHex(),
+                            destinationPath:
+                                artifactNeededPrivate.Path.ToString(pathTable),
+                            errorMessage:
+                                maybeMadeWritable.Failure.DescribeIncludingInnerFailures());
+                        return false;
+                    }
 
-                          return true;
-                      };
+                    return true;
+                };
 
             SemanticPathExpander semanticPathExpander = state.PathExpander;
 
@@ -1300,203 +1313,222 @@ namespace BuildXL.Scheduler
                     expectedRamUsageMb,
                     allowResourceBasedCancellation,
                     async (resourceLimitCancellationToken, registerQueryRamUsageMb) =>
-                          {
-                              // Inner cancellation token source for tracking cancellation time
-                              using (var innerResourceLimitCancellationTokenSource = new CancellationTokenSource())
-                              using (operationContext.StartOperation(PipExecutorCounter.ProcessPossibleRetryWallClockDuration))
-                              {
-                                  int lastObservedPeakRamUsage = 0;
-                                  TimeSpan? cancellationStartTime = null;
-                                  resourceLimitCancellationToken.Register(
-                                      () =>
-                                      {
-                                          cancellationStartTime = TimestampUtilities.Timestamp;
-                                          Logger.Log.StartCancellingProcessPipExecutionDueToResourceExhaustion(
-                                              operationContext,
-                                              processDescription,
-                                              (long)(operationContext.Duration?.TotalMilliseconds ?? -1),
-                                              peakMemoryMb: lastObservedPeakRamUsage,
-                                              expectedMemoryMb: expectedRamUsageMb);
+                    {
+                        // Inner cancellation token source for tracking cancellation time
+                        using (var innerResourceLimitCancellationTokenSource = new CancellationTokenSource())
+                        using (operationContext.StartOperation(PipExecutorCounter.ProcessPossibleRetryWallClockDuration))
+                        {
+                            int lastObservedPeakRamUsage = 0;
+                            TimeSpan? cancellationStartTime = null;
+                            resourceLimitCancellationToken.Register(
+                                () =>
+                                {
+                                    cancellationStartTime = TimestampUtilities.Timestamp;
+                                    Logger.Log.StartCancellingProcessPipExecutionDueToResourceExhaustion(
+                                        operationContext,
+                                        processDescription,
+                                        (long)(operationContext.Duration?.TotalMilliseconds ?? -1),
+                                        peakMemoryMb: lastObservedPeakRamUsage,
+                                        expectedMemoryMb: expectedRamUsageMb);
 
-                                          using (operationContext.StartAsyncOperation(PipExecutorCounter.ResourceLimitCancelProcessDuration))
-                                          {
-                                              innerResourceLimitCancellationTokenSource.Cancel();
-                                          }
-                                      });
+                                    using (operationContext.StartAsyncOperation(PipExecutorCounter.ResourceLimitCancelProcessDuration))
+                                    {
+                                        innerResourceLimitCancellationTokenSource.Cancel();
+                                    }
+                                });
 
-                                  int remainingUserRetries = pip.RetryExitCodes.Length > 0 ? environment.Configuration.Schedule.ProcessRetries : 0;
-                                  int remainingInternalSandboxedProcessExecutionFailureRetries = InternalSandboxedProcessExecutionFailureRetryCountMax;
+                            int remainingUserRetries = pip.RetryExitCodes.Length > 0 ? configuration.Schedule.ProcessRetries : 0;
+                            int remainingInternalSandboxedProcessExecutionFailureRetries = InternalSandboxedProcessExecutionFailureRetryCountMax;
 
-                                  int retryCount = 0;
-                                  SandboxedProcessPipExecutionResult result;
+                            int retryCount = 0;
+                            SandboxedProcessPipExecutionResult result;
 
-                                  // Retry pip count up to limit if we produce result without detecting file access.
-                                  // There are very rare cases where a child process is started not Detoured and we don't observe any file accesses from such process.
-                                  while (true)
-                                  {
-                                      lastObservedPeakRamUsage = 0;
+                            // Retry pip count up to limit if we produce result without detecting file access.
+                            // There are very rare cases where a child process is started not Detoured and we don't observe any file accesses from such process.
+                            while (true)
+                            {
+                                lastObservedPeakRamUsage = 0;
 
-                                      var executor = new SandboxedProcessPipExecutor(
-                                          context,
-                                          operationContext.LoggingContext,
-                                          pip,
-                                          environment.Configuration.Sandbox,
-                                          environment.Configuration.Layout,
-                                          environment.Configuration.Logging,
-                                          environment.RootMappings,
-                                          environment.ProcessInContainerManager,
-                                          state.FileAccessWhitelist,
-                                          makeInputPrivate,
-                                          makeOutputPrivate,
-                                          semanticPathExpander,
-                                          environment.Configuration.Engine.DisableConHostSharing,
-                                          pipEnvironment: environment.State.PipEnvironment,
-                                          validateDistribution: environment.Configuration.Distribution.ValidateDistribution,
-                                          directoryArtifactContext: new DirectoryArtifactContext(environment),
-                                          logger: processMonitoringLogger,
-                                          processIdListener: processIdListener,
-                                          pipDataRenderer: environment.PipFragmentRenderer,
-                                          buildEngineDirectory: environment.Configuration.Layout.BuildEngineDirectory,
-                                          directoryTranslator: environment.DirectoryTranslator,
-                                          remainingUserRetryCount: remainingUserRetries);
+                                var executor = new SandboxedProcessPipExecutor(
+                                    context,
+                                    operationContext.LoggingContext,
+                                    pip,
+                                    configuration.Sandbox,
+                                    configuration.Layout,
+                                    configuration.Logging,
+                                    environment.RootMappings,
+                                    environment.ProcessInContainerManager,
+                                    state.FileAccessWhitelist,
+                                    makeInputPrivate,
+                                    makeOutputPrivate,
+                                    semanticPathExpander,
+                                    configuration.Engine.DisableConHostSharing,
+                                    pipEnvironment: environment.State.PipEnvironment,
+                                    validateDistribution: configuration.Distribution.ValidateDistribution,
+                                    directoryArtifactContext: new DirectoryArtifactContext(environment),
+                                    logger: processMonitoringLogger,
+                                    processIdListener: processIdListener,
+                                    pipDataRenderer: environment.PipFragmentRenderer,
+                                    buildEngineDirectory: configuration.Layout.BuildEngineDirectory,
+                                    directoryTranslator: environment.DirectoryTranslator,
+                                    remainingUserRetryCount: remainingUserRetries,
+                                    vmInitializer: environment.VmInitializer,
+                                    tempDirectoryCleaner: environment.TempCleaner,
+                                    incrementalTools: configuration.IncrementalTools);
 
-                                      registerQueryRamUsageMb(
-                                          () =>
-                                          {
-                                              using (operationContext.StartAsyncOperation(PipExecutorCounter.QueryRamUsageDuration))
-                                              {
-                                                  lastObservedPeakRamUsage =
-                                                      (int)ByteSizeFormatter.ToMegabytes((long)(executor.GetActivePeakMemoryUsage() ?? 0));
-                                              }
+                                registerQueryRamUsageMb(
+                                    () =>
+                                    {
+                                        using (operationContext.StartAsyncOperation(PipExecutorCounter.QueryRamUsageDuration))
+                                        {
+                                            lastObservedPeakRamUsage =
+                                                (int)ByteSizeFormatter.ToMegabytes((long)(executor.GetActivePeakMemoryUsage() ?? 0));
+                                        }
 
-                                              return lastObservedPeakRamUsage;
-                                          });
+                                        return lastObservedPeakRamUsage;
+                                    });
 
-                                      // Increment the counters only on the first try.
-                                      if (retryCount == 0)
-                                      {
-                                          environment.Counters.IncrementCounter(PipExecutorCounter.ExternalProcessCount);
-                                          environment.SetMaxExternalProcessRan();
-                                      }
+                                // Increment the counters only on the first try.
+                                if (retryCount == 0)
+                                {
+                                    counters.IncrementCounter(PipExecutorCounter.ExternalProcessCount);
+                                    environment.SetMaxExternalProcessRan();
+                                }
 
-                                      result = await executor.RunAsync(innerResourceLimitCancellationTokenSource.Token, sandboxedKextConnection: environment.SandboxedKextConnection);
+                                IReadOnlyCollection<AbsolutePath> changeAffectedInputs = pip.ChangeAffectedInputListWrittenFilePath.IsValid
+                                    ? environment.State.FileContentManager.SourceChangeAffectedContents.GetChangeAffectedInputs(pip)
+                                    : null;
 
-                                      ++retryCount;
+                                result = await executor.RunAsync(innerResourceLimitCancellationTokenSource.Token, sandboxConnection: environment.SandboxConnection, changeAffectedInputs);
 
-                                      lock (s_telemetryDetoursHeapLock)
-                                      {
-                                          if (environment.Counters.GetCounterValue(PipExecutorCounter.MaxDetoursHeapInBytes) <
-                                              result.MaxDetoursHeapSizeInBytes)
-                                          {
-                                              // Zero out the counter first and then set the new value.
-                                              environment.Counters.AddToCounter(
-                                                  PipExecutorCounter.MaxDetoursHeapInBytes,
-                                                  -environment.Counters.GetCounterValue(PipExecutorCounter.MaxDetoursHeapInBytes));
-                                              environment.Counters.AddToCounter(
-                                                  PipExecutorCounter.MaxDetoursHeapInBytes,
-                                                  result.MaxDetoursHeapSizeInBytes);
-                                          }
-                                      }
+                                ++retryCount;
 
-                                      if (result.Status == SandboxedProcessPipExecutionStatus.OutputWithNoFileAccessFailed ||
-                                          result.Status == SandboxedProcessPipExecutionStatus.MismatchedMessageCount)
-                                      {
-                                          if (remainingInternalSandboxedProcessExecutionFailureRetries > 0)
-                                          {
-                                              --remainingInternalSandboxedProcessExecutionFailureRetries;
+                                lock (s_telemetryDetoursHeapLock)
+                                {
+                                    if (counters.GetCounterValue(PipExecutorCounter.MaxDetoursHeapInBytes) <
+                                        result.MaxDetoursHeapSizeInBytes)
+                                    {
+                                        // Zero out the counter first and then set the new value.
+                                        counters.AddToCounter(
+                                            PipExecutorCounter.MaxDetoursHeapInBytes,
+                                            -counters.GetCounterValue(PipExecutorCounter.MaxDetoursHeapInBytes));
+                                        counters.AddToCounter(
+                                            PipExecutorCounter.MaxDetoursHeapInBytes,
+                                            result.MaxDetoursHeapSizeInBytes);
+                                    }
+                                }
 
-                                              switch (result.Status)
-                                              {
-                                                  case SandboxedProcessPipExecutionStatus.OutputWithNoFileAccessFailed:
-                                                      environment.Counters.IncrementCounter(PipExecutorCounter.OutputsWithNoFileAccessRetriesCount);
-                                                      break;
+                                if (result.Status == SandboxedProcessPipExecutionStatus.OutputWithNoFileAccessFailed ||
+                                    result.Status == SandboxedProcessPipExecutionStatus.MismatchedMessageCount ||
+                                    result.Status == SandboxedProcessPipExecutionStatus.ShouldBeRetriedDueToAzureWatsonExitCode)
+                                {
+                                    if (remainingInternalSandboxedProcessExecutionFailureRetries > 0)
+                                    {
+                                        --remainingInternalSandboxedProcessExecutionFailureRetries;
 
-                                                  case SandboxedProcessPipExecutionStatus.MismatchedMessageCount:
-                                                      environment.Counters.IncrementCounter(PipExecutorCounter.MismatchMessageRetriesCount);
-                                                      break;
+                                        switch (result.Status)
+                                        {
+                                            case SandboxedProcessPipExecutionStatus.OutputWithNoFileAccessFailed:
+                                                counters.IncrementCounter(PipExecutorCounter.OutputsWithNoFileAccessRetriesCount);
+                                                break;
 
-                                                  default:
-                                                      Contract.Assert(false, "Unexpected result error type.");
-                                                      break;
-                                              }
+                                            case SandboxedProcessPipExecutionStatus.MismatchedMessageCount:
+                                                counters.IncrementCounter(PipExecutorCounter.MismatchMessageRetriesCount);
+                                                break;
 
-                                              continue;
-                                          }
+                                            case SandboxedProcessPipExecutionStatus.ShouldBeRetriedDueToAzureWatsonExitCode:
+                                                counters.IncrementCounter(PipExecutorCounter.AzureWatsonExitCodeRetriesCount);
+                                                break;
 
-                                          switch (result.Status)
-                                          {
-                                              case SandboxedProcessPipExecutionStatus.OutputWithNoFileAccessFailed:
-                                                  Logger.Log.FailPipOutputWithNoAccessed(
-                                                      operationContext,
-                                                      pip.SemiStableHash,
-                                                      processDescription);
-                                                  break;
+                                            default:
+                                                Contract.Assert(false, "Unexpected result error type.");
+                                                break;
+                                        }
 
-                                              case SandboxedProcessPipExecutionStatus.MismatchedMessageCount:
-                                                  Logger.Log.LogMismatchedDetoursErrorCount(
-                                                      operationContext,
-                                                      pip.SemiStableHash,
-                                                      processDescription);
-                                                  break;
+                                        continue;
+                                    }
 
-                                              default:
-                                                  Contract.Assert(false, "Unexpected result error type gotten.");
-                                                  break;
-                                          }
+                                    switch (result.Status)
+                                    {
+                                        case SandboxedProcessPipExecutionStatus.OutputWithNoFileAccessFailed:
+                                            Logger.Log.FailPipOutputWithNoAccessed(
+                                                operationContext,
+                                                pip.SemiStableHash,
+                                                processDescription);
+                                            break;
 
-                                          // Just break the loop below. The result is already set properly.
-                                      }
+                                        case SandboxedProcessPipExecutionStatus.MismatchedMessageCount:
+                                            Logger.Log.LogMismatchedDetoursErrorCount(
+                                                operationContext,
+                                                pip.SemiStableHash,
+                                                processDescription);
+                                            break;
 
-                                      if (result.Status == SandboxedProcessPipExecutionStatus.ShouldBeRetriedDueToExitCode)
-                                      {
-                                          Contract.Assert(remainingUserRetries > 0);
+                                        case SandboxedProcessPipExecutionStatus.ShouldBeRetriedDueToAzureWatsonExitCode:
+                                            Logger.Log.PipExitedWithAzureWatsonExitCode(
+                                                operationContext,
+                                                pip.SemiStableHash,
+                                                processDescription);
+                                            break;
 
-                                          --remainingUserRetries;
-                                          Logger.Log.PipWillBeRetriedDueToExitCode(
-                                              operationContext,
-                                              pip.SemiStableHash,
-                                              processDescription,
-                                              result.ExitCode,
-                                              remainingUserRetries);
-                                          environment.Counters.IncrementCounter(PipExecutorCounter.ProcessUserRetries);
+                                        default:
+                                            Contract.Assert(false, "Unexpected result error type gotten.");
+                                            break;
+                                    }
 
-                                          continue;
-                                      }
+                                    // Just break the loop below. The result is already set properly.
+                                }
 
-                                      break;
-                                  }
+                                if (result.Status == SandboxedProcessPipExecutionStatus.ShouldBeRetriedDueToUserSpecifiedExitCode)
+                                {
+                                    Contract.Assert(remainingUserRetries > 0);
 
-                                  environment.Counters.DecrementCounter(PipExecutorCounter.ExternalProcessCount);
+                                    --remainingUserRetries;
+                                    Logger.Log.PipWillBeRetriedDueToExitCode(
+                                        operationContext,
+                                        pip.SemiStableHash,
+                                        processDescription,
+                                        result.ExitCode,
+                                        remainingUserRetries);
+                                    counters.IncrementCounter(PipExecutorCounter.ProcessUserRetries);
 
-                                  if (result.Status == SandboxedProcessPipExecutionStatus.Canceled)
-                                  {
-                                      if (resourceLimitCancellationToken.IsCancellationRequested)
-                                      {
-                                          TimeSpan? cancelTime = TimestampUtilities.Timestamp - cancellationStartTime;
+                                    continue;
+                                }
 
-                                          environment.Counters.IncrementCounter(PipExecutorCounter.ProcessRetriesDueToResourceLimits);
-                                          Logger.Log.CancellingProcessPipExecutionDueToResourceExhaustion(
-                                              operationContext,
-                                              processDescription,
-                                              (long)(operationContext.Duration?.TotalMilliseconds ?? -1),
-                                              peakMemoryMb:
-                                                  (int)ByteSizeFormatter.ToMegabytes((long)(result.JobAccountingInformation?.PeakMemoryUsage ?? 0)),
-                                              expectedMemoryMb: expectedRamUsageMb,
-                                              cancelMilliseconds: (int)(cancelTime?.TotalMilliseconds ?? 0));
-                                      }
-                                  }
+                                break;
+                            }
 
-                                  return result;
-                              }
-                          });
+                            counters.DecrementCounter(PipExecutorCounter.ExternalProcessCount);
+
+                            if (result.Status == SandboxedProcessPipExecutionStatus.Canceled)
+                            {
+                                if (resourceLimitCancellationToken.IsCancellationRequested)
+                                {
+                                    TimeSpan? cancelTime = TimestampUtilities.Timestamp - cancellationStartTime;
+
+                                    counters.IncrementCounter(PipExecutorCounter.ProcessRetriesDueToResourceLimits);
+                                    Logger.Log.CancellingProcessPipExecutionDueToResourceExhaustion(
+                                        operationContext,
+                                        processDescription,
+                                        (long)(operationContext.Duration?.TotalMilliseconds ?? -1),
+                                        peakMemoryMb:
+                                            (int)ByteSizeFormatter.ToMegabytes((long)(result.JobAccountingInformation?.PeakMemoryUsage ?? 0)),
+                                        expectedMemoryMb: expectedRamUsageMb,
+                                        cancelMilliseconds: (int)(cancelTime?.TotalMilliseconds ?? 0));
+                                }
+                            }
+
+                            return result;
+                        }
+                    });
 
             processExecutionResult.ReportSandboxedExecutionResult(executionResult);
 
-            environment.Counters.AddToCounter(PipExecutorCounter.SandboxedProcessPrepDurationMs, executionResult.SandboxPrepMs);
-            environment.Counters.AddToCounter(
+            counters.AddToCounter(PipExecutorCounter.SandboxedProcessPrepDurationMs, executionResult.SandboxPrepMs);
+            counters.AddToCounter(
                 PipExecutorCounter.SandboxedProcessProcessResultDurationMs,
                 executionResult.ProcessSandboxedProcessResultMs);
-            environment.Counters.AddToCounter(PipExecutorCounter.ProcessStartTimeMs, executionResult.ProcessStartTimeMs);
+            counters.AddToCounter(PipExecutorCounter.ProcessStartTimeMs, executionResult.ProcessStartTimeMs);
 
             // We may have some violations reported already (outright denied by the sandbox manifest).
             FileAccessReportingContext fileAccessReportingContext = executionResult.UnexpectedFileAccesses;
@@ -1507,11 +1539,11 @@ namespace BuildXL.Scheduler
                 // We do not have any execution-time information (observed accesses or file monitoring violations) to analyze.
                 processExecutionResult.SetResult(operationContext, PipResultStatus.Failed);
 
-                environment.Counters.IncrementCounter(PipExecutorCounter.PreparationFailureCount);
+                counters.IncrementCounter(PipExecutorCounter.PreparationFailureCount);
 
                 if (executionResult.NumberOfProcessLaunchRetries > 0)
                 {
-                    environment.Counters.IncrementCounter(PipExecutorCounter.PreparationFailurePartialCopyCount);
+                    counters.IncrementCounter(PipExecutorCounter.PreparationFailurePartialCopyCount);
                 }
 
                 return processExecutionResult;
@@ -1524,7 +1556,7 @@ namespace BuildXL.Scheduler
 
                 ReportFileAccesses(processExecutionResult, fileAccessReportingContext);
 
-                environment.Counters.AddToCounter(
+                counters.AddToCounter(
                     PipExecutorCounter.CanceledProcessExecuteDuration,
                     executionResult.PrimaryProcessTimes.TotalWallClockTime);
 
@@ -1540,7 +1572,7 @@ namespace BuildXL.Scheduler
             {
                 Contract.Assert(false, "Unexpected execution result " + executionResult.Status);
             }
-               
+
             bool succeeded = executionResult.Status == SandboxedProcessPipExecutionStatus.Succeeded;
 
             if (executionResult.Status == SandboxedProcessPipExecutionStatus.ExecutionFailed ||
@@ -1555,7 +1587,7 @@ namespace BuildXL.Scheduler
             Contract.Assert(executionResult.UnexpectedFileAccesses != null, "Success / ExecutionFailed provides all execution-time fields");
             Contract.Assert(executionResult.PrimaryProcessTimes != null, "Success / ExecutionFailed provides all execution-time fields");
 
-            environment.Counters.AddToCounter(PipExecutorCounter.ExecuteProcessDuration, executionResult.PrimaryProcessTimes.TotalWallClockTime);
+            counters.AddToCounter(PipExecutorCounter.ExecuteProcessDuration, executionResult.PrimaryProcessTimes.TotalWallClockTime);
 
             using (operationContext.StartOperation(PipExecutorCounter.ProcessOutputsDuration))
             {
@@ -1567,7 +1599,7 @@ namespace BuildXL.Scheduler
                     //
                     // Don't track file changes in observed input processor when process execution failed. Running observed input processor has side effects
                     // that some files get tracked by the file change tracker. Suppose that the process failed because it accesses paths that
-                    // are supposed to be untracked (but the user forgot to specify it in the spec). Those paths will be tracked by 
+                    // are supposed to be untracked (but the user forgot to specify it in the spec). Those paths will be tracked by
                     // file change tracker because the observed input processor may try to probe and track those paths.
                     observedInputValidationResult =
                         await ValidateObservedFileAccesses(
@@ -1598,7 +1630,7 @@ namespace BuildXL.Scheduler
                     bool isDirty = false;
                     foreach (var absentPathProbe in observedInputValidationResult.AbsentPathProbesUnderNonDependenceOutputDirectories)
                     {
-                        if (!pip.DirectoryDependencies.Any(dir => absentPathProbe.IsWithin(context.PathTable, dir)))
+                        if (!pip.DirectoryDependencies.Any(dir => absentPathProbe.IsWithin(pathTable, dir)))
                         {
                             isDirty = true;
                             break;
@@ -1647,7 +1679,7 @@ namespace BuildXL.Scheduler
                         Logger.Log.ScheduleProcessNotStoredToCacheDueToFileMonitoringViolations(operationContext, processDescription);
                     }
                     else if (executionResult.NumberOfWarnings > 0 &&
-                             ExtraFingerprintSalts.ArePipWarningsPromotedToErrors(environment.Configuration.Logging))
+                             ExtraFingerprintSalts.ArePipWarningsPromotedToErrors(configuration.Logging))
                     {
                         // Just like not caching errors, we also don't want to cache warnings that are promoted to errors
                         Logger.Log.ScheduleProcessNotStoredToWarningsUnderWarnAsError(operationContext, processDescription);
@@ -1670,7 +1702,7 @@ namespace BuildXL.Scheduler
                     // TODO: Maybe all counter updates should occur on distributed build master.
                     if (skipCaching)
                     {
-                        environment.Counters.IncrementCounter(PipExecutorCounter.ProcessPipsExecutedButUncacheable);
+                        counters.IncrementCounter(PipExecutorCounter.ProcessPipsExecutedButUncacheable);
                     }
 
                     using (operationContext.StartOperation(PipExecutorCounter.ProcessOutputsStoreContentForProcessAndCreateCacheEntryDuration))
@@ -1720,7 +1752,7 @@ namespace BuildXL.Scheduler
                     // This strong fingerprint is meaningless and not-cached, but compute it for the sake of
                     // execution analyzer logic that rely on having a successful strong fingerprint
                     var strongFingerprint = observedInputValidationResult.ComputeStrongFingerprint(
-                        environment.Context.PathTable,
+                        pathTable,
                         fingerprintComputation.Value.WeakFingerprint,
                         pathSetHash);
 
@@ -1763,10 +1795,25 @@ namespace BuildXL.Scheduler
         ///   a non-null result is returned.
         /// - If cache lookup fails (i.e., the result is inconclusive due to failed hashing, etc.), a null result is returned.
         /// </summary>
-        public static async Task<RunnableFromCacheResult> TryCheckProcessRunnableFromCacheAsync(
+        public static Task<RunnableFromCacheResult> TryCheckProcessRunnableFromCacheAsync(
             ProcessRunnablePip processRunnable,
             PipExecutionState.PipScopeState state,
             CacheableProcess cacheableProcess)
+        {
+            return TryCheckProcessRunnableFromCacheAsync(
+                processRunnable,
+                state,
+                cacheableProcess,
+                computeWeakFingerprint: () => new WeakContentFingerprint(cacheableProcess.ComputeWeakFingerprint().Hash),
+                canAugmentWeakFingerprint: processRunnable.Environment.Configuration.Cache.AugmentWeakFingerprintPathSetThreshold > 0);
+        }
+
+        private static async Task<RunnableFromCacheResult> TryCheckProcessRunnableFromCacheAsync(
+            ProcessRunnablePip processRunnable,
+            PipExecutionState.PipScopeState state,
+            CacheableProcess cacheableProcess,
+            Func<WeakContentFingerprint> computeWeakFingerprint,
+            bool canAugmentWeakFingerprint)
         {
             Contract.Requires(processRunnable != null);
             Contract.Requires(cacheableProcess != null);
@@ -1783,6 +1830,12 @@ namespace BuildXL.Scheduler
 
             var process = cacheableProcess.Process;
 
+            BoxRef<PipCacheMissEventData> pipCacheMiss = new PipCacheMissEventData
+            {
+                PipId = process.PipId,
+                CacheMissType = PipCacheMissType.Invalid,
+            };
+
             var processFingerprintComputationResult = new ProcessFingerprintComputationEventData
             {
                 Kind = FingerprintComputationKind.CacheCheck,
@@ -1791,29 +1844,59 @@ namespace BuildXL.Scheduler
                     CollectionUtilities.EmptyArray<ProcessStrongFingerprintComputationData>(),
             };
 
-            BoxRef<PipCacheMissEventData> pipCacheMiss = new PipCacheMissEventData
-            {
-                PipId = process.PipId,
-                CacheMissType = PipCacheMissType.Invalid,
-            };
-
             int numPathSetsDownloaded = 0, numCacheEntriesVisited = 0;
+            WeakContentFingerprint weakFingerprint;
+            bool performedLookupForAugmentedWeakFingerprint = false;
 
             using (operationContext.StartOperation(PipExecutorCounter.CheckProcessRunnableFromCacheDuration))
+            using (var strongFingerprintComputationListWrapper = SchedulerPools.StrongFingerprintDataListPool.GetInstance())
+            {
+                List<BoxRef<ProcessStrongFingerprintComputationData>> strongFingerprintComputationList =
+                    strongFingerprintComputationListWrapper.Instance;
+
+                using (operationContext.StartOperation(PipExecutorCounter.ComputeWeakFingerprintDuration))
+                {
+                    weakFingerprint = computeWeakFingerprint();
+                    processFingerprintComputationResult.WeakFingerprint = weakFingerprint;
+                }
+
+                var result = await innerCheckRunnableFromCacheAsync(strongFingerprintComputationList);
+
+                // Update the strong fingerprint computations list
+                processFingerprintComputationResult.StrongFingerprintComputations = strongFingerprintComputationList.SelectArray(s => s.Value);
+
+                using (operationContext.StartOperation(PipExecutorCounter.CheckProcessRunnableFromCacheExecutionLogDuration))
+                {
+                    environment.State.ExecutionLog?.ProcessFingerprintComputation(processFingerprintComputationResult);
+                }
+
+                processRunnable.CacheLookupPerfInfo.LogCounters(pipCacheMiss.Value.CacheMissType, numPathSetsDownloaded, numCacheEntriesVisited);
+
+                Logger.Log.PipCacheLookupStats(
+                    operationContext,
+                    process.FormattedSemiStableHash,
+                    performedLookupForAugmentedWeakFingerprint,
+                    weakFingerprint.ToString(),
+                    numCacheEntriesVisited,
+                    numPathSetsDownloaded);
+
+                return result;
+            }
+
+            // Extracted local function with main logic for performing the cache lookup.
+            // This is done to ensure that execution log logging is always done even in cases of early return (namely augmented weak fingerprint cache lookup
+            // defers to an inner cache lookup and performs an early return of the result)
+            async Task<RunnableFromCacheResult> innerCheckRunnableFromCacheAsync(List<BoxRef<ProcessStrongFingerprintComputationData>> strongFingerprintComputationList)
             {
                 // Totally usable descriptor (may additionally require content availability), or null.
-                RunnableFromCacheResult.CacheHitData usableDescriptor = null;
+                RunnableFromCacheResult.CacheHitData cacheHitData = null;
                 PublishedEntryRefLocality? refLocality;
                 ObservedInputProcessingResult? maybeUsableProcessingResult = null;
 
                 string description = processRunnable.Description;
 
-                WeakContentFingerprint weakFingerprint;
-                using (operationContext.StartOperation(PipExecutorCounter.ComputeWeakFingerprintDuration))
-                {
-                    weakFingerprint = new WeakContentFingerprint(cacheableProcess.ComputeWeakFingerprint().Hash);
-                    processFingerprintComputationResult.WeakFingerprint = weakFingerprint;
-                }
+                // Augmented weak fingerprint used for storing cache entry in case of cache miss
+                WeakContentFingerprint? augmentedWeakFingerprint = null;
 
                 if (cacheableProcess.ShouldHaveArtificialMiss())
                 {
@@ -1848,7 +1931,6 @@ namespace BuildXL.Scheduler
 
                     using (operationContext.StartOperation(PipExecutorCounter.CheckProcessRunnableFromCacheChapter1DetermineStrongFingerprintDuration))
                     using (var strongFingerprintCacheWrapper = SchedulerPools.HashFingerprintDataMapPool.GetInstance())
-                    using (var strongFingerprintComputationListWrapper = SchedulerPools.StrongFingerprintDataListPool.GetInstance())
                     {
                         // It is common to have many entry refs for the same PathSet, since often path content changes more often than the set of paths
                         // (i.e., the refs differ by strong fingerprint). We cache the strong fingerprint computation per PathSet; this saves the repeated
@@ -1856,8 +1938,6 @@ namespace BuildXL.Scheduler
                         // For those path sets that are ill-defined for the pip (e.g. inaccessible paths), we use a null marker.
                         Dictionary<ContentHash, Tuple<BoxRef<ProcessStrongFingerprintComputationData>, ObservedInputProcessingResult, ObservedPathSet>> strongFingerprintCache =
                             strongFingerprintCacheWrapper.Instance;
-                        List<BoxRef<ProcessStrongFingerprintComputationData>> strongFingerprintComputationList =
-                            strongFingerprintComputationListWrapper.Instance;
 
                         foreach (
                             Task<Possible<PublishedEntryRef, Failure>> batchPromise in
@@ -1922,44 +2002,50 @@ namespace BuildXL.Scheduler
                                 }
 
                                 var pathSet = maybePathSet.Value;
-                                (bool succeeded, ObservedInputProcessingResult observedInputProcessingResult, StrongContentFingerprint? strongContentFingerprint, ObservedPathSet pathSetUsed, ContentHash pathSetHashUsed)
-                                    strongFingerprintComputationResult =
-                                        await TryComputeStrongFingerprintBasedOnPriorObservedPathSetAsync(
-                                            operationContext,
-                                            environment,
-                                            state,
-                                            cacheableProcess,
-                                            weakFingerprint,
-                                            pathSet,
-                                            entryRef.PathSetHash);
 
                                 // Record the most relevant strong fingerprint information, defaulting to information retrieved from cache
-                                BoxRef<ProcessStrongFingerprintComputationData> strongFingerprintComputationData = strongFingerprintComputationResult.succeeded 
-                                    ? new ProcessStrongFingerprintComputationData(
-                                        pathSet: strongFingerprintComputationResult.pathSetUsed,
-                                        pathSetHash: strongFingerprintComputationResult.pathSetHashUsed,
-                                        priorStrongFingerprints: new List<StrongContentFingerprint>(1) { strongFingerprintComputationResult.strongContentFingerprint.Value })
-                                    : new ProcessStrongFingerprintComputationData(
+                                BoxRef<ProcessStrongFingerprintComputationData> strongFingerprintComputationData = new ProcessStrongFingerprintComputationData(
                                         pathSet: pathSet,
                                         pathSetHash: entryRef.PathSetHash,
                                         priorStrongFingerprints: new List<StrongContentFingerprint>(1) { entryRef.StrongFingerprint });
 
                                 strongFingerprintComputationList.Add(strongFingerprintComputationData);
 
-                                ObservedInputProcessingResult observedInputProcessingResult = strongFingerprintComputationResult.observedInputProcessingResult;
+                                // check if now running with safer options than before (i.e., prior are not strictly safer than current)
+                                var currentUnsafeOptions = state.UnsafeOptions;
+                                var priorUnsafeOptions = pathSet.UnsafeOptions;
+
+                                if (priorUnsafeOptions.IsLessSafeThan(currentUnsafeOptions))
+                                {
+                                    // This path set's options are less safe than our current options so we cannot use it. Just ignore it.
+                                    // Poison this path set hash so we don't repeatedly try to retrieve and parse it.
+                                    strongFingerprintCache[entryRef.PathSetHash] = null;
+                                    continue;
+                                }
+
+                                (ObservedInputProcessingResult observedInputProcessingResult, StrongContentFingerprint computedStrongFingerprint) =
+                                    await TryComputeStrongFingerprintBasedOnPriorObservedPathSetAsync(
+                                        operationContext,
+                                        environment,
+                                        state,
+                                        cacheableProcess,
+                                        weakFingerprint,
+                                        pathSet,
+                                        entryRef.PathSetHash);
+
                                 ObservedInputProcessingStatus processingStatus = observedInputProcessingResult.Status;
 
                                 switch (processingStatus)
                                 {
                                     case ObservedInputProcessingStatus.Success:
-                                        strongFingerprint = strongFingerprintComputationResult.strongContentFingerprint;
+                                        strongFingerprint = computedStrongFingerprint;
                                         Contract.Assume(strongFingerprint.HasValue);
 
                                         strongFingerprintComputationData.Value = strongFingerprintComputationData.Value.ToSuccessfulResult(
-                                            computedStrongFingerprint: strongFingerprint.Value,
+                                            computedStrongFingerprint: computedStrongFingerprint,
                                             observedInputs: observedInputProcessingResult.ObservedInputs.BaseArray);
 
-                                        if (ETWLogger.Log.IsEnabled(EventLevel.Verbose, Events.Keywords.Diagnostics))
+                                        if (ETWLogger.Log.IsEnabled(EventLevel.Verbose, Keywords.Diagnostics))
                                         {
                                             Logger.Log.TwoPhaseStrongFingerprintComputedForPathSet(
                                                 operationContext,
@@ -1973,7 +2059,7 @@ namespace BuildXL.Scheduler
                                     case ObservedInputProcessingStatus.Mismatched:
                                         // This pip can't access some of the paths. We should remember that (the path set may be repeated many times).
                                         strongFingerprint = null;
-                                        if (ETWLogger.Log.IsEnabled(EventLevel.Verbose, Events.Keywords.Diagnostics))
+                                        if (ETWLogger.Log.IsEnabled(EventLevel.Verbose, Keywords.Diagnostics))
                                         {
                                             Logger.Log.TwoPhaseStrongFingerprintUnavailableForPathSet(
                                                 operationContext,
@@ -2035,8 +2121,57 @@ namespace BuildXL.Scheduler
                                 environment.ReportCacheDescriptorHit(entryRef.OriginatingCache);
                                 break;
                             }
+                            else if (canAugmentWeakFingerprint && entryRef.StrongFingerprint == StrongContentFingerprint.AugmentedWeakFingerprintMarker)
+                            {
+                                // The strong fingeprint is the marker fingerprint indicating that computing an augmented weak fingerprint is required.
+                                augmentedWeakFingerprint = new WeakContentFingerprint(strongFingerprint.Value.Hash);
+                                performedLookupForAugmentedWeakFingerprint = true;
 
-                            if (ETWLogger.Log.IsEnabled(EventLevel.Verbose, BuildXL.Utilities.Tracing.Events.Keywords.Diagnostics))
+                                // Notice this is a recursive call to same method with augmented weak fingerprint but disallowing
+                                // further augmentation
+                                var result = await TryCheckProcessRunnableFromCacheAsync(
+                                    processRunnable,
+                                    state,
+                                    cacheableProcess,
+                                    () => augmentedWeakFingerprint.Value,
+                                    canAugmentWeakFingerprint: false);
+
+                                string keepAliveResult = "N/A";
+
+                                try
+                                {
+                                    if (result.CanRunFromCache)
+                                    {
+                                        // Fetch the augmenting path set entry to keep it alive
+                                        // NOTE: This is best-effort so we don't observe the result here. This would
+                                        // be a good candidate for incorporate since we don't actually need the cache entry
+                                        var fetchAugmentingPathSetEntryResult = await cache.TryGetCacheEntryAsync(
+                                            cacheableProcess.Process,
+                                            weakFingerprint,
+                                            entryRef.PathSetHash,
+                                            entryRef.StrongFingerprint);
+
+                                        keepAliveResult = fetchAugmentingPathSetEntryResult.Succeeded
+                                            ? (fetchAugmentingPathSetEntryResult.Result == null ? "Missing" : "Success")
+                                            : fetchAugmentingPathSetEntryResult.Failure.Describe();
+
+                                        return result;
+                                    }
+                                }
+                                finally
+                                {
+                                    Logger.Log.AugmentedWeakFingerprint(
+                                        operationContext,
+                                        description,
+                                        weakFingerprint: weakFingerprint.ToString(),
+                                        augmentedWeakFingerprint: augmentedWeakFingerprint.ToString(),
+                                        pathSetHash: entryRef.PathSetHash.ToHex(),
+                                        pathCount: maybePathSet?.Paths.Length ?? -1,
+                                        keepAliveResult: keepAliveResult);
+                                }
+                            }
+
+                            if (ETWLogger.Log.IsEnabled(EventLevel.Verbose, Keywords.Diagnostics))
                             {
                                 Logger.Log.TwoPhaseStrongFingerprintRejected(
                                     operationContext,
@@ -2046,9 +2181,6 @@ namespace BuildXL.Scheduler
                                     availableStrongFingerprint: strongFingerprint.Value.ToString());
                             }
                         }
-
-                        // Update the strong fingerprint computations list
-                        processFingerprintComputationResult.StrongFingerprintComputations = strongFingerprintComputationList.SelectArray(s => s.Value);
                     }
 
                     CacheEntry? maybeUsableCacheEntry = null;
@@ -2123,7 +2255,7 @@ namespace BuildXL.Scheduler
 
                     if (maybeUsableCacheEntry.HasValue)
                     {
-                        usableDescriptor = await TryConvertToRunnableFromCacheResult(
+                        cacheHitData = await TryConvertToRunnableFromCacheResultAsync(
                          processRunnable,
                          operationContext,
                          environment,
@@ -2142,14 +2274,107 @@ namespace BuildXL.Scheduler
 
                 RunnableFromCacheResult runnableFromCacheResult;
 
+                bool isCacheHit = cacheHitData != null;
+
+                if (!isCacheHit)
+                {
+                    var pathSetCount = strongFingerprintComputationList.Count;
+                    int threshold = environment.Configuration.Cache.AugmentWeakFingerprintPathSetThreshold;
+                    if (augmentedWeakFingerprint == null
+                        && threshold > 0
+                        && canAugmentWeakFingerprint
+                        && pathSetCount >= threshold)
+                    {
+                        // Compute 'weak augmenting' path set with common paths among path sets
+                        ObservedPathSet weakAugmentingPathSet = ExtractPathSetForAugmentingWeakFingerprint(pathTable, environment.Configuration.Cache, strongFingerprintComputationList);
+
+                        var minPathCount = strongFingerprintComputationList.Select(s => s.Value.PathSet.Paths.Length).Min();
+                        var maxPathCount = strongFingerprintComputationList.Select(s => s.Value.PathSet.Paths.Length).Max();
+
+                        var weakAugmentingPathSetHashResult = await cache.TryStorePathSetAsync(weakAugmentingPathSet);
+                        string addAugmentingPathSetResultDescription;
+
+                        if (weakAugmentingPathSetHashResult.Succeeded)
+                        {
+                            ContentHash weakAugmentingPathSetHash = weakAugmentingPathSetHashResult.Result;
+
+                            // Optional (not currently implemented): If augmenting path set already exists (race condition), we 
+                            // could compute augmented weak fingerprint and perform the cache lookup as above
+                            (ObservedInputProcessingResult observedInputProcessingResult, StrongContentFingerprint computedStrongFingerprint)
+                                        = await TryComputeStrongFingerprintBasedOnPriorObservedPathSetAsync(
+                                                operationContext,
+                                                environment,
+                                                state,
+                                                cacheableProcess,
+                                                weakFingerprint,
+                                                weakAugmentingPathSet,
+                                                weakAugmentingPathSetHash);
+
+                            BoxRef<ProcessStrongFingerprintComputationData> strongFingerprintComputation = new ProcessStrongFingerprintComputationData(
+                                weakAugmentingPathSetHash,
+                                new List<StrongContentFingerprint>() { StrongContentFingerprint.AugmentedWeakFingerprintMarker },
+                                weakAugmentingPathSet);
+
+                            // Add the computation of the augmenting weak fingerprint
+                            strongFingerprintComputationList.Add(strongFingerprintComputation);
+
+                            if (observedInputProcessingResult.Status == ObservedInputProcessingStatus.Success)
+                            {
+                                // Add marker selector with weak augmenting path set
+                                var addAugmentationResult = await cache.TryPublishCacheEntryAsync(
+                                    cacheableProcess.Process,
+                                    weakFingerprint,
+                                    weakAugmentingPathSetHash,
+                                    StrongContentFingerprint.AugmentedWeakFingerprintMarker,
+                                    CacheEntry.FromArray((new[] { weakAugmentingPathSetHash }).ToReadOnlyArray(), "AugmentWeakFingerprint"));
+
+                                addAugmentingPathSetResultDescription = addAugmentationResult.Succeeded
+                                    ? addAugmentationResult.Result.Status.ToString()
+                                    : addAugmentationResult.Failure.Describe();
+
+                                augmentedWeakFingerprint = new WeakContentFingerprint(computedStrongFingerprint.Hash);
+
+                                strongFingerprintComputation.Value = strongFingerprintComputation.Value.ToSuccessfulResult(
+                                    computedStrongFingerprint,
+                                    observedInputProcessingResult.ObservedInputs);
+                            }
+                            else
+                            {
+                                addAugmentingPathSetResultDescription = observedInputProcessingResult.Status.ToString();
+                            }
+                        }
+                        else
+                        {
+                            addAugmentingPathSetResultDescription = weakAugmentingPathSetHashResult.Failure.Describe();
+                        }
+
+                        Logger.Log.AddAugmentingPathSet(
+                            operationContext,
+                            cacheableProcess.Description,
+                            weakFingerprint: weakFingerprint.ToString(),
+                            pathSetHash: weakAugmentingPathSetHashResult.Succeeded ? weakAugmentingPathSetHashResult.Result.ToHex() : "N/A",
+                            pathCount: weakAugmentingPathSet.Paths.Length,
+                            pathSetCount: pathSetCount,
+                            minPathCount: minPathCount,
+                            maxPathCount: maxPathCount,
+                            result: addAugmentingPathSetResultDescription);
+                    }
+                }
+
+                WeakContentFingerprint cacheResultWeakFingerprint = isCacheHit || augmentedWeakFingerprint == null
+                    ? weakFingerprint
+                    : augmentedWeakFingerprint.Value;
+
                 runnableFromCacheResult = CreateRunnableFromCacheResult(
-                    usableDescriptor,
+                    cacheHitData,
                     environment,
                     refLocality,
                     maybeUsableProcessingResult,
-                    weakFingerprint);
+                    cacheResultWeakFingerprint);
 
-                if (!runnableFromCacheResult.CanRunFromCache)
+                if (!runnableFromCacheResult.CanRunFromCache
+                    // Don't perform redundant cache miss logging if already handled for augmented weak fingerprint
+                    && !performedLookupForAugmentedWeakFingerprint)
                 {
                     Contract.Assert(pipCacheMiss.Value.CacheMissType != PipCacheMissType.Invalid, "Must have valid cache miss reason");
                     environment.Counters.IncrementCounter((PipExecutorCounter)pipCacheMiss.Value.CacheMissType);
@@ -2161,14 +2386,92 @@ namespace BuildXL.Scheduler
                     environment.State.ExecutionLog?.PipCacheMiss(pipCacheMiss.Value);
                 }
 
-                using (operationContext.StartOperation(PipExecutorCounter.CheckProcessRunnableFromCacheExecutionLogDuration))
-                {
-                    environment.State.ExecutionLog?.ProcessFingerprintComputation(processFingerprintComputationResult);
-                }
-
-                processRunnable.CacheLookupPerfInfo.LogCounters(pipCacheMiss.Value.CacheMissType, numPathSetsDownloaded, numCacheEntriesVisited);
                 return runnableFromCacheResult;
             }
+        }
+
+        /// <summary>
+        /// Extract a path set to represent the commonly accessed paths which can be used to compute an augmented weak fingerprint
+        /// </summary>
+        private static ObservedPathSet ExtractPathSetForAugmentingWeakFingerprint(
+            PathTable pathTable,
+            ICacheConfiguration cacheConfiguration,
+            List<BoxRef<ProcessStrongFingerprintComputationData>> strongFingerprintComputationList)
+        {
+            var requiredUseCount = Math.Max(1, cacheConfiguration.AugmentWeakFingerprintPathSetThreshold * cacheConfiguration.AugmentWeakFingerprintRequiredPathCommonalityFactor);
+            using (var pool = s_pathToObservationEntryMapPool.GetInstance())
+            using (var accessedNameUseCountMapPool = s_accessedFileNameToUseCountPool.GetInstance())
+            using (var stringIdPool = Pools.StringIdSetPool.GetInstance())
+            {
+                Dictionary<AbsolutePath, ExtractedPathEntry> map = pool.Instance;
+                var accessedNameUseCountMap = accessedNameUseCountMapPool.Instance;
+                var accessedFileNameSet = stringIdPool.Instance;
+
+                foreach (var pathSet in strongFingerprintComputationList.Select(s => s.Value.PathSet))
+                {
+                    // Union common observed access file names to increase the strength (specificity) of the augmented weak fingerprint
+                    // for search path enumerations in the path sets.
+                    foreach (var accessedFileName in pathSet.ObservedAccessedFileNames)
+                    {
+                        if (!accessedNameUseCountMap.TryGetValue(accessedFileName, out var useCount))
+                        {
+                            useCount = 0;
+                        }
+
+                        useCount++;
+
+                        if (useCount >= requiredUseCount)
+                        {
+                            accessedFileNameSet.Add(accessedFileName);
+                        }
+
+                        accessedNameUseCountMap[accessedFileName] = useCount;
+                    }
+
+                    // Union common observed paths to increase the strength (specificity) of the augmented weak fingerprint.
+                    foreach (ObservedPathEntry pathEntry in pathSet.Paths)
+                    {
+                        if (map.TryGetValue(pathEntry.Path, out var existingEntry))
+                        {
+                            if (IsCompatible(pathEntry, existingEntry.Entry))
+                            {
+                                existingEntry.UseCount++;
+                                map[pathEntry.Path] = existingEntry;
+                            }
+                        }
+                        else
+                        {
+                            map[pathEntry.Path] = new ExtractedPathEntry()
+                            {
+                                Entry = pathEntry,
+                                UseCount = 1
+                            };
+                        }
+                    }
+                }
+
+                var firstPathSet = strongFingerprintComputationList[0].Value.PathSet;
+                var paths = SortedReadOnlyArray<ObservedPathEntry, ObservedPathEntryExpandedPathComparer>.CloneAndSort(
+                    map.Values.Where(e => e.UseCount >= requiredUseCount).Select(e => e.Entry),
+                    firstPathSet.Paths.Comparer);
+
+                var observedAccessedFileNames = SortedReadOnlyArray<StringId, CaseInsensitiveStringIdComparer>.CloneAndSort(
+                    accessedFileNameSet,
+                    firstPathSet.ObservedAccessedFileNames.Comparer);
+
+                return new ObservedPathSet(
+                    paths,
+                    observedAccessedFileNames,
+                    // Use default unsafe options which prevents path set from ever being rejected due to
+                    // incompatibility with the currently specified unsafe options during cache lookup
+                    unsafeOptions: null);
+            }
+        }
+
+        private static bool IsCompatible(ObservedPathEntry pathEntry, ObservedPathEntry existingEntry)
+        {
+            return pathEntry.Flags == existingEntry.Flags
+                && pathEntry.EnumeratePatternRegex == existingEntry.EnumeratePatternRegex;
         }
 
         private static RunnableFromCacheResult CreateRunnableFromCacheResult(
@@ -2241,6 +2544,7 @@ namespace BuildXL.Scheduler
             }
 
             var cacheHitData = TryCreatePipCacheDescriptorFromMetadata(
+                operationContext,
                 environment,
                 state,
                 pip,
@@ -2262,7 +2566,7 @@ namespace BuildXL.Scheduler
                 : RunnableFromCacheResult.CreateForMiss(executionResult.TwoPhaseCachingInfo.WeakFingerprint);
         }
 
-        private static async Task<RunnableFromCacheResult.CacheHitData> TryConvertToRunnableFromCacheResult(
+        private static async Task<RunnableFromCacheResult.CacheHitData> TryConvertToRunnableFromCacheResultAsync(
             ProcessRunnablePip processRunnable,
             OperationContext operationContext,
             IPipExecutionEnvironment environment,
@@ -2303,6 +2607,7 @@ namespace BuildXL.Scheduler
                     if (maybeMetadata.Succeeded && maybeMetadata.Result != null)
                     {
                         maybeParsedDescriptor = TryCreatePipCacheDescriptorFromMetadata(
+                            operationContext,
                             environment,
                             state,
                             pip,
@@ -2482,7 +2787,6 @@ namespace BuildXL.Scheduler
 
             var pathTable = environment.Context.PathTable;
             var stringTable = environment.Context.StringTable;
-            var symbolTable = environment.Context.SymbolTable;
             var cacheHitData = runnableFromCacheCheckResult.GetCacheHitData();
             var metadata = cacheHitData.Metadata;
             var currentProcessWeakFingerprintText = runnableFromCacheCheckResult.WeakFingerprint.ToString();
@@ -2558,7 +2862,7 @@ namespace BuildXL.Scheduler
                 string fileMaterializationFileNameString = info.FileName.ToString(stringTable);
                 var stringBuilder = new StringBuilder();
                 stringBuilder.AppendLine(
-                    I($"File name should only differ by casing. File artifact's full path: '{fileArtifactPathString}'; file artifact's file name: '{fileArtifactFileName.ToString(stringTable)}'; materialization info file name: '{fileMaterializationFileNameString}'."));                
+                    I($"File name should only differ by casing. File artifact's full path: '{fileArtifactPathString}'; file artifact's file name: '{fileArtifactFileName.ToString(stringTable)}'; materialization info file name: '{fileMaterializationFileNameString}'."));
                 stringBuilder.AppendLine(I($"[{process.FormattedSemiStableHash}] Weak FP: '{runnableFromCacheCheckResult.WeakFingerprint.ToString()}', Strong FP: '{cacheHitData.StrongFingerprint.ToString()}', Metadata Hash: '{cacheHitData.MetadataHash.ToString()}'"));
 
                 Contract.Assert(false, stringBuilder.ToString());
@@ -2693,6 +2997,7 @@ namespace BuildXL.Scheduler
             }
 
             var pathTable = environment.Context.PathTable;
+            var configuration = environment.Configuration;
             SemanticPathExpander semanticPathExpander = state.PathExpander;
             var pipDataRenderer = new PipFragmentRenderer(
                 pathTable,
@@ -2703,21 +3008,24 @@ namespace BuildXL.Scheduler
                 environment.Context,
                 operationContext.LoggingContext,
                 pip,
-                environment.Configuration.Sandbox,
-                environment.Configuration.Layout,
-                environment.Configuration.Logging,
+                configuration.Sandbox,
+                configuration.Layout,
+                configuration.Logging,
                 environment.RootMappings,
                 environment.ProcessInContainerManager,
                 pipEnvironment: environment.State.PipEnvironment,
-                validateDistribution: environment.Configuration.Distribution.ValidateDistribution,
+                validateDistribution: configuration.Distribution.ValidateDistribution,
                 directoryArtifactContext: new DirectoryArtifactContext(environment),
                 whitelist: null,
                 makeInputPrivate: null,
                 makeOutputPrivate: null,
                 semanticPathExpander: semanticPathExpander,
-                disableConHostSharing: environment.Configuration.Engine.DisableConHostSharing,
+                disableConHostSharing: configuration.Engine.DisableConHostSharing,
                 pipDataRenderer: pipDataRenderer,
-                directoryTranslator: environment.DirectoryTranslator);
+                directoryTranslator: environment.DirectoryTranslator,
+                vmInitializer: environment.VmInitializer,
+                tempDirectoryCleaner: environment.TempCleaner,
+                incrementalTools: configuration.IncrementalTools);
 
             if (!await executor.TryInitializeWarningRegexAsync())
             {
@@ -2800,6 +3108,7 @@ namespace BuildXL.Scheduler
         }
 
         private static RunnableFromCacheResult.CacheHitData TryCreatePipCacheDescriptorFromMetadata(
+            OperationContext operationContext,
             IPipExecutionEnvironment environment,
             PipExecutionState.PipScopeState state,
             CacheablePip pip,
@@ -2838,41 +3147,54 @@ namespace BuildXL.Scheduler
             List<(FileArtifact, FileMaterializationInfo)> cachedArtifactContentHashes =
                 new List<(FileArtifact, FileMaterializationInfo)>(pip.Outputs.Length);
 
-            // Outputs should be the same as what was in the metadata section.
-            int outputHashIndex = 0;
-            for (int i = 0; i < pip.Outputs.Length; i++)
+            // Only the CanBeReferencedOrCached output will be saved in metadata.StaticOutputHashes
+            // We looped metadata.StaticOutputHashes and meanwhile find the corresponding output in current executing pip.
+            FileArtifactWithAttributes attributedOutput;
+            using (var poolAbsolutePathFileArtifactWithAttributes = Pools.GetAbsolutePathFileArtifactWithAttributesMap())
             {
-                FileArtifactWithAttributes attributedOutput = pip.Outputs[i];
-                if (!attributedOutput.CanBeReferencedOrCached())
-                {
-                    // Skipping non-cacheable outputs (note that StoreContentForProcess does the same).
-                    continue;
-                }
+                Dictionary<AbsolutePath, FileArtifactWithAttributes> outputs = poolAbsolutePathFileArtifactWithAttributes.Instance;
+                outputs.AddRange(pip.Outputs.Select(o => new KeyValuePair<AbsolutePath, FileArtifactWithAttributes>(o.Path, o)));
 
-                FileArtifact output = attributedOutput.ToFileArtifact();
+                foreach (var staticOutputHashes in metadata.StaticOutputHashes)
+                {
+                    // TODO: The code path that returns null looks dubious. Could they ever be reached? Should we write a contract here instead of silently concluding weak fingerprint miss?
 
-                FileMaterializationInfo materializationInfo = metadata.StaticOutputHashes[outputHashIndex].ToFileMaterializationInfo(pathTable);
-                outputHashIndex++;
+                    FileMaterializationInfo materializationInfo = staticOutputHashes.Info.ToFileMaterializationInfo(pathTable);
+                    AbsolutePath metadataPath = AbsolutePath.Create(pathTable, staticOutputHashes.AbsolutePath);
 
-                // Following logic should be in sync with StoreContentForProcess method.
-                bool isRequired = IsRequiredForCaching(attributedOutput);
-                if (materializationInfo.Hash != WellKnownContentHashes.AbsentFile)
-                {
-                    cachedArtifactContentHashes.Add((output, materializationInfo));
-                }
-                else if (isRequired)
-                {
-                    // Required but looks absent; entry is invalid.
-                    return null;
-                }
-                else
-                {
-                    if (absentArtifacts == null)
+                    if (!outputs.TryGetValue(metadataPath, out attributedOutput))
                     {
-                        absentArtifacts = new List<FileArtifact>();
+                        // Output in metadata is missing from the pip specification; entry is invalid.
+                        Logger.Log.InvalidMetadataStaticOutputNotFound(operationContext, pip.Description, staticOutputHashes.AbsolutePath);
+                        return null;
                     }
 
-                    absentArtifacts.Add(output);
+                    Contract.Assert(attributedOutput.IsValid);
+
+                    FileArtifact output = attributedOutput.ToFileArtifact();
+
+                    // Following logic should be in sync with StoreContentForProcess method.
+                    bool isRequired = IsRequiredForCaching(attributedOutput);
+
+                    if (materializationInfo.Hash != WellKnownContentHashes.AbsentFile)
+                    {
+                        cachedArtifactContentHashes.Add((output, materializationInfo));
+                    }
+                    else if (isRequired)
+                    {
+                        // Required but looks absent; entry is invalid.
+                        Logger.Log.InvalidMetadataRequiredOutputIsAbsent(operationContext, pip.Description, staticOutputHashes.AbsolutePath);
+                        return null;
+                    }
+                    else
+                    {
+                        if (absentArtifacts == null)
+                        {
+                            absentArtifacts = new List<FileArtifact>();
+                        }
+
+                        absentArtifacts.Add(output);
+                    }
                 }
             }
 
@@ -2981,7 +3303,7 @@ namespace BuildXL.Scheduler
             {
                 // The path can't be accessed. Note that we don't apply a whitelist here (that only applies to process execution).
                 // We let this cause overall failure (i.e., a failed ObservedInputProcessingResult, and an undefined StrongContentFingerprint).
-                if (!BuildXL.Scheduler.ETWLogger.Log.IsEnabled(EventLevel.Verbose, BuildXL.Utilities.Tracing.Events.Keywords.Diagnostics))
+                if (!BuildXL.Scheduler.ETWLogger.Log.IsEnabled(EventLevel.Verbose, Keywords.Diagnostics))
                 {
                     Logger.Log.PathSetValidationTargetFailedAccessCheck(m_operationContext, m_pipDescription, assertion.Path.ToString(m_pathTable));
                 }
@@ -3169,7 +3491,7 @@ namespace BuildXL.Scheduler
         /// Note that if the returned processing status is <see cref="ObservedInputProcessingStatus.Aborted"/>, then a failure has been logged and pip
         /// execution must fail.
         /// </summary>
-        private static async Task<(bool, ObservedInputProcessingResult, StrongContentFingerprint?, ObservedPathSet, ContentHash)> TryComputeStrongFingerprintBasedOnPriorObservedPathSetAsync(
+        private static async Task<(ObservedInputProcessingResult, StrongContentFingerprint)> TryComputeStrongFingerprintBasedOnPriorObservedPathSetAsync(
             OperationContext operationContext,
             IPipExecutionEnvironment environment,
             PipExecutionState.PipScopeState state,
@@ -3198,21 +3520,7 @@ namespace BuildXL.Scheduler
                 // force cache miss if observed input processing result is not 'Success'
                 if (validationResult.Status != ObservedInputProcessingStatus.Success)
                 {
-                    return (false, validationResult, default(StrongContentFingerprint?), default(ObservedPathSet), default(ContentHash));
-                }
-
-                // check if now running with safer options than before (i.e., prior are not strictly safer than current)
-                var currentUnsafeOptions = state.UnsafeOptions;
-                var priorUnsafeOptions = pathSet.UnsafeOptions;
-
-                // prior options are safer --> use the precomputed path set hash to aim for a cache hit
-                var finalPathSetHash = pathSetHash;
-                var finalPathSet = pathSet;
-                if (!priorUnsafeOptions.IsAsSafeOrSaferThan(currentUnsafeOptions))
-                {
-                    // prior options are less safe --> compute new path set hash (with updated unsafe options)
-                    finalPathSet = pathSet.WithUnsafeOptions(currentUnsafeOptions);
-                    finalPathSetHash = await pathSet.WithUnsafeOptions(currentUnsafeOptions).ToContentHash(environment.Context.PathTable, state.PathExpander);
+                    return (validationResult, default(StrongContentFingerprint));
                 }
 
                 // log and compute strong fingerprint using the PathSet hash from the cache
@@ -3222,16 +3530,16 @@ namespace BuildXL.Scheduler
                     pip,
                     validationResult);
 
-                StrongContentFingerprint? strongFingerprint;
+                StrongContentFingerprint strongFingerprint;
                 using (operationContext.StartOperation(PipExecutorCounter.ComputeStrongFingerprintDuration))
                 {
                     strongFingerprint = validationResult.ComputeStrongFingerprint(
                         environment.Context.PathTable,
                         weakFingerprint,
-                        finalPathSetHash);
+                        pathSetHash);
                 }
 
-                return (true, validationResult, strongFingerprint, finalPathSet, finalPathSetHash);
+                return (validationResult, strongFingerprint);
             }
         }
 
@@ -3295,7 +3603,7 @@ namespace BuildXL.Scheduler
             }
 
             // Tracing input assertions is expensive (many events and many string expansions); we avoid tracing when nobody is listening.
-            if (!BuildXL.Scheduler.ETWLogger.Log.IsEnabled(EventLevel.Verbose, BuildXL.Utilities.Tracing.Events.Keywords.Diagnostics))
+            if (!BuildXL.Scheduler.ETWLogger.Log.IsEnabled(EventLevel.Verbose, Keywords.Diagnostics))
             {
                 return;
             }
@@ -3357,7 +3665,7 @@ namespace BuildXL.Scheduler
             // only check/load "real" files - reparse points are not stored in CAS, they are stored in metadata that we have already obtained
             // if we try to load reparse points' content from CAS, content availability check would fail, and as a result,
             // BuildXL would have to re-run the pip (even if all other outputs are available)
-            // Also, do not load zero-hash files (there is nothing in CAS with this hash) 
+            // Also, do not load zero-hash files (there is nothing in CAS with this hash)
             allHashes.AddRange(cachedArtifactContentHashes
                 .Where(pair => pair.fileMaterializationInfo.IsCacheable)
                 .Select(a => (a.fileArtifact, a.fileMaterializationInfo.Hash)));
@@ -3402,6 +3710,12 @@ namespace BuildXL.Scheduler
 
                 return succeeded;
             }
+        }
+
+        private struct ExtractedPathEntry
+        {
+            public ObservedPathEntry Entry;
+            public int UseCount;
         }
 
         [Flags]
@@ -3490,6 +3804,30 @@ namespace BuildXL.Scheduler
             }
         }
 
+        private static bool CheckForAllowedDirectorySymlinkOrJunctionProduction(AbsolutePath outputPath, OperationContext operationContext, string description, PathTable pathTable, ExecutionResult processExecutionResult)
+        {
+            if (OperatingSystemHelper.IsUnixOS)
+            {
+                return true;
+            }
+
+            var pathstring = outputPath.ToString(pathTable);
+            if (FileUtilities.IsDirectorySymlinkOrJunction(pathstring))
+            {
+                // We don't support storing directory symlinks/junctions to the cache in Windows right now.
+                // We won't fail the pip
+                // We won't cache it either
+                Logger.Log.StorageSymlinkDirInOutputDirectoryWarning(
+                    operationContext,
+                    description,
+                    pathstring);
+                processExecutionResult.MustBeConsideredPerpetuallyDirty = true;
+                return false;
+            }
+
+            return true;
+        }
+
         /// <summary>
         /// Discovers the content hashes of a process pip's outputs, which must now be on disk.
         /// The pip's outputs will be stored into the <see cref="IArtifactContentCache"/> of <see cref="IPipExecutionEnvironment.Cache"/>,
@@ -3573,6 +3911,12 @@ namespace BuildXL.Scheduler
                 {
                     FileOutputData.UpdateFileData(allOutputData, output.Path, OutputFlags.DeclaredFile);
 
+                    if (!CheckForAllowedDirectorySymlinkOrJunctionProduction(output.Path, operationContext, description, pathTable, processExecutionResult))
+                    {
+                        enableCaching = false;
+                        continue;
+                    }
+
                     // If the directory containing the output file was redirected, then we want to cache the content of the redirected output instead.
                     if (outputFilesAreRedirected && environment.ProcessInContainerManager.TryGetRedirectedDeclaredOutputFile(output.Path, containerConfiguration, out AbsolutePath redirectedOutputPath))
                     {
@@ -3601,6 +3945,12 @@ namespace BuildXL.Scheduler
                             directoryArtifact,
                             handleFile: fileArtifact =>
                             {
+                                if (!CheckForAllowedDirectorySymlinkOrJunctionProduction(fileArtifact.Path, operationContext, description, pathTable, processExecutionResult))
+                                {
+                                    enableCaching = false;
+                                    return;
+                                }
+
                                 fileList.Add(fileArtifact);
                                 FileOutputData.UpdateFileData(allOutputData, fileArtifact.Path, OutputFlags.DynamicFile, index);
                                 var fileArtifactWithAttributes = fileArtifact.WithAttributes(FileExistence.Required);
@@ -3654,6 +4004,12 @@ namespace BuildXL.Scheduler
                             // But we could do this here in the future
                             if (maybeResult.Result == PathExistence.ExistsAsDirectory)
                             {
+                                continue;
+                            }
+
+                            if (!CheckForAllowedDirectorySymlinkOrJunctionProduction(access, operationContext, description, pathTable, processExecutionResult))
+                            {
+                                enableCaching = false;
                                 continue;
                             }
 
@@ -3967,15 +4323,12 @@ namespace BuildXL.Scheduler
 
             if (requiredOrExistent)
             {
-                bool isProcessPreservingOutputs = IsProcessPreservingOutputs(environment, process);
-                bool isDynamicOutputFile = outputData.HasAnyFlag(OutputFlags.DynamicFile);
+                bool isProcessPreservingOutputs = IsProcessPreservingOutputFile(environment, process, outputArtifact, outputData);
                 bool isRewrittenOutputFile = IsRewriteOutputFile(environment, outputArtifact);
 
                 bool shouldOutputBePreserved =
                     // Process is marked for allowing preserved output.
                     isProcessPreservingOutputs &&
-                    // Preserving dynamic output is currently not supported.
-                    !isDynamicOutputFile &&
                     // Rewritten output is stored to the cache.
                     !isRewrittenOutputFile;
 
@@ -4019,6 +4372,26 @@ namespace BuildXL.Scheduler
                    environment.Configuration.Sandbox.UnsafeSandboxConfiguration.PreserveOutputs != PreserveOutputsMode.Disabled;
         }
 
+        private static bool IsProcessPreservingOutputFile(IPipExecutionEnvironment environment, Process process, FileArtifact fileArtifact, FileOutputData fileOutputData)
+        {
+            Contract.Requires(environment != null);
+            Contract.Requires(process != null);
+
+            if (!IsProcessPreservingOutputs(environment, process))
+            {
+                return false;
+            }
+
+            AbsolutePath declaredArtifactPath = fileArtifact.Path;
+            if (fileOutputData.HasAnyFlag(OutputFlags.DynamicFile))
+            {
+                // If it is a dynamic file, let's find the declared directory path.
+                declaredArtifactPath = process.DirectoryOutputs[fileOutputData.OpaqueDirectoryIndex].Path;
+            }
+
+            return PipArtifacts.IsPreservedOutputByPip(process, declaredArtifactPath, environment.Context.PathTable);
+        }
+
         private static bool IsRewriteOutputFile(IPipExecutionEnvironment environment, FileArtifact file)
         {
             Contract.Requires(environment != null);
@@ -4052,8 +4425,12 @@ namespace BuildXL.Scheduler
 
                 if (outputData.HasAllFlags(OutputFlags.DeclaredFile))
                 {
-                    // If it is a static output, just store its hash in the descriptor.
-                    metadata.StaticOutputHashes.Add(materializationInfo.ToBondFileMaterializationInfo(pathTable));
+                    var keyedHash = new AbsolutePathFileMaterializationInfo
+                    {
+                        AbsolutePath = path.ToString(pathTable),
+                        Info = materializationInfo.ToBondFileMaterializationInfo(pathTable),
+                    };
+                    metadata.StaticOutputHashes.Add(keyedHash);
                 }
 
                 if (outputData.HasAllFlags(OutputFlags.DynamicFile))
@@ -4156,11 +4533,11 @@ namespace BuildXL.Scheduler
             // Suppose that we don't include the output hashes. Let's have a pip P whose output o should be preserved.
             // P executes, and stores #M of metadata hash with some strong fingerprint SF.
             // Before the next build, o is deleted from disk. Now, P maintains its SF because its input has not changed.
-            // P gets a cache hit, but when BuildXL tries to load o with #o (stored in M), it fails because o wasn't stored in the cache 
-            // and o doesn't exist on disk. Thus, P executes and produces o with different hash #o'. However, the post-execution of P 
+            // P gets a cache hit, but when BuildXL tries to load o with #o (stored in M), it fails because o wasn't stored in the cache
+            // and o doesn't exist on disk. Thus, P executes and produces o with different hash #o'. However, the post-execution of P
             // will fail to store #M because the entry has existed.
             //
-            // In the next run, P again gets a cache hit, but when BuildXL tries to load o with #o (stored in M) it fails because o wasn't stored 
+            // In the next run, P again gets a cache hit, but when BuildXL tries to load o with #o (stored in M) it fails because o wasn't stored
             // in the cache and o, even though exists on disk, has different hash (#o vs. #o'). Thus, P executes again and produces o with different hash #o''.
             // This will happen over and over again.
             //
@@ -4285,7 +4662,7 @@ namespace BuildXL.Scheduler
             };
 
             // Converge to the conflicting entry rather than ignoring and continuing.
-            var usableDescriptor = await TryConvertToRunnableFromCacheResult(
+            var usableDescriptor = await TryConvertToRunnableFromCacheResultAsync(
                 null,
                 operationContext,
                 environment,
@@ -4439,77 +4816,6 @@ namespace BuildXL.Scheduler
             return (environment.Configuration.Engine.UseHardlinks && !process.OutputsMustRemainWritable)
                 ? FileRealizationMode.HardLinkOrCopy // Prefers hardlinks, but will fall back to copying when creating a hard link fails. (e.g. >1023 links)
                 : FileRealizationMode.Copy;
-        }
-
-        /// <summary>
-        /// The result of storing the two phase cache entry
-        /// </summary>
-        internal sealed class StoreCacheEntryResult
-        {
-            /// <summary>
-            /// Gets result indicate the the operation successfully stored the cache entry to the cache
-            /// </summary>
-            public static readonly StoreCacheEntryResult Succeeded = new StoreCacheEntryResult();
-
-            /// <summary>
-            /// The execution result if the cache entry had conflicting entry which was retrieved
-            /// and outputs were reported from the entry
-            /// </summary>
-            public readonly ExecutionResult ConvergedExecutionResult;
-
-            /// <summary>
-            /// Gets whether the cache entry had conflicting entry which was retrieved
-            /// and outputs were reported from the entry
-            /// </summary>
-            public bool Converged => ConvergedExecutionResult != null;
-
-            /// <summary>
-            /// Creates a <see cref="StoreCacheEntryResult"/> indicating cache convergence.
-            /// </summary>
-            public static StoreCacheEntryResult CreateConvergedResult(ExecutionResult convergedExecutionResult)
-            {
-                Contract.Requires(convergedExecutionResult != null);
-                Contract.Requires(!convergedExecutionResult.IsSealed);
-
-                convergedExecutionResult.Converged = true;
-                convergedExecutionResult.Seal();
-
-                Contract.Assert(!convergedExecutionResult.Result.IndicatesFailure(), "Converged result must represent success");
-                return new StoreCacheEntryResult(convergedExecutionResult);
-            }
-
-            private StoreCacheEntryResult(ExecutionResult convergedExecutionResult = null)
-            {
-                ConvergedExecutionResult = convergedExecutionResult;
-            }
-        }
-
-        /// <summary>
-        /// Directory-related information to be passed to <see cref="SandboxedProcessPipExecutor"/>
-        /// </summary>
-        private sealed class DirectoryArtifactContext : IDirectoryArtifactContext
-        {
-            private readonly IPipExecutionEnvironment m_pipExecutionEnvironment;
-
-            /// <nodoc/>
-            public DirectoryArtifactContext(IPipExecutionEnvironment pipExecutionEnvironment)
-            {
-                Contract.Requires(pipExecutionEnvironment != null);
-
-                m_pipExecutionEnvironment = pipExecutionEnvironment;
-            }
-
-            /// <inheritdoc/>
-            public SealDirectoryKind GetSealDirectoryKind(DirectoryArtifact directoryArtifact)
-            {
-                return m_pipExecutionEnvironment.GetSealDirectoryKind(directoryArtifact);
-            }
-
-            /// <inheritdoc/>
-            public SortedReadOnlyArray<FileArtifact, OrdinalFileArtifactComparer> ListSealDirectoryContents(DirectoryArtifact directory)
-            {
-                return m_pipExecutionEnvironment.State.FileContentManager.ListSealedDirectoryContents(directory);
-            }
         }
 
         /// <summary>

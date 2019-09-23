@@ -18,24 +18,20 @@ namespace BuildXL.Engine.Distribution.Grpc
         private readonly LoggingContext m_loggingContext;
         private readonly ClientConnectionManager m_connectionManager;
         private readonly Worker.WorkerClient m_client;
-        private readonly SenderInfo m_senderInfo;
+        private readonly Func<CancellationToken, Task<IDisposable>> m_attachAcquireAsync;
 
-        public GrpcWorkerClient(LoggingContext loggingContext, string buildId, string ipAddress, int port)
+        public GrpcWorkerClient(LoggingContext loggingContext, string buildId, string ipAddress, int port, EventHandler onConnectionTimeOutAsync, Func<CancellationToken, Task<IDisposable>> attachAcquireAsync)
         {
             m_loggingContext = loggingContext;
             m_connectionManager = new ClientConnectionManager(loggingContext, ipAddress, port, buildId);
+            m_connectionManager.OnConnectionTimeOutAsync += onConnectionTimeOutAsync;
             m_client = new Worker.WorkerClient(m_connectionManager.Channel);
-            m_senderInfo = new SenderInfo()
-            {
-                BuildId = buildId,
-                SenderName = MachineName,
-                SenderId = Guid.NewGuid().ToString()
-            };
+            m_attachAcquireAsync = attachAcquireAsync;
         }
 
-        public void Close()
+        public Task CloseAsync()
         {
-            m_connectionManager.Close();
+            return m_connectionManager.CloseAsync();
         }
 
         public void Dispose()
@@ -43,29 +39,32 @@ namespace BuildXL.Engine.Distribution.Grpc
 
         public Task<RpcCallResult<Unit>> AttachAsync(OpenBond.BuildStartData message)
         {
-            var grpcMessage = message.ToGrpc(m_senderInfo);
+            var grpcMessage = message.ToGrpc();
 
             return m_connectionManager.CallAsync(
-                (callOptions) => m_client.AttachAsync(grpcMessage, options: callOptions),
+                async (callOptions) =>
+                {
+                    using (await m_attachAcquireAsync(callOptions.CancellationToken))
+                    {
+                        return await m_client.AttachAsync(grpcMessage, options: callOptions);
+                    }
+                },
                 "Attach",
                 waitForConnection: true);
         }
 
         public Task<RpcCallResult<Unit>> ExecutePipsAsync(OpenBond.PipBuildRequest message, IList<long> semiStableHashes)
         {
-            var grpcMessage = message.ToGrpc(m_senderInfo);
+            var grpcMessage = message.ToGrpc();
 
             return m_connectionManager.CallAsync(
-               (callOptions) => m_client.ExecutePipsAsync(grpcMessage, options: callOptions),
+               async (callOptions) => await m_client.ExecutePipsAsync(grpcMessage, options: callOptions),
                GetExecuteDescription(semiStableHashes));
         }
 
         public Task<RpcCallResult<Unit>> ExitAsync(OpenBond.BuildEndData message, CancellationToken cancellationToken)
         {
-            var grpcBuildEndData = new BuildEndData()
-            {
-                Sender = m_senderInfo,
-            };
+            var grpcBuildEndData = new BuildEndData();
 
             if (message.Failure != null)
             {
@@ -73,7 +72,7 @@ namespace BuildXL.Engine.Distribution.Grpc
             }
 
             return m_connectionManager.CallAsync(
-                (callOptions) => m_client.ExitAsync(grpcBuildEndData, options: callOptions),
+                async (callOptions) => await m_client.ExitAsync(grpcBuildEndData, options: callOptions),
                 "Exit",
                 cancellationToken);
         }

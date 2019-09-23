@@ -14,12 +14,13 @@ namespace BuildXL.Cache.ContentStore.Service
     public sealed class LocalServerConfiguration
     {
         /// <nodoc />
-        public LocalServerConfiguration(AbsolutePath dataRootPath, IReadOnlyDictionary<string, AbsolutePath> namedCacheRoots, int grpcPort, int? bufferSizeForGrpcCopies = null)
+        public LocalServerConfiguration(AbsolutePath dataRootPath, IReadOnlyDictionary<string, AbsolutePath> namedCacheRoots, int grpcPort, int? bufferSizeForGrpcCopies = null, int? gzipBarrierSizeForGrpcCopies = null)
         {
             DataRootPath = dataRootPath;
             NamedCacheRoots = namedCacheRoots;
             GrpcPort = grpcPort;
             BufferSizeForGrpcCopies = bufferSizeForGrpcCopies;
+            GzipBarrierSizeForGrpcCopies = gzipBarrierSizeForGrpcCopies;
         }
 
         /// <nodoc />
@@ -42,6 +43,7 @@ namespace BuildXL.Cache.ContentStore.Service
             GrpcPort = (int)serviceConfiguration.GrpcPort;
             GrpcPortFileName = serviceConfiguration.GrpcPortFileName;
             BufferSizeForGrpcCopies = serviceConfiguration.BufferSizeForGrpcCopies;
+            GzipBarrierSizeForGrpcCopies = serviceConfiguration.GzipBarrierSizeForGrpcCopies;
             return this;
         }
 
@@ -58,7 +60,7 @@ namespace BuildXL.Cache.ContentStore.Service
         /// <summary>
         /// Gets or sets the time period between logging incremental stats
         /// </summary>
-        public TimeSpan LogIncrementalStatsInterval { get; set; } = TimeSpan.FromMinutes(15);
+        public TimeSpan LogIncrementalStatsInterval { get; set; } = TimeSpan.FromDays(15); // Effectively disabling incremental statistics.
 
         /// <summary>
         /// Gets or sets the duration of inactivity after which a session will be timed out.
@@ -94,6 +96,11 @@ namespace BuildXL.Cache.ContentStore.Service
         /// <nodoc />
         public int? BufferSizeForGrpcCopies { get; private set; }
 
+        /// <summary>
+        /// Files greater than this size will be compressed via GZip when GZip is enabled.
+        /// </summary>
+        public int? GzipBarrierSizeForGrpcCopies { get; private set; }
+
         /// <nodoc />
         public static readonly string DefaultFileName = "CASaaS GRPC port";
 
@@ -124,6 +131,7 @@ namespace BuildXL.Cache.ContentStore.Service
             sb.Append($", GrpcPort={GrpcPort}");
             sb.Append($", GrpcPortFileName={GrpcPortFileName}");
             sb.Append($", BufferSizeForGrpcCopies={BufferSizeForGrpcCopies}");
+            sb.Append($", GzipBarrierSizeForGrpcCopies={GzipBarrierSizeForGrpcCopies}");
 
             return sb.ToString();
         }

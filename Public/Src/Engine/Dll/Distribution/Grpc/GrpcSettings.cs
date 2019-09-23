@@ -3,6 +3,7 @@
 
 using System;
 using BuildXL.Utilities.Configuration;
+using Grpc.Core;
 
 namespace BuildXL.Engine.Distribution.Grpc
 {
@@ -10,7 +11,9 @@ namespace BuildXL.Engine.Distribution.Grpc
     {
         public const string TraceIdKey = "traceid-bin";
         public const string BuildIdKey = "buildid";
-        public const int MaxRetry = 4;
+        public const string SenderKey = "sender";
+
+        public const int MaxRetry = 3;
 
         /// <summary>
         /// Maximum time for a Grpc call (both master->worker and worker->master)
@@ -24,7 +27,7 @@ namespace BuildXL.Engine.Distribution.Grpc
         /// Maximum time to wait for the master to connect to a worker.
         /// </summary>
         /// <remarks>
-        /// Default: 30 minutes
+        /// Default: 60 minutes
         /// </remarks>
         public static TimeSpan InactiveTimeout => EngineEnvironmentSettings.DistributionInactiveTimeout;
 
@@ -40,8 +43,31 @@ namespace BuildXL.Engine.Distribution.Grpc
         /// Maximum time to wait for the master to connect to a worker.
         /// </summary>
         /// <remarks>
-        /// Default: true
+        /// Default: false
         /// </remarks>
         public static bool HandlerInliningEnabled => EngineEnvironmentSettings.GrpcHandlerInliningEnabled;
+
+        public static void ParseHeader(Metadata header, out string sender, out string senderBuildId, out string traceId)
+        {
+            sender = string.Empty;
+            senderBuildId = string.Empty;
+            traceId = string.Empty;
+
+            foreach (var kvp in header)
+            {
+                if (kvp.Key == GrpcSettings.TraceIdKey)
+                {
+                    traceId = new Guid(kvp.ValueBytes).ToString();
+                }
+                else if (kvp.Key == GrpcSettings.BuildIdKey)
+                {
+                    senderBuildId = kvp.Value;
+                }
+                else if (kvp.Key == GrpcSettings.SenderKey)
+                {
+                    sender = kvp.Value;
+                }
+            }
+        }
     }
 }

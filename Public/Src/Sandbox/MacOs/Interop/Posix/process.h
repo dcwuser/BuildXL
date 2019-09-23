@@ -11,9 +11,11 @@ typedef struct {
     double exitTime;
     unsigned long systemTime;
     unsigned long userTime;
-} ProcessTimesInfo;
+    unsigned long diskio_bytesRead;
+    unsigned long diskio_bytesWritten;
+} ProcessResourceUsage;
 
-int GetProcessTimes(pid_t pid, ProcessTimesInfo *buffer, long bufferSize, bool includeChildProcesses);
+int GetProcessResourceUsage(pid_t pid, ProcessResourceUsage *buffer, long bufferSize, bool includeChildProcesses);
 
 typedef struct {
     char *outputPath;
@@ -25,5 +27,7 @@ typedef struct {
 
 bool SetupProcessDumps(const char *logsDirectory, /*out*/ char *buffer, size_t bufsiz);
 void TeardownProcessDumps(void);
+
+void RegisterSignalHandlers(void);
 
 #endif /* process_h */

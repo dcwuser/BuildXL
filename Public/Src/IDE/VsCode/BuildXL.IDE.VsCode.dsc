@@ -48,10 +48,12 @@ namespace LanguageService.Server {
      * means that any change to client/src/extension.ts needs to be recompiled and the checked-in file updated.
      */
     export function buildVsixDeploymentDefinition(serverAssembly: ManagedSdk.Assembly) : Deployment.Definition {
-        // Update the version of the manifest and json files to match the one being passed
 
-        let manifest = IDE.VersionUtilities.updateVersion(Branding.semanticVersion, f`pluginTemplate/extension.vsixmanifest`);
-        let json = IDE.VersionUtilities.updateVersion(Branding.version, f`client/package.json`);
+        // We have to publish the vsix to the Visual Studio MarketPlace which doesn't handle prerelease tags. 
+        let version = Branding.versionNumberForToolsThatDontSupportPreReleaseTag;
+        let manifest = IDE.VersionUtilities.updateVersion(version, f`pluginTemplate/extension.vsixmanifest`);
+        let json = IDE.VersionUtilities.updateVersion(version, f`client/package.json`);
+        let readme = IDE.VersionUtilities.updateVersion(Branding.version, f`client/README.md`);
 
         const vsixDeployment: Deployment.Definition = {
             contents: [
@@ -62,10 +64,6 @@ namespace LanguageService.Server {
                             subfolder: a`bin`,
                             contents: [
                                 serverAssembly,
-                                // Language server could start nuget download and in this case
-                                // the nuget.exe is detoured.
-                                // This requires detours to be deployed with the language server
-                                DetoursServices.Deployment.definition,
                             ]
                         },
                         {
@@ -93,7 +91,7 @@ namespace LanguageService.Server {
                         },
                         f`client/License.txt`,
                         f`client/package.nls.json`,
-                        f`client/README.md`,
+                        readme,
                         f`client/ThirdPartyNotices.txt`,
                         Branding.pngFile,
                         json,

@@ -40,6 +40,19 @@ namespace Test.BuildXL.FrontEnd.MsBuild.Infrastructure
 
         protected AbsolutePath TestPath { get; }
 
+        // Keep the paths below in sync with Public\Src\FrontEnd\UnitTests\MsBuild\Test.BuildXL.FrontEnd.MsBuild.dsc
+        private AbsolutePath FullframeworkMSBuild => AbsolutePath.Create(PathTable, TestDeploymentDir)
+            .Combine(PathTable, "msbuild")
+            .Combine(PathTable, "net472")
+            .Combine(PathTable, "MSBuild.exe");
+        private AbsolutePath DotnetCoreMSBuild => AbsolutePath.Create(PathTable, TestDeploymentDir)
+            .Combine(PathTable, "msbuild")
+            .Combine(PathTable, "dotnetcore")
+            .Combine(PathTable, "MSBuild.dll");
+        private AbsolutePath DotnetExe => AbsolutePath.Create(PathTable, TestDeploymentDir)
+            .Combine(PathTable, "dotnet")
+            .Combine(PathTable, OperatingSystemHelper.IsUnixOS ? "dotnet" : "dotnet.exe");
+
         /// <nodoc/>
         public MsBuildPipSchedulingTestBase(ITestOutputHelper output, bool usePassThroughFileSystem = false) : base(output, usePassThroughFileSystem)
         {
@@ -96,17 +109,23 @@ namespace Test.BuildXL.FrontEnd.MsBuild.Infrastructure
             IReadOnlyCollection<AbsolutePath> outputs = null, 
             IEnumerable<ProjectWithPredictions> references = null,
             GlobalProperties globalProperties = null,
-            PredictedTargetsToExecute predictedTargetsToExecute = null)
+            PredictedTargetsToExecute predictedTargetsToExecute = null,
+            bool implementsTargetProtocol = true)
         {
             var projectNameRelative = RelativePath.Create(StringTable, projectName ?? "testProj.proj");
 
+            // We need to simulate the project comes from MSBuild with /graph
+            var properties = new Dictionary<string, string>(globalProperties ?? GlobalProperties.Empty);
+            properties[PipConstructor.s_isGraphBuildProperty] = "true";
+
             var projectWithPredictions = new ProjectWithPredictions(
                 TestPath.Combine(PathTable, projectNameRelative), 
-                globalProperties ?? GlobalProperties.Empty, 
+                implementsTargetProtocol,
+                new GlobalProperties(properties), 
                 inputs ?? CollectionUtilities.EmptyArray<AbsolutePath>(), 
                 outputs ?? CollectionUtilities.EmptyArray<AbsolutePath>(), 
                 projectReferences: references?.ToArray() ?? CollectionUtilities.EmptyArray<ProjectWithPredictions>(),
-                predictedTargetsToExecute: predictedTargetsToExecute ?? PredictedTargetsToExecute.CreatePredictedTargetsToExecute(new[] { "Build" }));
+                predictedTargetsToExecute: predictedTargetsToExecute ?? PredictedTargetsToExecute.Create(new[] { "Build" }));
 
             return projectWithPredictions;
         }
@@ -121,13 +140,18 @@ namespace Test.BuildXL.FrontEnd.MsBuild.Infrastructure
 
             using (var controller = CreateFrontEndHost(GetDefaultCommandLine(), frontEndFactory, workspaceFactory, moduleRegistry, AbsolutePath.Invalid, out _, out _, requestedQualifiers))
             {
+                resolverSettings.ComputeEnvironment(out var trackedEnv, out var passthroughVars);
+
                 var pipConstructor = new PipConstructor(
                     FrontEndContext,
                     controller,
                     m_testModule,
                     resolverSettings,
-                    AbsolutePath.Create(PathTable, TestDeploymentDir).Combine(PathTable, "MSBuild.exe"),
-                    nameof(MsBuildFrontEnd));
+                    resolverSettings.ShouldRunDotNetCoreMSBuild()? DotnetCoreMSBuild : FullframeworkMSBuild,
+                    resolverSettings.ShouldRunDotNetCoreMSBuild()? DotnetExe : AbsolutePath.Invalid,
+                    nameof(MsBuildFrontEnd),
+                    trackedEnv,
+                    passthroughVars);
 
                 var schedulingResults = new Dictionary<ProjectWithPredictions, (bool, string, Process)>();
 

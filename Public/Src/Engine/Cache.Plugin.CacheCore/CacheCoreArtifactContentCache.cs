@@ -29,13 +29,17 @@ namespace BuildXL.Engine.Cache.Plugin.CacheCore
 
         private readonly RootTranslator m_rootTranslator;
 
+        private readonly bool m_replaceExistingFileOnMaterialization;
+
         /// <nodoc />
         public CacheCoreArtifactContentCache(
             ICacheSession cache,
-            RootTranslator rootTranslator)
+            RootTranslator rootTranslator,
+            bool replaceExistingFileOnMaterialization = false)
         {
             m_cache = new PossiblyOpenCacheSession(cache);
             m_rootTranslator = rootTranslator;
+            m_replaceExistingFileOnMaterialization = replaceExistingFileOnMaterialization;
         }
 
         /// <inheritdoc />
@@ -248,7 +252,11 @@ namespace BuildXL.Engine.Cache.Plugin.CacheCore
                         ? FileToDelete.Invalid
                         : FileToDelete.Create(pathForCache);
 
-            var mayBeDelete = fileToDelete.TryDelete();
+            if (!m_replaceExistingFileOnMaterialization)
+            {
+                // BuildXL controls the file deletion if the place file mode is FailIfExists.
+
+                var mayBeDelete = fileToDelete.TryDelete();
                 // The file materialization below can fail if fileToDelete and fileForCacheToDelete
                 // point to different object files. One can think that fileForCacheToDelete should
                 // be deleted as well by adding the following expression in the above statement:
@@ -258,9 +266,10 @@ namespace BuildXL.Engine.Cache.Plugin.CacheCore
                 // However, this deletion masks a possibly serious underlying issue because we expect
                 // both fileToDelete and fileForCacheToDelete point to the same object file.
 
-            if (!mayBeDelete.Succeeded)
-            {
-                return mayBeDelete.Failure;
+                if (!mayBeDelete.Succeeded)
+                {
+                    return mayBeDelete.Failure;
+                }
             }
 
             Possible<ICacheSession, Failure> maybeOpen = m_cache.Get(nameof(TryMaterializeAsync));
@@ -279,20 +288,7 @@ namespace BuildXL.Engine.Cache.Plugin.CacheCore
                 return maybePlaced.Failure.Annotate(diagnostic);
             }
 
-            return maybePlaced.Then(p => {
-                // TODO:58494: Occasionally we see odd behavior where materialization seems to succeed, but the file is not present in the file system
-                //             layer. This check tries to see if the file exits after successful materialization and fails if it doesn't.
-                if (!FileUtilities.FileExistsNoFollow(pathForCache))
-                {
-                    return new Failure<string>(string.Format(
-                                CultureInfo.InvariantCulture,
-                                "The file '{0}' with content hash '{1}' was materialzed successfully, but can't be found on disk",
-                                pathForCache,
-                                contentHash));
-                }
-
-                return new Possible<Unit, Failure>(Unit.Void);
-            });
+            return maybePlaced.Then(p => Unit.Void);
         }
 
         /// <inheritdoc />

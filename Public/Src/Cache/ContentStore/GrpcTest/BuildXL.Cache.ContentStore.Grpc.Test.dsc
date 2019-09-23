@@ -3,34 +3,30 @@
 
 namespace GrpcTest {
     @@public
-    export const dll = BuildXLSdk.isDotNetCoreBuild ? undefined : BuildXLSdk.cacheTest({
+    export const dll = BuildXLSdk.cacheTest({
         assemblyName: "Microsoft.ContentStore.Grpc.Test",
         sources: globR(d`.`,"*.cs"),
         runTestArgs: {
             parallelGroups: [ "Integration" ],
         },
-        skipTestRun: BuildXLSdk.restrictTestRunToDebugNet461OnWindows,
+        skipTestRun: BuildXLSdk.restrictTestRunToSomeQualifiers,
         references: [
             ...addIf(BuildXLSdk.isFullFramework,
                 NetFx.System.Xml.dll,
                 NetFx.System.Xml.Linq.dll
             ),
-            ...(BuildXLSdk.isDotNetCoreBuild
-                // TODO: This is to get a .Net Core build, but it may not pass tests
-                ? [importFrom("System.Data.SQLite").withQualifier({targetFramework: "net461"}).pkg]
-                : [importFrom("System.Data.SQLite").pkg]
-            ),
-            importFrom("Grpc.Core").pkg,
-            importFrom("Google.Protobuf").pkg,
-        
+
+            App.exe, // Tests launch the server, so this needs to be deployed.
             Grpc.dll,
-            Interfaces.dll,
+            Test.dll,
             Hashing.dll,
+            Library.dll,
+            Interfaces.dll,
             UtilitiesCore.dll,
             InterfacesTest.dll,
-            Library.dll,
-            Test.dll,
-            App.exe, // Tests launch the server, so this needs to be deployed.
+
+            importFrom("Grpc.Core").pkg,
+            importFrom("Google.Protobuf").pkg,
             ...BuildXLSdk.fluentAssertionsWorkaround,
         ],
         runtimeContent: [

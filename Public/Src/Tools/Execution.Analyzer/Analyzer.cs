@@ -27,7 +27,10 @@ namespace BuildXL.Execution.Analyzer
         /// </summary>
         public readonly CachedGraph CachedGraph;
 
-        protected readonly AnalysisInput Input;
+        /// <summary>
+        /// Analysis inputs (XLG file location etc.)
+        /// </summary>
+        public readonly AnalysisInput Input;
 
         public LoggingContext LoggingContext { get; set; }
 
@@ -43,19 +46,19 @@ namespace BuildXL.Execution.Analyzer
         /// <summary>
         /// Prepares the analyzer and reads the execution log events into the analyzer
         /// </summary>
-        public void ReadExecutionLog(bool prepare = true)
+        public bool ReadExecutionLog(bool prepare = true)
         {
             if (prepare)
             {
                 Prepare();
             }
 
-            ReadEvents();
+            return ReadEvents();
         }
 
-        protected virtual void ReadEvents()
+        protected virtual bool ReadEvents()
         {
-            Input.ReadExecutionLog(this);
+            return Input.ReadExecutionLog(this);
         }
 
         #region Utility Methods

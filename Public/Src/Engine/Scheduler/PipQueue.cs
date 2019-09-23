@@ -51,12 +51,24 @@ namespace BuildXL.Scheduler
         /// In distributed builds, new work items can come from external requests after draining is started (i.e., workers get requests from the master)
         /// In single machine builds, after draining is started, new work items are only scheduled from the items that are being executed, not external requests.
         /// </remarks>
-        private bool m_isFinalized;
+        private volatile bool m_isFinalized;
 
         /// <summary>
         /// Whether the queue is cancelled via Ctrl-C
         /// </summary>
         private bool m_isCancelled;
+
+        private bool IsCancelled
+        {
+            get
+            {
+                return Volatile.Read(ref m_isCancelled);
+            }
+            set
+            {
+                Volatile.Write(ref m_isCancelled, value);
+            }
+        }
 
         /// <inheritdoc/>
         public int MaxProcesses => m_queuesByKind[DispatcherKind.CPU].MaxParallelDegree;
@@ -77,7 +89,7 @@ namespace BuildXL.Scheduler
         /// If there are no items running or pending in the queues, we need to check whether this pipqueue can accept new external work.
         /// If this is a worker, we cannot finish dispatcher because master can still send new work items to the worker.
         /// </returns>
-        public bool IsFinished => m_isCancelled || (Volatile.Read(ref m_numRunningOrQueued) == 0 && m_isFinalized);
+        public bool IsFinished => IsCancelled || (Volatile.Read(ref m_numRunningOrQueued) == 0 && m_isFinalized);
 
         /// <inheritdoc/>
         public bool IsDisposed { get; private set; }
@@ -231,7 +243,7 @@ namespace BuildXL.Scheduler
                 }
             }
 
-            if (m_isCancelled)
+            if (IsCancelled)
             {
                 Contract.Assert(m_hasAnyRunning != null, "If cancellation is requested, the taskcompletionsource to keep track of running items cannot be null");
 
@@ -247,6 +259,12 @@ namespace BuildXL.Scheduler
         {
             Contract.Requires(runnablePip != null);
             Contract.Assert(runnablePip.DispatcherKind != DispatcherKind.None, "RunnablePip should be associated with a dispatcher kind when it is enqueued");
+
+            if (IsCancelled)
+            {
+                // If the cancellation is requested, do not enqueue.
+                return;
+            }
 
             m_queuesByKind[runnablePip.DispatcherKind].Enqueue(runnablePip);
 
@@ -319,7 +337,7 @@ namespace BuildXL.Scheduler
         public void Cancel()
         {
             m_hasAnyRunning = new TaskCompletionSource<bool>();
-            m_isCancelled = true;
+            IsCancelled = true;
             TriggerDispatcher();
         }
 

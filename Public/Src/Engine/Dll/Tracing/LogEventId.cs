@@ -154,7 +154,8 @@ namespace BuildXL.Engine.Tracing
         // Double defined in EventId.cs
         //DistributionWorkerForwardedError = 7015,
         DistributionWorkerForwardedWarning = 7016,
-
+        DistributionWorkerUnexpectedFailureAfterMasterExits = 7017,
+        DistributionWorkerFinish = 7018,
         DistributionWorkerExecutePipRequest = 7019,
         DistributionWorkerFinishedPipRequest = 7020,
         DistributionWorkerCouldNotLoadGraph = 7021,
@@ -174,7 +175,7 @@ namespace BuildXL.Engine.Tracing
         DistributionWorkerStatus = 7038,
 
         DistributionExecutePipFailedNetworkFailureWarning = 7039,
-        // UNUSED 7040
+        DistributionWorkerTimeoutFailure = 7040,
 
         DistributionBondCall = 7041,
         DistributionDebugMessage = 7042,
@@ -215,9 +216,16 @@ namespace BuildXL.Engine.Tracing
         FailedToAcquireDirectoryLock = 7116,
         UsingRedirectedUserProfile = 7117,
         FailedToRedirectUserProfile = 7118,
-        ResourceBasedCancellationIsEnabledWithSharedOpaquesPresent = 7119,
+        // was: ResourceBasedCancellationIsEnabledWithSharedOpaquesPresent = 7119,
         BusyOrUnavailableOutputDirectoriesException = 7120,
         GrpcSettings = 7121,
+
+        FailedToGetJournalAccessor = 7122,
+
+        StartInitializingVm = 7123,
+        EndInitializingVm = 7124,
+        InitializingVm = 7125
+
         // max 7200
     }
 }

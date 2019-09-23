@@ -5,6 +5,7 @@ import {Transformer} from "Sdk.Transformers";
 
 import * as Json from "Sdk.Json";
 import * as Shared from "Sdk.Managed.Shared";
+import * as Deployment from "Sdk.Deployment";
 
 namespace RuntimeConfigFiles {
 
@@ -18,6 +19,7 @@ namespace RuntimeConfigFiles {
         assemblyName: string, 
         runtimeBinary: Shared.Binary,
         references: Shared.Reference[], 
+        runtimeContentToSkip: Deployment.DeployableItem[], 
         appConfig: File, 
         testRunnerDeployment?: boolean
         ) : File[] {
@@ -44,7 +46,7 @@ namespace RuntimeConfigFiles {
                 }
 
                 return [
-                    createDependenciesJson(framework, assemblyName, runtimeBinary, references, testRunnerDeployment),
+                    createDependenciesJson(framework, assemblyName, runtimeBinary, references, runtimeContentToSkip, testRunnerDeployment),
                     createRuntimeConfigJson(framework, assemblyName, runtimeConfigFolder, testRunnerDeployment),
                 ];
             case "none":
@@ -68,12 +70,13 @@ namespace RuntimeConfigFiles {
         assemblyName: string,
         runtimeBinary: Shared.Binary,
         references: Shared.Reference[], 
+        runtimeContentToSkip: Deployment.DeployableItem[], 
         testRunnerDeployment?: boolean
         ): File {
 
         const specFileOutput = Context.getNewOutputDirectory("DotNetSpecFiles");
 
-        const runtimeReferences = Helpers.computeTransitiveReferenceClosure(framework, references, false);
+        const runtimeReferences = Helpers.computeTransitiveReferenceClosure(framework, references, runtimeContentToSkip, false);
 
         const dependencySpecExtension = `${assemblyName}.deps.json`;
         const dependencySpecPath = p`${specFileOutput}/${dependencySpecExtension}`;
@@ -195,16 +198,24 @@ namespace RuntimeConfigFiles {
     @@public
     export function createRuntimeConfigJson(framework: Shared.Framework, assemblyName: string, runtimeConfigFolder: Directory, testRunnerDeployment?: boolean): File {
         const useRuntimeOptions = testRunnerDeployment || framework.applicationDeploymentStyle !== "selfContained";
-        const runtimeOptions = {
+        const frameworkRuntimeOptions = useRuntimeOptions ? {
             tfm: framework.targetFramework,
             framework: {
                 name: framework.runtimeFrameworkName,
                 version: framework.runtimeConfigVersion,
             }
+        } : {};
+
+        // when not using Server GC, in large builds the front end is likely to get completely bogged 
+        const gcRuntimeOptions = {
+            configProperties: {
+                "System.GC.Server": true,
+                "System.GC.RetainVM": true
+            },
         };
 
         let options = {
-            runtimeOptions: useRuntimeOptions ? runtimeOptions : {},
+            runtimeOptions: Object.merge(gcRuntimeOptions, frameworkRuntimeOptions)
         };
 
         return Json.write(p`${runtimeConfigFolder}/${assemblyName + ".runtimeconfig.json"}`, options, '"');

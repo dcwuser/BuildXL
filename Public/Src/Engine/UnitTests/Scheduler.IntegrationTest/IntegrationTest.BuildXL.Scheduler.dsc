@@ -42,6 +42,7 @@ namespace Scheduler.IntegrationTest {
             importFrom("BuildXL.Engine").Engine.dll,
             importFrom("BuildXL.Engine").Processes.dll,
             importFrom("BuildXL.Engine").Scheduler.dll,
+            importFrom("BuildXL.Engine").ViewModel.dll,
             importFrom("BuildXL.Pips").dll,
             importFrom("BuildXL.Utilities").dll,
             importFrom("BuildXL.Utilities").Collections.dll,
@@ -55,15 +56,12 @@ namespace Scheduler.IntegrationTest {
         ],
         runtimeContent: [
             importFrom("BuildXL.Utilities.UnitTests").TestProcess.deploymentDefinition,
+            importFrom("BuildXL.Tools").SandboxedProcessExecutor.exe,
+            // TODO: Move it to the root when we can access the real VmCommandProxy in CB.
             {
-                subfolder: a`tools`,
+                subfolder: r`tools/VmCommandProxy/tools`,
                 contents: [
-                    {
-                        subfolder: a`SandboxedProcessExecutor`,
-                        contents: [
-                            importFrom("BuildXL.Tools").SandboxedProcessExecutor.exe
-                        ]
-                    }
+                    importFrom("BuildXL.Utilities.UnitTests").MockVmCommandProxy.exe
                 ]
             }
         ],

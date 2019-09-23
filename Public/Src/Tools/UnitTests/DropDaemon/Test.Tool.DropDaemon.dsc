@@ -12,6 +12,7 @@ namespace Test.Tool.DropDaemon {
             importFrom("BuildXL.Cache.ContentStore").UtilitiesCore.dll,
             importFrom("BuildXL.Engine").Scheduler.dll,
             importFrom("BuildXL.Tools.DropDaemon").exe,
+            importFrom("BuildXL.Tools").ServicePipDaemon.dll,
             importFrom("BuildXL.Utilities").dll,
             importFrom("BuildXL.Utilities").Ipc.dll,
             importFrom("BuildXL.Utilities").Storage.dll,
@@ -24,11 +25,12 @@ namespace Test.Tool.DropDaemon {
             importFrom("Drop.Client").pkg,
             importFrom("Drop.RemotableClient.Interfaces").pkg,
             importFrom("Microsoft.AspNet.WebApi.Client").pkg,
-            importFrom("Microsoft.VisualStudio.Services.ArtifactServices.Shared").pkg,
+            ...BuildXLSdk.visualStudioServicesArtifactServicesSharedPkg,
             importFrom("Microsoft.VisualStudio.Services.BlobStore.Client").pkg,
             importFrom("Microsoft.IdentityModel.Clients.ActiveDirectory").pkg,
             importFrom("Microsoft.VisualStudio.Services.Client").pkg,
             importFrom("Microsoft.VisualStudio.Services.InteractiveClient").pkg,
         ],
+        runTestArgs: { weight: 2},
     });
 }

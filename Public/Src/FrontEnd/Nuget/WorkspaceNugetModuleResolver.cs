@@ -9,6 +9,7 @@ using System.Diagnostics.ContractsLight;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Net.NetworkInformation;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -58,6 +59,9 @@ namespace BuildXL.FrontEnd.Nuget
 
         private const int MaxRetryCount = 2;
         private const int RetryDelayMs = 100;
+
+        private const int SpecGenerationFormatVersion = 1;
+        private const string SpecGenerationVersionFileSuffix = ".version";
 
         private NugetFrameworkMonikers m_nugetFrameworkMonikers;
 
@@ -218,18 +222,28 @@ namespace BuildXL.FrontEnd.Nuget
 
         /// <summary>
         /// Returns all packages known by this resolver. This includes potentially embedded packages
+        /// 
+        /// The multi-value dictionary maps the original Nuget package name to (possibly multiple) generated DScript packages.
         /// </summary>
-        public async Task<Possible<IEnumerable<Package>>> GetAllKnownPackagesAsync()
+        public async Task<Possible<MultiValueDictionary<string, Package>>> GetAllKnownPackagesAsync()
         {
             var maybeResult = await DownloadPackagesAndGenerateSpecsIfNeededInternal();
 
             return await maybeResult.ThenAsync(
                 async result =>
-                      {
-                          var maybeDefinitions = await this.GetAllModuleDefinitionsAsync();
-                          return maybeDefinitions.Then(
-                              definitions => definitions.Select(GetPackageForGeneratedProject));
-                      });
+                {
+                    var maybeDefinitions = await this.GetAllModuleDefinitionsAsync();
+                    return maybeDefinitions.Then(
+                        definitions => definitions.Aggregate(
+                            seed: new MultiValueDictionary<string, Package>(),
+                            func: (acc, def) => AddPackage(acc, result.GetOriginalNugetPackageName(def), GetPackageForGeneratedProject(def))));
+                });
+        }
+
+        private MultiValueDictionary<string, Package> AddPackage(MultiValueDictionary<string, Package> dict, string nugetPackageName, Package package)
+        {
+            dict.Add(nugetPackageName, package);
+            return dict;
         }
 
         private Package GetPackageForGeneratedProject(ModuleDefinition moduleDefinition)
@@ -248,10 +262,7 @@ namespace BuildXL.FrontEnd.Nuget
             };
 
             // We know that the generated Nuget package config does not have any qualifier space defined.
-            var package = Package.Create(id, moduleDefinition.ModuleConfigFile, packageDescriptor);
-            package.ModuleId = moduleDescriptor.Id;
-
-            return package;
+            return Package.Create(id, moduleDefinition.ModuleConfigFile, packageDescriptor, moduleId: moduleDescriptor.Id);
         }
 
         private PackageId GetPackageIdFromModuleDescriptor(ModuleDescriptor moduleDescriptor)
@@ -353,7 +364,7 @@ namespace BuildXL.FrontEnd.Nuget
                 m_nugetGenerationResult
                     .GetOrCreate(
                         (@this: this, possiblePackages),
-                        tpl => Task.FromResult(tpl.@this.GetNugetGenerationResultFromDownloadedPackages(tpl.possiblePackages))
+                        tpl => Task.FromResult(tpl.@this.GetNugetGenerationResultFromDownloadedPackages(tpl.possiblePackages, null))
                     )
                     .GetAwaiter()
                     .GetResult()
@@ -497,6 +508,7 @@ namespace BuildXL.FrontEnd.Nuget
                             }
                             else
                             {
+                                packageResult.Result.NugetName = nugetPackage.Package.Id;
                                 restoredPackagesById[packageResult.Result.ActualId] = packageResult.Result;
                             }
                         }
@@ -507,7 +519,7 @@ namespace BuildXL.FrontEnd.Nuget
                         return new WorkspaceModuleResolverGenericInitializationFailure(Kind);
                     }
                 }
-
+                
                 var possiblePackages = GenerateSpecsForDownloadedPackages(restoredPackagesById);
 
                 // At this point we know which are all the packages that contain embedded specs, so we can initialize the embedded resolver properly
@@ -518,7 +530,7 @@ namespace BuildXL.FrontEnd.Nuget
                     return failure;
                 }
 
-                return GetNugetGenerationResultFromDownloadedPackages(possiblePackages);
+                return GetNugetGenerationResultFromDownloadedPackages(possiblePackages, restoredPackagesById);
             }
         }
 
@@ -627,7 +639,8 @@ namespace BuildXL.FrontEnd.Nuget
         }
 
         private Possible<NugetGenerationResult> GetNugetGenerationResultFromDownloadedPackages(
-            Dictionary<string, Possible<AbsolutePath>> possiblePackages)
+            Dictionary<string, Possible<AbsolutePath>> possiblePackages,
+            Dictionary<string, NugetAnalyzedPackage> nugetPackagesByModuleName)
         {
             var generatedProjectsByPackageDescriptor = new Dictionary<ModuleDescriptor, AbsolutePath>(m_resolverSettings.Packages.Count);
             var generatedProjectsByPath = new Dictionary<AbsolutePath, ModuleDescriptor>(m_resolverSettings.Packages.Count);
@@ -645,14 +658,14 @@ namespace BuildXL.FrontEnd.Nuget
                     return possiblePackage.Failure;
                 }
 
-                var moduleDescriptor = ModuleDescriptor.CreateWithUniqueId(packageName, this);
+                var moduleDescriptor = ModuleDescriptor.CreateWithUniqueId(m_context.StringTable, packageName, this);
 
                 generatedProjectsByPackageDescriptor[moduleDescriptor] = possiblePackage.Result;
                 generatedProjectsByPath[possiblePackage.Result] = moduleDescriptor;
                 generatedProjectsByPackageName.Add(moduleDescriptor.Name, moduleDescriptor);
             }
 
-            return new NugetGenerationResult(generatedProjectsByPackageDescriptor, generatedProjectsByPath, generatedProjectsByPackageName);
+            return new NugetGenerationResult(generatedProjectsByPackageDescriptor, generatedProjectsByPath, generatedProjectsByPackageName, nugetPackagesByModuleName);
         }
 
         /// <summary>
@@ -684,14 +697,6 @@ namespace BuildXL.FrontEnd.Nuget
                 Logger.Log.NugetRegeneratingNugetSpecs(m_context.LoggingContext);
 
                 var result = new Dictionary<string, Possible<AbsolutePath>>(analyzedPackages.Count);
-                if (!NugetAnalyzedPackage.TryPatchSupportedTargetFrameworksForPackageExtent(m_nugetFrameworkMonikers, analyzedPackages, out var failure))
-                {
-                    // In order to not complicate the result type, in case of a failure in patching the extent, we add it as a dummy package.
-                    // Observe the package name is not really used when there is a failure.
-                    result.Add("__dummy__", failure);
-                    return result;
-                }
-
                 var generatedSpecsCount = 0;
                 foreach (var analyzedPackage in analyzedPackages.Values)
                 {
@@ -786,7 +791,7 @@ namespace BuildXL.FrontEnd.Nuget
 
                 try
                 {
-                    // Sadly nuget goes all over the disk to chain configs, but when it comes to the credentials it decides not to properly merge them. 
+                    // Sadly nuget goes all over the disk to chain configs, but when it comes to the credentials it decides not to properly merge them.
                     // So for now we have to hack and read the credentials from the users profile and stick them in the local config....
                     if (FileUtilities.Exists(localNuGetConfigPath))
                     {
@@ -925,15 +930,65 @@ namespace BuildXL.FrontEnd.Nuget
         private bool CanReuseSpecFromDisk(NugetAnalyzedPackage analyzedPackage)
         {
             var packageDsc = GetPackageDscFile(analyzedPackage).ToString(PathTable);
+            
+            // This file contains some state from the last time the spec file was generated. It includes
+            // the fingerprint of the package (name, version, etc) and the version of the spec generator.
+            // It is stored next to the primary generated spec file
+            var (fileFormat, fingerprint) = ReadGeneratedSpecStateFile(packageDsc + SpecGenerationVersionFileSuffix);
 
-            if (analyzedPackage.Source == PackageSource.Disk &&
-                analyzedPackage.PackageOnDisk.PackageDownloadResult.SpecsFormatIsUpToDate &&
-                File.Exists(packageDsc))
+            // We can reuse the already generated spec file if all of the following are true:
+            //  * The spec generator is of the same format as when the spec was generated
+            //  * The package fingerprint is the same. This means the binaries are the same
+            //  * Both the generated spec and package config file exist on disk
+            // NOTE: This is not resilient to the specs being modified by other entities than the build engine.
+            if (fileFormat == SpecGenerationFormatVersion &&
+                fingerprint != null && fingerprint == analyzedPackage.PackageOnDisk.PackageDownloadResult.FingerprintHash && 
+                File.Exists(packageDsc) &&
+                File.Exists(GetPackageConfigDscFile(analyzedPackage).ToString(PathTable)))
             {
                 return true;
             }
 
             return false;
+        }
+
+        private static (int fileFormat, string fingerprint) ReadGeneratedSpecStateFile(string path)
+        {
+            if(File.Exists(path))
+            {
+                int fileFormat;
+                string[] lines = File.ReadAllLines(path);
+                if(lines.Length == 2)
+                {
+                    if (int.TryParse(lines[0], out fileFormat))
+                    {
+                        string fingerprint = lines[1];
+                        return (fileFormat, fingerprint);
+                    }
+                }
+            }
+
+            // Error
+            return (-1, null);
+        }
+
+        private void WriteGeneratedSpecStateFile(string path, (int fileFormat, string fingerprint) data)
+        {
+            try
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(path));
+
+                if (File.Exists(path))
+                {
+                    File.Delete(path);
+                }
+
+                File.WriteAllLines(path, new string[] { data.fileFormat.ToString(), data.fingerprint });
+            }
+            catch (IOException ex)
+            {
+                Logger.Log.NugetFailedToWriteGeneratedSpecStateFile(m_context.LoggingContext, ex.Message);
+            }
         }
 
         [SuppressMessage("Microsoft.Naming", "CA2204:Literals should be spelled correctly")]
@@ -959,10 +1014,17 @@ namespace BuildXL.FrontEnd.Nuget
                 return possibleProjectFile.Failure;
             }
 
-            return TryWriteSourceFile(
+            var writeResult = TryWriteSourceFile(
                 analyzedPackage.PackageOnDisk.Package,
                 GetPackageConfigDscFile(analyzedPackage),
                 nugetSpecGenerator.CreatePackageConfig());
+
+            if (writeResult.Succeeded && possibleProjectFile.Succeeded)
+            {
+                WriteGeneratedSpecStateFile(possibleProjectFile.Result.ToString(PathTable) + SpecGenerationVersionFileSuffix, (SpecGenerationFormatVersion, analyzedPackage.PackageOnDisk.PackageDownloadResult.FingerprintHash));
+            }
+
+            return writeResult;
         }
 
         internal Possible<NugetAnalyzedPackage> AnalyzeNugetPackage(
@@ -1167,10 +1229,15 @@ namespace BuildXL.FrontEnd.Nuget
                 .Append(" -Verbosity detailed")
                 .AppendFormat(" -ConfigFile  \"{0}\"", layout.NugetConfig.ToString(PathTable))
                 .Append(" -PackageSaveMode nuspec")
-                .Append(" -NonInteractive")
                 .Append(" -NoCache")
                 // Currently we have to hack nuget to MsBuild version 4 which should come form the current CLR.
                 .Append(" -MsBuildVersion 4");
+
+            if (!m_host.Configuration.Interactive)
+            {
+                // Prevent Nuget from showing any UI when not in interactive mode
+                argumentsBuilder.Append(" -NonInteractive");
+            }
 
             var arguments = argumentsBuilder.ToString();
 
@@ -1191,7 +1258,7 @@ namespace BuildXL.FrontEnd.Nuget
                         disableConHostSharing: true,
                         ContainerConfiguration.DisabledIsolation,
                         loggingContext: m_context.LoggingContext,
-                        sandboxedKextConnection: m_useMonoBasedNuGet ? new FakeKextConnection() : null)
+                        sandboxConnection: m_useMonoBasedNuGet ? new SandboxConnectionFake() : null)
                     {
                         Arguments = arguments,
                         WorkingDirectory = layout.TempDirectory.ToString(PathTable),
@@ -1296,7 +1363,7 @@ namespace BuildXL.FrontEnd.Nuget
             }
         }
 
-        private class FakeKextConnection : IKextConnection
+        private class SandboxConnectionFake : ISandboxConnection
         {
             public int NumberOfKextConnections => 1;
 
@@ -1320,11 +1387,11 @@ namespace BuildXL.FrontEnd.Nuget
 
             public bool NotifyUsage(uint cpuUsage, uint availableRamMB) { return true; }
 
-            public bool NotifyKextPipStarted(FileAccessManifest fam, SandboxedProcessMacKext process) { return true; }
+            public bool NotifyPipStarted(FileAccessManifest fam, SandboxedProcessMac process) { return true; }
 
-            public void NotifyKextPipProcessTerminated(long pipId, int processId) { }
+            public void NotifyPipProcessTerminated(long pipId, int processId) { }
 
-            public bool NotifyKextProcessFinished(long pipId, SandboxedProcessMacKext process) { return true; }
+            public bool NotifyProcessFinished(long pipId, SandboxedProcessMac process) { return true; }
 
             public void ReleaseResources() { }
         }
@@ -1455,7 +1522,6 @@ namespace BuildXL.FrontEnd.Nuget
             return contents;
         }
 
-        [SuppressMessage("Microsoft.Performance", "CA1822:MarkMembersAsStatic", Justification = "False positive: the analyzer can't detect that the instance member was used in the local function.")]
         private EnumerateDirectoryResult EnumerateDirectoryRecursively(string packagePath, out List<RelativePath> resultingContent)
         {
             resultingContent = new List<RelativePath>();
@@ -1676,11 +1742,16 @@ namespace BuildXL.FrontEnd.Nuget
     /// </summary>
     internal struct NugetGenerationResult
     {
-        public NugetGenerationResult(Dictionary<ModuleDescriptor, AbsolutePath> generatedProjectsByModuleDescriptor, Dictionary<AbsolutePath, ModuleDescriptor> generatedProjectsByPath, MultiValueDictionary<string, ModuleDescriptor> generatedProjectsByModuleName)
+        public NugetGenerationResult(
+            Dictionary<ModuleDescriptor, AbsolutePath> generatedProjectsByModuleDescriptor, 
+            Dictionary<AbsolutePath, ModuleDescriptor> generatedProjectsByPath, 
+            MultiValueDictionary<string, ModuleDescriptor> generatedProjectsByModuleName,
+            Dictionary<string, NugetAnalyzedPackage> nugetPackagesByModuleName)
         {
             GeneratedProjectsByModuleDescriptor = generatedProjectsByModuleDescriptor;
             GeneratedProjectsByPath = generatedProjectsByPath;
             GeneratedProjectsByModuleName = generatedProjectsByModuleName;
+            NugetPackagesByModuleName = nugetPackagesByModuleName;
         }
 
         /// <summary>
@@ -1697,5 +1768,14 @@ namespace BuildXL.FrontEnd.Nuget
         /// All package descriptors, indexed by name.
         /// </summary>
         public MultiValueDictionary<string, ModuleDescriptor> GeneratedProjectsByModuleName { get; set; }
+
+        public Dictionary<string, NugetAnalyzedPackage> NugetPackagesByModuleName { get; }
+
+        internal string GetOriginalNugetPackageName(ModuleDefinition def)
+        {
+            return NugetPackagesByModuleName != null && NugetPackagesByModuleName.TryGetValue(def.Descriptor.Name, out var value)
+                ? value.NugetName
+                : def.Descriptor.Name;
+        }
     }
 }

@@ -6,6 +6,7 @@ import * as Managed from "Sdk.Managed.Shared";
 import * as MacOS from "Sdk.MacOS";
 
 const pkgContents = importFrom("Grpc.Tools").Contents.all;
+const includesFolder = d`${pkgContents.root}/build/native/include`;
 
 @@public
 export const tool: Transformer.ToolDefinition = {
@@ -13,17 +14,17 @@ export const tool: Transformer.ToolDefinition = {
         Context.getCurrentHost().os === "win"
             ? r`tools/windows_x64/protoc.exe`
             : r`tools/macosx_x64/protoc`),
-    dependsOnWindowsDirectories: true,
-    untrackedDirectoryScopes: [
-        ...addIfLazy(Context.getCurrentHost().os === "macOS", () => MacOS.untrackedSystemFolderDeps)
-    ],
-    untrackedFiles: [
-        ...addIfLazy(Context.getCurrentHost().os === "macOS", () => MacOS.untrackedFiles)
-    ],
-    runtimeDirectoryDependencies: [
-        ...addIfLazy(Context.getCurrentHost().os === "macOS", () => MacOS.systemFolderInputDeps),
-    ]
+    dependsOnCurrentHostOSDirectories: true
 };
+
+/**
+ * Standard includes for Protobufs.
+ */
+@@public
+export const includes = Transformer.sealPartialDirectory(
+    includesFolder, 
+    pkgContents.getContent().filter(file => file.isWithin(includesFolder))
+);
 
 /**
  * Generates the protobuf files.
@@ -33,47 +34,74 @@ export const tool: Transformer.ToolDefinition = {
 @@public
 export function generate(args: Arguments) : Result {
 
-    const outputDirectory = Context.getNewOutputDirectory("protobuf");
-    const arguments : Argument[] = [
-        Cmd.option("--proto_path ", Artifact.none(args.proto.parent)),
-        Cmd.option("--csharp_out ", Artifact.none(outputDirectory)),
-        Cmd.files([args.proto]),
-        Cmd.option("--grpc_out ", Artifact.none(outputDirectory)),
-        Cmd.option("--plugin=protoc-gen-grpc=", Artifact.input(pkgContents.getFile(
-            Context.getCurrentHost().os === "win"
-                ? r`tools/windows_x64/grpc_csharp_plugin.exe`
-                : r`tools/macosx_x64/grpc_csharp_plugin`)
-            )
-        ),
-    ];
+    let resultSources : File[] = [];
 
-    let mainCsFile = p`${outputDirectory}/${args.proto.nameWithoutExtension + ".cs"}`;
-    let grpcCsFile = p`${outputDirectory}/${args.proto.nameWithoutExtension + "Grpc.cs"}`;
+    let filesToProcess : {file: File, isRpc: boolean }[] = [];
+    
+    if (args.proto) {
+        for (let file of args.proto) {
+            filesToProcess = filesToProcess.push({file: file, isRpc: false});
+        }
+    }
 
-    let result = Transformer.execute({
-        tool: args.tool || tool,
-        arguments: arguments,
-        workingDirectory: outputDirectory,
-        outputs: [
-            mainCsFile,
-            grpcCsFile,
-        ],
-        dependencies: [
-            ...addIfLazy(Context.getCurrentHost().os === "macOS", () => MacOS.filesAndSymlinkInputDeps)
-        ]
-    });
+    if (args.rpc) {
+        for (let file of args.rpc) {
+            filesToProcess = filesToProcess.push({file: file, isRpc: true});
+        }
+    }
+
+    for (let fileToProcess of filesToProcess) {
+        const outputDirectory = Context.getNewOutputDirectory("protobuf");
+        const arguments : Argument[] = [
+            Cmd.option("--proto_path ", Artifact.none(fileToProcess.file.parent)),
+            Cmd.option("--csharp_out ", Artifact.none(outputDirectory)),
+            Cmd.files([fileToProcess.file]),
+            ...addIf(fileToProcess.isRpc,
+                Cmd.option("--grpc_out ", Artifact.none(outputDirectory)),
+                Cmd.option("--plugin=protoc-gen-grpc=", Artifact.input(pkgContents.getFile(
+                    Context.getCurrentHost().os === "win"
+                        ? r`tools/windows_x64/grpc_csharp_plugin.exe`
+                        : r`tools/macosx_x64/grpc_csharp_plugin`)
+                    )
+                )
+            ),
+            Cmd.options("--proto_path=", Artifact.inputs(args.includes)),
+        ];
+
+        const targetFileName = fileToProcess.file.nameWithoutExtension.toString().replace("_", "");
+        const mainCsFile = p`${outputDirectory}/${targetFileName + ".cs"}`;
+        const grpcCsFile = p`${outputDirectory}/${targetFileName + "Grpc.cs"}`;
+
+        const result = Transformer.execute({
+            tool: args.tool || tool,
+            arguments: arguments,
+            tags:["protobufgenerator"],
+            workingDirectory: outputDirectory,
+            outputs: [
+                mainCsFile,
+                ...addIf(fileToProcess.isRpc,
+                    grpcCsFile
+                ),
+            ],
+            dependencies: filesToProcess.map(fileToProcess => fileToProcess.file),
+        });
+
+        resultSources = resultSources.push(result.getOutputFile(mainCsFile));
+        if (fileToProcess.isRpc) {
+            resultSources = resultSources.push(result.getOutputFile(grpcCsFile));
+        }
+    }
 
     return {
-        sources: [
-            result.getOutputFile(mainCsFile),
-            result.getOutputFile(grpcCsFile),
-        ],
+        sources: resultSources,
     };
 }
 
 @@public
 export interface Arguments extends Transformer.RunnerArguments{
-    proto: File,
+    proto?: File[],
+    rpc?: File[],
+    includes?: StaticDirectory[],
 }
 
 @@public

@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft. All rights reserved.
 // Licensed under the MIT license. See LICENSE file in the project root for full license information.
 
+#include <dispatch/dispatch.h>
 #include <inttypes.h>
 #include <signal.h>
 #include <stdio.h>
@@ -10,11 +11,11 @@
 
 #include "process.h"
 
-int GetProcessTimes(pid_t pid, ProcessTimesInfo *buffer, long bufferSize, bool includeChildProcesses)
+int GetProcessResourceUsage(pid_t pid, ProcessResourceUsage *buffer, long bufferSize, bool includeChildProcesses)
 {
-    if (sizeof(ProcessTimesInfo) != bufferSize)
+    if (sizeof(ProcessResourceUsage) != bufferSize)
     {
-        printf("ERROR: Wrong size of ProcessTimesInfo buffer; expected %ld, received %ld\n", sizeof(ProcessTimesInfo), bufferSize);
+        printf("ERROR: Wrong size of ProcessResourceUsage buffer; expected %ld, received %ld\n", sizeof(ProcessResourceUsage), bufferSize);
         return GET_RUSAGE_ERROR;
     }
 
@@ -35,7 +36,7 @@ int GetProcessTimes(pid_t pid, ProcessTimesInfo *buffer, long bufferSize, bool i
     }
 
     uint64_t absoluteTime = mach_absolute_time();
-    double factor = (((double)numer) / denom) / NSEC_PER_SEC;
+    double factor = (((double) numer) / denom) / NSEC_PER_SEC;
 
     buffer->startTime = ((long)rusage.ri_proc_start_abstime - (long)absoluteTime) * factor;
 
@@ -44,6 +45,9 @@ int GetProcessTimes(pid_t pid, ProcessTimesInfo *buffer, long bufferSize, bool i
 
     buffer->systemTime = rusage.ri_system_time;
     buffer->userTime = rusage.ri_user_time;
+
+    buffer->diskio_bytesRead = rusage.ri_diskio_bytesread;
+    buffer->diskio_bytesWritten = rusage.ri_diskio_byteswritten;
 
     if (includeChildProcesses)
     {
@@ -152,9 +156,12 @@ void DumpThreadState()
 
 static void sigCrashHandler(int sig)
 {
-    signal(sig, SIG_DFL);
     DumpThreadState();
     TeardownProcessDumpsInternal(false);
+
+    // Restore defaults and raise same signal again to get OS default handling e.g. crash report write out etc. after
+    // we have got our thread mapping and cleaned up some book keeping.
+    signal(sig, SIG_DFL);
     raise(sig);
 }
 
@@ -200,11 +207,7 @@ bool SetupProcessDumps(const char *logsDirectory, /*out*/ char *buffer, size_t b
 
             // Install signal handlers for the all unexpected failure conditions of interest, this helps debugging
             // unexpected errors and crashes that can't be caught by the CoreCLR
-            signal(SIGBUS,  sigCrashHandler);
-            signal(SIGILL,  sigCrashHandler);
-            signal(SIGHUP,  sigCrashHandler);
-            signal(SIGABRT, sigCrashHandler);
-            signal(SIGSEGV, sigCrashHandler);
+            RegisterSignalHandlers();
 
             size_t len;
             if (sysctlbyname(SYSCTL_KERN_COREFILE, NULL, &len, NULL, 0) != 0 || len > bufsiz)
@@ -225,4 +228,28 @@ bool SetupProcessDumps(const char *logsDirectory, /*out*/ char *buffer, size_t b
     }
 
     return false;
+}
+
+void RegisterSignalHandlers()
+{
+    // Ignore default signal handlers for the signals we are interested in
+    struct sigaction action = { 0 };
+    action.sa_handler = SIG_IGN;
+
+    int signals[] = { SIGBUS, SIGILL, SIGHUP, SIGABRT, SIGSEGV };
+    int signalsLength = sizeof(signals) / sizeof(signals[0]);
+
+    for (int i = 0; i < signalsLength; i++)
+    {
+        int sig = signals[i];
+        sigaction(sig, &action, NULL);
+
+        dispatch_source_t source = dispatch_source_create(DISPATCH_SOURCE_TYPE_SIGNAL, sig, 0, dispatch_get_global_queue(0, 0));
+        dispatch_source_set_event_handler(source, ^()
+        {
+            sigCrashHandler(sig);
+        });
+
+        dispatch_resume(source);
+    }
 }

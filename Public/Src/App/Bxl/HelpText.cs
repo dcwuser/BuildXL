@@ -487,6 +487,22 @@ namespace BuildXL
                 Strings.HelpText_DisplayHelp_PinCachedOutputs,
                 HelpLevel.Verbose);
 
+
+            hw.WriteOption(
+                "/pathSetThreshold",
+                Strings.HelpText_DisplayHelp_PathSetThreshold,
+                HelpLevel.Verbose);
+
+            hw.WriteOption(
+                "/augmentingPathSetCommonalityFactor:(0, 1]",
+                Strings.HelpText_DisplayHelp_AugmentingPathSetCommonalityFactor,
+                HelpLevel.Verbose);
+
+            hw.WriteOption(
+                "/vfsCasRoot<vfs cas root directory>",
+                Strings.HelpText_DisplayHelp_VfsCasRoot,
+                HelpLevel.Verbose);
+
             hw.WriteOption(
                 "/enableDedupChunk[+|-]",
                 Strings.HelpText_DisplayHelp_EnableDedupChunk,
@@ -947,6 +963,11 @@ namespace BuildXL
                 HelpLevel.Verbose);
 
             hw.WriteOption(
+                "/unsafe_OptimizedAstConversion[+|-]",
+                Strings.HelpText_DisplayHelp_OptimizedAstConversion,
+                HelpLevel.Verbose);
+
+            hw.WriteOption(
                 "/unsafe_PreserveOutputs[+|-|:Reset]",
                 Strings.HelpText_DisplayHelp_PreserveOutputs,
                 HelpLevel.Verbose);
@@ -998,6 +1019,17 @@ namespace BuildXL
 
             #endregion
 
+            #region Component Governance Manifest 
+            hw.WriteBanner(Strings.HelpText_DisplayHelp_CgManifestBanner);
+
+            hw.WriteOption("/generateCgManifestForNugest:<file>",
+                Strings.HelpText_DisplayHelp_GenerateCgManifest);
+
+            hw.WriteOption("/validateCgManifestForNugest:<file>",
+                Strings.HelpText_DisplayHelp_ValidateCgManifest);
+
+            #endregion
+
             hw.WriteBanner(Strings.HelpText_DisplayHelp_MsBuildBanner);
 
             #region MSBuild
@@ -1031,6 +1063,11 @@ namespace BuildXL
             hw.WriteOption(
                 "/help:[standard|verbose]",
                 Strings.HelpText_DisplayHelp_Help);
+
+            hw.WriteOption(
+                "/interactive[+|-]",
+                Strings.HelpText_DisplayHelp_Interactive,
+                HelpLevel.Verbose);
 
             hw.WriteOption(
                 "/noLogo",
@@ -1072,6 +1109,10 @@ namespace BuildXL
             hw.WriteOption(
                 "/symlinkDefinitionFile:<file>",
                 Strings.HelpText_DisplayHelp_SymlinkDefinitionFile);
+
+            hw.WriteOption(
+                "/inputChanges:<file>",
+                Strings.HelpText_DisplayHelp_InputChanges);
 
             hw.WriteOption(
                 "/telemetryTagPrefix:<string>",

@@ -34,6 +34,9 @@ namespace BuildXL.Cache.ContentStore.Sessions
         /// <inheritdoc />
         protected override Tracer Tracer { get; } = new Tracer(nameof(FileSystemContentSession));
 
+        /// <inheritdoc />
+        protected override bool TraceErrorsOnly => true; // This type adds nothing in terms of tracing. So configure it to trace errors only.
+
         /// <summary>
         ///     Initializes a new instance of the <see cref="ReadOnlyFileSystemContentSession" /> class.
         /// </summary>
@@ -46,14 +49,14 @@ namespace BuildXL.Cache.ContentStore.Sessions
         }
 
         /// <inheritdoc />
-        protected override async Task<BoolResult> ShutdownCoreAsync(OperationContext operatonContext)
+        protected override async Task<BoolResult> ShutdownCoreAsync(OperationContext operationContext)
         {
             await _pinContext.DisposeAsync();
 
-            var statsResult = await Store.GetStatsAsync(operatonContext);
+            var statsResult = await Store.GetStatsAsync(operationContext);
             if (statsResult.Succeeded)
             {
-                statsResult.CounterSet.LogOrderedNameValuePairs(s => Tracer.Debug(operatonContext, s));
+                statsResult.CounterSet.LogOrderedNameValuePairs(s => Tracer.Debug(operationContext, s));
             }
 
             return BoolResult.Success;
@@ -76,7 +79,7 @@ namespace BuildXL.Cache.ContentStore.Sessions
         protected override Task<OpenStreamResult> OpenStreamCoreAsync(
             OperationContext operationContext, ContentHash contentHash, UrgencyHint urgencyHint, Counter retryCounter)
         {
-            return Store.OpenStreamAsync(operationContext, contentHash, MakePinRequest());
+            return Store.OpenStreamAsync(operationContext, contentHash, MakePinRequest(ImplicitPin.Get));
         }
 
         /// <inheritdoc />
@@ -90,7 +93,7 @@ namespace BuildXL.Cache.ContentStore.Sessions
             UrgencyHint urgencyHint,
             Counter retryCounter)
         {
-            return Store.PlaceFileAsync(operationContext, contentHash, path, accessMode, replacementMode, realizationMode, MakePinRequest());
+            return Store.PlaceFileAsync(operationContext, contentHash, path, accessMode, replacementMode, realizationMode, MakePinRequest(ImplicitPin.Put));
         }
 
         /// <inheritdoc />
@@ -114,7 +117,7 @@ namespace BuildXL.Cache.ContentStore.Sessions
             UrgencyHint urgencyHint,
             Counter retryCounter)
         {
-            return Store.PlaceFileAsync(operationContext, hashesWithPaths, accessMode, replacementMode, realizationMode, MakePinRequest());
+            return Store.PlaceFileAsync(operationContext, hashesWithPaths, accessMode, replacementMode, realizationMode, MakePinRequest(ImplicitPin.Get));
         }
 
         /// <inheritdoc />
@@ -137,11 +140,11 @@ namespace BuildXL.Cache.ContentStore.Sessions
         }
 
         /// <summary>
-        ///     Build a PinRequest based on auto-pin configuration.
+        ///     Build a PinRequest based on whether auto-pin configuration matches request.
         /// </summary>
-        protected PinRequest? MakePinRequest()
+        protected PinRequest? MakePinRequest(ImplicitPin implicitPin)
         {
-            return _implicitPin == ImplicitPin.PutAndGet ? new PinRequest(_pinContext) : (PinRequest?)null;
+            return (implicitPin & _implicitPin) != ImplicitPin.None ? new PinRequest(_pinContext) : (PinRequest?)null;
         }
     }
 }

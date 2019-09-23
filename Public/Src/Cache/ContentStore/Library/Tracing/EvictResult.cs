@@ -2,7 +2,9 @@
 // Licensed under the MIT license. See LICENSE file in the project root for full license information.
 
 using System;
+using BuildXL.Cache.ContentStore.Hashing;
 using BuildXL.Cache.ContentStore.Interfaces.Results;
+using BuildXL.Cache.ContentStore.Interfaces.Stores;
 
 namespace BuildXL.Cache.ContentStore.Tracing
 {
@@ -14,14 +16,16 @@ namespace BuildXL.Cache.ContentStore.Tracing
         /// <summary>
         ///     Initializes a new instance of the <see cref="EvictResult"/> class.
         /// </summary>
-        public EvictResult(long evictedSize, long evictedFiles, long pinnedSize, DateTime lastAccessTime, bool successfullyEvictedHash, long replicaCount)
+        public EvictResult(long evictedSize, long evictedFiles, long pinnedSize, DateTime lastAccessTime, DateTime? effectiveLastAccessTime, bool successfullyEvictedHash, long replicaCount)
         {
             EvictedSize = evictedSize;
             EvictedFiles = evictedFiles;
             PinnedSize = pinnedSize;
             LastAccessTime = lastAccessTime;
+            EffectiveLastAccessTime = effectiveLastAccessTime;
             SuccessfullyEvictedHash = successfullyEvictedHash;
             ReplicaCount = replicaCount;
+            CreationTime = DateTime.UtcNow;
         }
 
         /// <summary>
@@ -41,6 +45,14 @@ namespace BuildXL.Cache.ContentStore.Tracing
         }
 
         /// <summary>
+        ///     Initializes a new instance of the <see cref="EvictResult"/> class.
+        /// </summary>
+        public EvictResult(ContentHashWithLastAccessTimeAndReplicaCount contentHash, long evictedSize, long evictedFiles, long pinnedSize, bool successfullyEvictedHash)
+            : this(evictedSize, evictedFiles, pinnedSize, contentHash.LastAccessTime, contentHash.EffectiveLastAccessTime, successfullyEvictedHash, contentHash.ReplicaCount)
+        {
+        }
+
+        /// <summary>
         ///     Gets number of bytes evicted.
         /// </summary>
         public long EvictedSize { get; }
@@ -56,9 +68,14 @@ namespace BuildXL.Cache.ContentStore.Tracing
         public long PinnedSize { get; }
 
         /// <summary>
-        ///     Gets content's last-access time.
+        ///     Gets content's original last-access time.
         /// </summary>
         public DateTime LastAccessTime { get; }
+
+        /// <summary>
+        /// The effective last access time of the content
+        /// </summary>
+        public DateTime? EffectiveLastAccessTime { get; }
 
         /// <summary>
         ///     Gets a value indicating whether or not the hash was fully evicted.
@@ -70,11 +87,40 @@ namespace BuildXL.Cache.ContentStore.Tracing
         /// </summary>
         public long ReplicaCount { get; }
 
+        /// <summary>
+        ///     Gets a value indicating the age of the hash at the time when the result was created.
+        /// </summary>
+        public DateTime CreationTime { get; }
+
+        /// <summary>
+        ///     Convert to the <see cref="DeleteResult"/> class.
+        /// </summary>
+        public DeleteResult ToDeleteResult(ContentHash contentHash)
+        {
+            if (HasException)
+            {
+                return new DeleteResult(DeleteResult.ResultCode.Error, Exception, ErrorMessage);
+            }
+
+            if (Succeeded)
+            {
+                if (!SuccessfullyEvictedHash)
+                {
+                    return new DeleteResult(DeleteResult.ResultCode.ContentNotFound, contentHash, EvictedSize, PinnedSize);
+                }
+
+                return new DeleteResult(DeleteResult.ResultCode.Success, contentHash, EvictedSize, PinnedSize);
+            }
+
+            // !HasException && Succeeded && !SuccessfulyEvictedHash
+            return new DeleteResult(DeleteResult.ResultCode.ContentNotDeleted, contentHash, EvictedSize, PinnedSize);
+        }
+
         /// <inheritdoc />
         public override string ToString()
         {
             return Succeeded
-                ? $"Success Size={EvictedSize} Files={EvictedFiles} Pinned={PinnedSize} LastAccessTime={LastAccessTime} ReplicaCount={ReplicaCount}"
+                ? $"Success Size={EvictedSize} Files={EvictedFiles} Pinned={PinnedSize} LastAccessTime={LastAccessTime} Age={CreationTime - LastAccessTime} ReplicaCount={ReplicaCount} EffectiveLastAccessTime={EffectiveLastAccessTime} EffectiveAge={CreationTime - EffectiveLastAccessTime}"
                 : GetErrorString();
         }
     }

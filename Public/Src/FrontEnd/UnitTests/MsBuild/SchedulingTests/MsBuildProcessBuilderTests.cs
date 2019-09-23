@@ -163,11 +163,36 @@ namespace Test.BuildXL.FrontEnd.MsBuild
             Assert.True(testProj.EnvironmentVariables.Any(e => e.Name.Equals(mspdbsrvEnvVarStringId)));
         }
 
+        public void FullEnvironmentIsExposedToTheProcess()
+        {
+            var project = CreateProjectWithPredictions("A.proj");
+            // We define a tracked environment variable and a passthrough one
+            var testProj = Start(new MsBuildResolverSettings { Environment = new Dictionary<string, DiscriminatingUnion<string, UnitValue>>
+            {
+                ["TrackedEnv"] = new DiscriminatingUnion<string, UnitValue>("1"),
+                ["PassThroughEnv"] = new DiscriminatingUnion<string, UnitValue>(UnitValue.Unit),
+
+            }})
+                .Add(project)
+                .ScheduleAll()
+                .AssertSuccess()
+                .RetrieveSuccessfulProcess(project);
+
+            // Both should be exposed to the process
+            StringId tracked = StringId.Create(PathTable.StringTable, "TrackedEnv");
+            StringId passthrough = StringId.Create(PathTable.StringTable, "PassThroughEnv");
+            Assert.Contains(tracked, testProj.EnvironmentVariables.Select(e => e.Name));
+            Assert.Contains(passthrough, testProj.EnvironmentVariables.Select(e => e.Name));
+        }
+
         [Fact]
         public void EnvironmentIsHonored()
         {
+            var one = new DiscriminatingUnion<string, UnitValue>();
+            one.SetValue("1");
+
             var project = CreateProjectWithPredictions("A.proj");
-            var testProj = Start(new MsBuildResolverSettings { Environment = new Dictionary<string, string> { ["Test"] = "1" } })
+            var testProj = Start(new MsBuildResolverSettings { Environment = new Dictionary<string, DiscriminatingUnion<string, UnitValue>> { ["Test"] = one } })
                 .Add(project)
                 .ScheduleAll()
                 .AssertSuccess()
@@ -184,7 +209,7 @@ namespace Test.BuildXL.FrontEnd.MsBuild
             Environment.SetEnvironmentVariable(envVar, "1");
 
             var project = CreateProjectWithPredictions("A.proj");
-            var testProj = Start(new MsBuildResolverSettings { Environment = new Dictionary<string, string>() })
+            var testProj = Start(new MsBuildResolverSettings { Environment = new Dictionary<string, DiscriminatingUnion<string, UnitValue>>() })
                 .Add(project)
                 .ScheduleAll()
                 .AssertSuccess()
@@ -287,6 +312,25 @@ namespace Test.BuildXL.FrontEnd.MsBuild
             Assert.DoesNotContain("/isolate", arguments);
             // A project that is not built in isolation has to rely on /p:buildprojectreferences=false
             Assert.Contains("/p:buildprojectreferences=false", arguments);
+        }
+
+        [Theory]
+        [InlineData("/noAutoResponse")]
+        [InlineData("/nodeReuse:false")]
+        public void CommonArgumentsAreSet(string argument)
+        {
+            var project = CreateProjectWithPredictions("A.proj");
+
+            var testProj = Start(new MsBuildResolverSettings { UseLegacyProjectIsolation = true })
+                .Add(project)
+                .ScheduleAll()
+                .AssertSuccess().
+                RetrieveSuccessfulProcess(project);
+
+            var arguments = RetrieveProcessArguments(testProj);
+
+            // The auto-response option should be always off
+            Assert.Contains(argument, arguments);
         }
     }
 }

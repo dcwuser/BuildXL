@@ -10,15 +10,28 @@ namespace Tools {
 
     export declare const qualifier : { configuration: "debug" | "release"};
 
+    namespace XldbAnalyzer {
+
+        export declare const qualifier: BuildXLSdk.NetCoreAppQualifier;
+
+        export const deployment : Deployment.Definition = {
+            contents: [
+                importFrom("BuildXL.Tools").Xldb.Analyzer.exe,
+            ]
+        };
+    
+        const deployed = BuildXLSdk.DeploymentHelpers.deploy({
+            definition: deployment,
+            targetLocation: r`${qualifier.configuration}/tools/XldbAnalyzer/${qualifier.targetRuntime}`,
+        });
+    }
+
     namespace SandboxExec {
 
         export declare const qualifier: BuildXLSdk.NetCoreAppQualifier;
 
         export const deployment : Deployment.Definition = {
             contents: [
-                ...addIfLazy(qualifier.targetRuntime !== "osx-x64", () => [
-                    DetoursServices.Deployment.definition
-                ]),
                 ...addIfLazy(MacServices.Deployment.macBinaryUsage !== "none" && qualifier.targetRuntime === "osx-x64", () => [
                     MacServices.Deployment.kext,
                     MacServices.Deployment.sandboxMonitor,
@@ -42,7 +55,7 @@ namespace Tools {
             contents: [
                 importFrom("BuildXL.Tools").withQualifier({
                     configuration: qualifier.configuration,
-                    targetFramework: "netcoreapp2.2",
+                    targetFramework: "netcoreapp3.0",
                     targetRuntime: qualifier.targetRuntime
                 }).Orchestrator.exe
             ],
@@ -52,5 +65,34 @@ namespace Tools {
             definition: deployment,
             targetLocation: r`${qualifier.configuration}/tools/Orchestrator/${qualifier.targetRuntime}`
         });
+    }
+
+    namespace BuildExplorer {
+        export declare const qualifier: {
+            configuration: "debug" | "release",
+            targetRuntime: "win-x64"
+        };
+
+        export const deployment : Deployment.Definition = {
+            contents: [
+                ...(BuildXLSdk.Flags.excludeBuildXLExplorer
+                ? []
+                : [{
+                    // There is an error when deploying a single sealed directory where the graph
+                    // invalidly thinks there is a duplicate deployment between robocopy and the sealed
+                    // directory... Using a subfolder is a workaround for now.
+                    subfolder: "bxp",
+                    contents: [
+                        importFrom("BuildXL.Explorer").App.app.appFolder
+                    ]
+                }])
+            ]            
+        };
+            
+        const deployed = BuildXLSdk.DeploymentHelpers.deploy({
+            definition: deployment,
+            targetLocation: r`${qualifier.configuration}/tools`
+        });
+
     }
 }

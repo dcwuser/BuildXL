@@ -21,6 +21,7 @@ using BuildXL.Processes;
 using BuildXL.Utilities;
 using BuildXL.Utilities.Collections;
 using BuildXL.Utilities.Configuration;
+using JetBrains.Annotations;
 using Newtonsoft.Json;
 using TypeScript.Net.DScript;
 using TypeScript.Net.Types;
@@ -51,6 +52,10 @@ namespace BuildXL.FrontEnd.MsBuild
 
         private Possible<ProjectGraphResult>? m_projectGraph;
 
+        private ICollection<string> m_passthroughVariables;
+
+        private IDictionary<string, string> m_userDefinedEnvironment;
+
         /// <summary>
         /// Set of well known locations that are used to identify a candidate entry point to parse, if a specific one is not provided
         /// </summary>
@@ -59,7 +64,7 @@ namespace BuildXL.FrontEnd.MsBuild
         /// <summary>
         /// Collection of environment variables that are allowed to the graph construction process to see (in addition to the ones specified by the user)
         /// </summary>
-        private static readonly string[] s_environmentVariableWhitelist = new[] 
+        private static readonly string[] s_environmentVariableWhitelist = new[]
             {
                 "ComSpec",
                 "PATH",
@@ -79,7 +84,10 @@ namespace BuildXL.FrontEnd.MsBuild
         /// <summary>
         /// Keep in sync with the BuildXL deployment spec that places the tool
         /// </summary>
-        private RelativePath RelativePathToGraphConstructionTool => RelativePath.Create(m_context.StringTable, @"tools\MsBuildGraphBuilder\ProjectGraphBuilder.exe");
+        private RelativePath RelativePathToGraphConstructionTool =>
+            RelativePath.Create(m_context.StringTable, m_resolverSettings.ShouldRunDotNetCoreMSBuild() ?
+                @"tools\MsBuildGraphBuilder\dotnetcore\ProjectGraphBuilder.dll" :
+                @"tools\MsBuildGraphBuilder\net472\ProjectGraphBuilder.exe");
 
         /// <summary>
         /// The result of computing the build graph
@@ -91,7 +99,31 @@ namespace BuildXL.FrontEnd.MsBuild
                 Contract.Assert(m_projectGraph.HasValue, "The computation of the build graph should have been triggered to be able to retrieve this value");
                 return m_projectGraph.Value;
             }
-        } 
+        }
+
+        /// <summary>
+        /// Environment variables defined by the user that are exposed to the graph construction process and pip execution
+        /// </summary>
+        public IEnumerable<KeyValuePair<string, string>> UserDefinedEnvironment
+        {
+            get
+            {
+                Contract.Assert(m_projectGraph.HasValue, "The computation of the build graph should have been triggered to be able to retrieve this value");
+                return m_userDefinedEnvironment;
+            }
+        }
+
+        /// <summary>
+        /// Passthrough environment variables defined by the user that are exposed to the graph construction process and pip execution
+        /// </summary>
+        public IEnumerable<string> UserDefinedPassthroughVariables
+        {
+            get
+            {
+                Contract.Assert(m_projectGraph.HasValue, "The computation of the build graph should have been triggered to be able to retrieve this value");
+                return m_passthroughVariables;
+            }
+        }
 
         /// <inheritdoc/>
         public MsBuildWorkspaceResolver()
@@ -139,6 +171,8 @@ namespace BuildXL.FrontEnd.MsBuild
             m_configuration = configuration;
 
             m_resolverSettings = resolverSettings as IMsBuildResolverSettings;
+            m_resolverSettings.ComputeEnvironment(out m_userDefinedEnvironment, out m_passthroughVariables);
+
             Contract.Assert(m_resolverSettings != null);
 
             m_requestedQualifiers = requestedQualifiers;
@@ -237,7 +271,7 @@ namespace BuildXL.FrontEnd.MsBuild
             if (m_projectGraph == null)
             {
                 // Get the locations where the MsBuild assemblies should be searched
-                if (!TryRetrieveMsBuildSearchLocations(out IEnumerable<AbsolutePath> searchLocations))
+                if (!TryRetrieveMsBuildSearchLocations(out IEnumerable<AbsolutePath> msBuildSearchLocations))
                 {
                     // Errors should have been logged
                     return new MsBuildGraphConstructionFailure(m_resolverSettings, m_context.PathTable);
@@ -249,9 +283,21 @@ namespace BuildXL.FrontEnd.MsBuild
                     return new MsBuildGraphConstructionFailure(m_resolverSettings, m_context.PathTable);
                 }
 
+                // If we should run the dotnet core version of MSBuild, let's retrieve the locations where dotnet.exe
+                // should be found
+                IEnumerable<AbsolutePath> dotNetSearchLocations = null;
+                if (m_resolverSettings.ShouldRunDotNetCoreMSBuild())
+                {
+                    if (!TryRetrieveDotNetSearchLocations(out dotNetSearchLocations))
+                    {
+                        // Errors should have been logged
+                        return new MsBuildGraphConstructionFailure(m_resolverSettings, m_context.PathTable);
+                    }
+                }
+
                 BuildParameters.IBuildParameters buildParameters = RetrieveBuildParameters();
 
-                m_projectGraph = await TryComputeBuildGraphAsync(searchLocations, parsingEntryPoints, buildParameters);
+                m_projectGraph = await TryComputeBuildGraphAsync(msBuildSearchLocations, dotNetSearchLocations, parsingEntryPoints, buildParameters);
             }
 
             return m_projectGraph.Value;
@@ -259,16 +305,15 @@ namespace BuildXL.FrontEnd.MsBuild
 
         private BuildParameters.IBuildParameters RetrieveBuildParameters()
         {
-            // If the environment is not specified, expose the whole process environment
-            if (m_resolverSettings.Environment == null)
-            {
-                return BuildParameters.GetFactory().PopulateFromEnvironment();
-            }
-
-            // Otherwise, just what the environment specified (plus a handful of extra required ones)
+            // The full environment is built with all user-defined env variables plus the passthrough variables with their current values
+            var fullEnvironment = m_userDefinedEnvironment.Union(
+                m_passthroughVariables.Select(variable => 
+                    // Here we explicitly skip the front end engine for retrieving the passthrough values: we need these values for graph construction
+                    // purposes but they shouldn't be tracked
+                    new KeyValuePair<string, string>(variable, Environment.GetEnvironmentVariable(variable))));
 
             // User-configured environment
-            var configuredEnvironment = BuildParameters.GetFactory().PopulateFromDictionary(m_resolverSettings.Environment);
+            var configuredEnvironment = BuildParameters.GetFactory().PopulateFromDictionary(fullEnvironment);
 
             // Combine the ones above with a set of OS-wide properties processes should see
             var buildParameters = BuildParameters
@@ -316,13 +361,13 @@ namespace BuildXL.FrontEnd.MsBuild
             {
                 Tracing.Logger.Log.TooManyParsingEntryPointCandidates(m_context.LoggingContext, m_resolverSettings.Location(m_context.PathTable), m_resolverSettings.RootTraversal.ToString(m_context.PathTable));
             }
-            
+
             parsingEntryPoints = null;
             return false;
 
         }
 
-        private async Task<Possible<ProjectGraphResult>> TryComputeBuildGraphAsync(IEnumerable<AbsolutePath> searchLocations, IEnumerable<AbsolutePath> parsingEntryPoints, BuildParameters.IBuildParameters buildParameters)
+        private async Task<Possible<ProjectGraphResult>> TryComputeBuildGraphAsync(IEnumerable<AbsolutePath> msBuildSearchLocations, IEnumerable<AbsolutePath> dotnetSearchLocations, IEnumerable<AbsolutePath> parsingEntryPoints, BuildParameters.IBuildParameters buildParameters)
         {
             // We create a unique output file on the obj folder associated with the current front end, and using a GUID as the file name
             AbsolutePath outputDirectory = m_host.GetFolderForFrontEnd(MsBuildFrontEnd.Name);
@@ -333,7 +378,7 @@ namespace BuildXL.FrontEnd.MsBuild
             // Make sure the directories are there
             FileUtilities.CreateDirectory(outputDirectory.ToString(m_context.PathTable));
 
-            Possible<ProjectGraphWithPredictionsResult<AbsolutePath>> maybeProjectGraphResult = await ComputeBuildGraphAsync(responseFile, parsingEntryPoints, outputFile, searchLocations, buildParameters);
+            Possible<ProjectGraphWithPredictionsResult<AbsolutePath>> maybeProjectGraphResult = await ComputeBuildGraphAsync(responseFile, parsingEntryPoints, outputFile, msBuildSearchLocations, dotnetSearchLocations, buildParameters);
 
             if (!maybeProjectGraphResult.Succeeded)
             {
@@ -370,7 +415,7 @@ namespace BuildXL.FrontEnd.MsBuild
                 projectFiles.Add(node.FullPath);
             }
 
-            var moduleDescriptor = ModuleDescriptor.CreateWithUniqueId(m_resolverSettings.ModuleName, this);
+            var moduleDescriptor = ModuleDescriptor.CreateWithUniqueId(m_context.StringTable, m_resolverSettings.ModuleName, this);
             var moduleDefinition = ModuleDefinition.CreateModuleDefinitionWithImplicitReferences(
                 moduleDescriptor,
                 m_resolverSettings.RootTraversal,
@@ -379,7 +424,7 @@ namespace BuildXL.FrontEnd.MsBuild
                 allowedModuleDependencies: null, // no module policies
                 cyclicalFriendModules: null); // no whitelist of cycles
 
-            return new ProjectGraphResult(projectGraph, moduleDefinition, projectGraphResult.PathToMsBuildExe);
+            return new ProjectGraphResult(projectGraph, moduleDefinition, projectGraphResult.PathToMsBuild, projectGraphResult.PathToDotNetExe);
         }
 
         private void DeleteGraphBuilderRelatedFiles(AbsolutePath outputFile, AbsolutePath responseFile)
@@ -421,19 +466,49 @@ namespace BuildXL.FrontEnd.MsBuild
                 m_host.Engine,
                 m_resolverSettings.MsBuildSearchLocations?.SelectList(directoryLocation => directoryLocation.Path),
                 out searchLocations,
-                () => Tracing.Logger.Log.NoSearchLocationsSpecified(m_context.LoggingContext, m_resolverSettings.Location(m_context.PathTable)),
+                () => Tracing.Logger.Log.NoSearchLocationsSpecified(m_context.LoggingContext, m_resolverSettings.Location(m_context.PathTable), "msBuildSearchLocations"),
+                paths => Tracing.Logger.Log.CannotParseBuildParameterPath(m_context.LoggingContext, m_resolverSettings.Location(m_context.PathTable), paths)
+            );
+        }
+
+        /// <summary>
+        /// Retrieves a list of search locations for dotnet.exe
+        /// </summary>
+        /// <remarks>
+        /// First inspects the resolver configuration to check if these are defined explicitly. Otherwise, uses PATH environment variable.
+        /// </remarks>
+        private bool TryRetrieveDotNetSearchLocations(out IEnumerable<AbsolutePath> searchLocations)
+        {
+            return FrontEndUtilities.TryRetrieveExecutableSearchLocations(
+                MsBuildFrontEnd.Name,
+                m_context,
+                m_host.Engine,
+                m_resolverSettings.DotNetSearchLocations?.SelectList(directoryLocation => directoryLocation.Path),
+                out searchLocations,
+                () => Tracing.Logger.Log.NoSearchLocationsSpecified(m_context.LoggingContext, m_resolverSettings.Location(m_context.PathTable), "dotnetSearchLocations"),
                 paths => Tracing.Logger.Log.CannotParseBuildParameterPath(m_context.LoggingContext, m_resolverSettings.Location(m_context.PathTable), paths)
             );
         }
 
         private async Task<Possible<ProjectGraphWithPredictionsResult<AbsolutePath>>> ComputeBuildGraphAsync(
             AbsolutePath responseFile,
-            IEnumerable<AbsolutePath> projectEntryPoints, 
-            AbsolutePath outputFile, 
-            IEnumerable<AbsolutePath> searchLocations, 
+            IEnumerable<AbsolutePath> projectEntryPoints,
+            AbsolutePath outputFile,
+            IEnumerable<AbsolutePath> msBuidSearchLocations,
+            IEnumerable<AbsolutePath> dotnetSearchLocations,
             BuildParameters.IBuildParameters buildParameters)
         {
-            SandboxedProcessResult result = await RunMsBuildGraphBuilderAsync(responseFile, projectEntryPoints, outputFile, searchLocations, buildParameters);
+            AbsolutePath dotnetExeLocation = AbsolutePath.Invalid;
+            if (m_resolverSettings.ShouldRunDotNetCoreMSBuild())
+            {
+                if (!TryFindDotNetExe(dotnetSearchLocations, out dotnetExeLocation, out string failure))
+                {
+                    return ProjectGraphWithPredictionsResult<AbsolutePath>.CreateFailure(
+                        GraphConstructionError.CreateFailureWithoutLocation(failure), 
+                        CollectionUtilities.EmptyDictionary<string, AbsolutePath>(), AbsolutePath.Invalid);
+                }
+            }
+            SandboxedProcessResult result = await RunMsBuildGraphBuilderAsync(responseFile, projectEntryPoints, outputFile, msBuidSearchLocations, dotnetExeLocation, buildParameters);
 
             string standardError = result.StandardError.CreateReader().ReadToEndAsync().GetAwaiter().GetResult();
 
@@ -453,7 +528,7 @@ namespace BuildXL.FrontEnd.MsBuild
                 return new MsBuildGraphConstructionFailure(m_resolverSettings, m_context.PathTable);
             }
 
-            // If the tool exited gracefully, but standard error is not empty, that 
+            // If the tool exited gracefully, but standard error is not empty, that
             // is interpreted as a warning. We propagate that to the BuildXL log
             if (!string.IsNullOrEmpty(standardError))
             {
@@ -463,10 +538,11 @@ namespace BuildXL.FrontEnd.MsBuild
                     standardError);
             }
 
-            TrackFilesAndEnvironment(buildParameters, result.AllUnexpectedFileAccesses, outputFile.GetParent(m_context.PathTable));
+            TrackFilesAndEnvironment(result.AllUnexpectedFileAccesses, outputFile.GetParent(m_context.PathTable));
 
             var serializer = JsonSerializer.Create(ProjectGraphSerializationSettings.Settings);
             serializer.Converters.Add(new AbsolutePathJsonConverter(m_context.PathTable));
+            serializer.Converters.Add(new ValidAbsolutePathEnumerationJsonConverter());
 
             using (var sr = new StreamReader(outputFile.ToString(m_context.PathTable)))
             using (var reader = new JsonTextReader(sr))
@@ -474,7 +550,7 @@ namespace BuildXL.FrontEnd.MsBuild
                 var projectGraphWithPredictionsResult = serializer.Deserialize<ProjectGraphWithPredictionsResult<AbsolutePath>>(reader);
 
                 // A successfully constructed graph should always have a valid path to MsBuild
-                Contract.Assert(!projectGraphWithPredictionsResult.Succeeded || projectGraphWithPredictionsResult.PathToMsBuildExe.IsValid);
+                Contract.Assert(!projectGraphWithPredictionsResult.Succeeded || projectGraphWithPredictionsResult.PathToMsBuild.IsValid);
                 // A successfully constructed graph should always have at least one project node
                 Contract.Assert(!projectGraphWithPredictionsResult.Succeeded || projectGraphWithPredictionsResult.Result.ProjectNodes.Length > 0);
                 // A failed construction should always have a failure set
@@ -482,20 +558,41 @@ namespace BuildXL.FrontEnd.MsBuild
 
                 // Let's log the paths to the used MsBuild assemblies, just for debugging purposes
                 Tracing.Logger.Log.GraphConstructionToolCompleted(
-                    m_context.LoggingContext, m_resolverSettings.Location(m_context.PathTable), 
-                    string.Join(",\n", projectGraphWithPredictionsResult.MsBuildAssemblyPaths.Select(kvp => I($"[{kvp.Key}]:{kvp.Value.ToString(m_context.PathTable)}"))), 
-                    projectGraphWithPredictionsResult.PathToMsBuildExe.ToString(m_context.PathTable));
+                    m_context.LoggingContext, m_resolverSettings.Location(m_context.PathTable),
+                    string.Join(",\n", projectGraphWithPredictionsResult.MsBuildAssemblyPaths.Select(kvp => I($"[{kvp.Key}]:{kvp.Value.ToString(m_context.PathTable)}"))),
+                    projectGraphWithPredictionsResult.PathToMsBuild.ToString(m_context.PathTable));
 
-                return projectGraphWithPredictionsResult;
+                return m_resolverSettings.ShouldRunDotNetCoreMSBuild() ? projectGraphWithPredictionsResult.WithPathToDotNetExe(dotnetExeLocation) : projectGraphWithPredictionsResult;
             }
         }
 
-        private void TrackFilesAndEnvironment(BuildParameters.IBuildParameters buildParameters, ISet<ReportedFileAccess> fileAccesses, AbsolutePath frontEndFolder)
+        private bool TryFindDotNetExe(IEnumerable<AbsolutePath> dotnetSearchLocations, out AbsolutePath dotnetExeLocation, out string failure)
+        {
+            dotnetExeLocation = AbsolutePath.Invalid;
+            failure = string.Empty;
+
+            foreach (AbsolutePath location in dotnetSearchLocations)
+            {
+                AbsolutePath dotnetExeCandidate = location.Combine(m_context.PathTable, "dotnet.exe");
+                if (m_host.Engine.FileExists(dotnetExeCandidate))
+                {
+                    dotnetExeLocation = dotnetExeCandidate;
+                    return true;
+                }
+            }
+
+            failure = $"Cannot find dotnet.exe. " +
+                $"This is required because the dotnet core version of MSBuild was specified to run. Searched locations: [{string.Join(", ", dotnetSearchLocations.Select(location => location.ToString(m_context.PathTable)))}]";
+            return false;
+        }
+
+        private void TrackFilesAndEnvironment(ISet<ReportedFileAccess> fileAccesses, AbsolutePath frontEndFolder)
         {
             // Register all build parameters passed to the graph construction process
+            // Observe passthrough variables are explicitly skipped: we don't want the engine to track them
             // TODO: we actually need the build parameters *used* by the graph construction process, but for now this is a compromise to keep
             // graph caching sound. We need to modify this when MsBuild static graph API starts providing used env vars.
-            foreach (string key in buildParameters.ToDictionary().Keys)
+            foreach (string key in m_userDefinedEnvironment.Keys)
             {
                 m_host.Engine.TryGetBuildParameter(key, MsBuildFrontEnd.Name, out _);
             }
@@ -505,31 +602,48 @@ namespace BuildXL.FrontEnd.MsBuild
 
         private Task<SandboxedProcessResult> RunMsBuildGraphBuilderAsync(
             AbsolutePath responseFile,
-            IEnumerable<AbsolutePath> projectEntryPoints, 
-            AbsolutePath outputFile, 
-            IEnumerable<AbsolutePath> searchLocations, 
+            IEnumerable<AbsolutePath> projectEntryPoints,
+            AbsolutePath outputFile,
+            IEnumerable<AbsolutePath> msBuildSearchLocations,
+            AbsolutePath dotnetExeLocation,
             BuildParameters.IBuildParameters buildParameters)
         {
+            Contract.Assert(!m_resolverSettings.ShouldRunDotNetCoreMSBuild() || dotnetExeLocation.IsValid);
+
             AbsolutePath toolDirectory = m_configuration.Layout.BuildEngineDirectory.Combine(m_context.PathTable, RelativePathToGraphConstructionTool).GetParent(m_context.PathTable);
-            string pathToTool = m_configuration.Layout.BuildEngineDirectory.Combine(m_context.PathTable, RelativePathToGraphConstructionTool).ToString(m_context.PathTable);
             string outputDirectory = outputFile.GetParent(m_context.PathTable).ToString(m_context.PathTable);
             string outputFileString = outputFile.ToString(m_context.PathTable);
-            string enlistmentRoot = m_resolverSettings.Root.ToString(m_context.PathTable);
             IReadOnlyCollection<string> entryPointTargets = m_resolverSettings.InitialTargets ?? CollectionUtilities.EmptyArray<string>();
 
             var requestedQualifiers = m_requestedQualifiers.Select(qualifierId => MsBuildResolverUtils.CreateQualifierAsGlobalProperties(qualifierId, m_context)).ToList();
 
             var arguments = new MSBuildGraphBuilderArguments(
-                enlistmentRoot,
                 projectEntryPoints.Select(entryPoint => entryPoint.ToString(m_context.PathTable)).ToList(),
                 outputFileString,
                 new GlobalProperties(m_resolverSettings.GlobalProperties ?? CollectionUtilities.EmptyDictionary<string, string>()),
-                searchLocations.Select(location => location.ToString(m_context.PathTable)).ToList(),
+                msBuildSearchLocations.Select(location => location.ToString(m_context.PathTable)).ToList(),
                 entryPointTargets,
-                requestedQualifiers);
+                requestedQualifiers,
+                m_resolverSettings.AllowProjectsToNotSpecifyTargetProtocol == true,
+                m_resolverSettings.ShouldRunDotNetCoreMSBuild());
 
             var responseFilePath = responseFile.ToString(m_context.PathTable);
             SerializeResponseFile(responseFilePath, arguments);
+
+            string graphConstructionToolPath = m_configuration.Layout.BuildEngineDirectory.Combine(m_context.PathTable, RelativePathToGraphConstructionTool).ToString(m_context.PathTable);
+            string pathToTool;
+            string toolArguments;
+            // if we should call the dotnet core version of MSBuild, we need to actually call dotnet.exe and pass the tool itself as its first argument
+            if (m_resolverSettings.ShouldRunDotNetCoreMSBuild())
+            {
+                pathToTool = dotnetExeLocation.ToString(m_context.PathTable);
+                toolArguments = I($"\"{graphConstructionToolPath}\" \"{responseFilePath}\"");
+            }
+            else
+            {
+                pathToTool = graphConstructionToolPath;
+                toolArguments = I($"\"{responseFilePath}\"");
+            }
 
             Tracing.Logger.Log.LaunchingGraphConstructionTool(m_context.LoggingContext, m_resolverSettings.Location(m_context.PathTable), arguments.ToString(), pathToTool);
 
@@ -541,7 +655,7 @@ namespace BuildXL.FrontEnd.MsBuild
                 pathToTool,
                 buildStorageDirectory: outputDirectory,
                 fileAccessManifest: GenerateFileAccessManifest(toolDirectory, outputFile),
-                arguments: I($"\"{responseFilePath}\""),
+                arguments: toolArguments,
                 workingDirectory: outputDirectory,
                 description: "MsBuild graph builder",
                 buildParameters,
@@ -568,7 +682,7 @@ namespace BuildXL.FrontEnd.MsBuild
                         {
                             try
                             {
-                                // The name of the pipe is the filename of the output file 
+                                // The name of the pipe is the filename of the output file
                                 using (var pipeClient = new NamedPipeClientStream(
                                     ".",
                                     Path.GetFileName(outputFileString),

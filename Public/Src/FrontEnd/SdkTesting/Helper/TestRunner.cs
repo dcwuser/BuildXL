@@ -5,6 +5,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics.CodeAnalysis;
 using System.Diagnostics.ContractsLight;
+using System.Diagnostics.Tracing;
 using System.IO;
 using System.Linq;
 using System.Runtime.ExceptionServices;
@@ -23,11 +24,6 @@ using BuildXL.Utilities.Collections;
 using BuildXL.Utilities.Instrumentation.Common;
 using BuildXL.FrontEnd.Script.Constants;
 using BuildXL.FrontEnd.Workspaces.Core;
-#if FEATURE_MICROSOFT_DIAGNOSTICS_TRACING
-using Microsoft.Diagnostics.Tracing;
-#else
-using System.Diagnostics.Tracing;
-#endif
 using BuildXL.Utilities.Configuration;
 using BuildXL.Utilities.Configuration.Mutable;
 using BuildXL.FrontEnd.Core;
@@ -180,7 +176,7 @@ export function test(args: TestArguments): TestResult {{
                         mountPathExpander);
 
                     using (var cacheLayer = new EngineCache(
-                        new InMemoryArtifactContentCache(pipContext),
+                        new InMemoryArtifactContentCache(),
                         new InMemoryTwoPhaseFingerprintStore()))
                     {
                         var cache = Task.FromResult(Possible.Create(cacheLayer));

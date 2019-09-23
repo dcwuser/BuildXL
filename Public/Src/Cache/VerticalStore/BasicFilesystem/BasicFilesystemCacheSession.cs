@@ -10,6 +10,7 @@ using System.Threading.Tasks;
 using BuildXL.Cache.ContentStore.Interfaces.Results;
 using BuildXL.Cache.ImplementationSupport;
 using BuildXL.Cache.Interfaces;
+using BuildXL.Native.IO;
 using BuildXL.Storage;
 using BuildXL.Utilities;
 
@@ -226,7 +227,6 @@ namespace BuildXL.Cache.BasicFilesystem
             return false;
         }
 
-        [System.Diagnostics.CodeAnalysis.SuppressMessage("Microsoft.Usage", "CA2202:outputCanBeDoubleDisposed", Justification = "Tool is confused - No way to write this code without it complaining")]
         [System.Diagnostics.CodeAnalysis.SuppressMessage("AsyncUsage", "AsyncFixer02:MissingAsyncOpportunity")]
         private async Task<CasHash> HashStreamToFileAsync(Stream filestream, string filename)
         {
@@ -471,7 +471,7 @@ namespace BuildXL.Cache.BasicFilesystem
 
                     try
                     {
-                        Directory.CreateDirectory(Path.GetDirectoryName(filename));
+                        FileUtilities.CreateDirectory(Path.GetDirectoryName(filename));
                         await m_cache.CopyFromCasAsync(hash, filename);
                         counter.FileSize(new FileInfo(filename).Length);
                     }

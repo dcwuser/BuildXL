@@ -5,6 +5,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics.CodeAnalysis;
 using System.Diagnostics.ContractsLight;
+using System.Diagnostics.Tracing;
 using System.IO;
 using System.Linq;
 using System.Reflection;
@@ -17,11 +18,6 @@ using BuildXL.FrontEnd.Script.Incrementality;
 using BuildXL.FrontEnd.Script.Constants;
 using BuildXL.FrontEnd.Workspaces.Core;
 using JetBrains.Annotations;
-#if FEATURE_MICROSOFT_DIAGNOSTICS_TRACING
-using Microsoft.Diagnostics.Tracing;
-#else
-using System.Diagnostics.Tracing;
-#endif
 using BuildXL.Utilities.Configuration;
 using BuildXL.Utilities.Configuration.Mutable;
 using BuildXL.FrontEnd.Core;
@@ -49,6 +45,7 @@ using InitializationLogger = global::BuildXL.FrontEnd.Core.Tracing.Logger;
 using LogEventId = BuildXL.FrontEnd.Script.Tracing.LogEventId;
 using Logger = BuildXL.FrontEnd.Script.Tracing.Logger;
 using Test.DScript.Workspaces.Utilities;
+using BuildXL.ViewModel;
 
 namespace Test.BuildXL.FrontEnd.Core
 {
@@ -722,7 +719,13 @@ namespace Test.BuildXL.FrontEnd.Core
                              Schedule =
                              {
                                  MaxProcesses = DegreeOfParallelism,
-                                 DisableProcessRetryOnResourceExhaustion = true
+                                 DisableProcessRetryOnResourceExhaustion = true,
+                             },
+                             // DS tests don't need the extra I/O this adds
+                             Logging =
+                             {
+                                LogExecution = false,
+                                StoreFingerprints = false,
                              },
                              Layout =
                              {
@@ -800,6 +803,7 @@ namespace Test.BuildXL.FrontEnd.Core
                 UseSpecPublicFacadeAndAstWhenAvailable = false,
                 CycleDetectorStartupDelay = 1,
                 EnableIncrementalFrontEnd = false,
+                AllowUnsafeAmbient = true
             };
         }
 
@@ -1012,7 +1016,7 @@ namespace Test.BuildXL.FrontEnd.Core
                 InitializationLogger, 
                 collector: null,
                 collectMemoryAsSoonAsPossible: false);
-            var engine = BuildXLEngine.Create(LoggingContext, engineContext, config, new LambdaBasedFrontEndControllerFactory((_, __) => controller));
+            var engine = BuildXLEngine.Create(LoggingContext, engineContext, config, new LambdaBasedFrontEndControllerFactory((_, __) => controller), new BuildViewModel());
 
             if (engine == null)
             {
@@ -1103,9 +1107,12 @@ namespace Test.BuildXL.FrontEnd.Core
             {
                 var location = LocationData.Create(specPath);
                 global::BuildXL.FrontEnd.Sdk.Tracing.Logger.Log.ErrorUnsupportedQualifierValue(
-                FrontEndContext.LoggingContext,
-                location.ToLogLocation(FrontEndContext.PathTable),
-                error);
+                    FrontEndContext.LoggingContext,
+                    location.ToLogLocation(FrontEndContext.PathTable),
+                    error.QualifierKey,
+                    error.InvalidValue,
+                    error.LegalValues
+                );
 
                 // Returning null, because it can happen in a real test case.
                 return null;
@@ -1167,9 +1174,7 @@ namespace Test.BuildXL.FrontEnd.Core
         {
             var conversionConfiguration = new AstConversionConfiguration(
                 policyRules: customRules ?? new string[] { },
-                degreeOfParallelism: 1,
-                disableLanguagePolicies: configuration.DisableLanguagePolicyAnalysis(),
-                useLegacyOfficeLogic: false)
+                disableLanguagePolicies: configuration.DisableLanguagePolicyAnalysis())
             {
                 PreserveFullNameSymbols = true,
             };

@@ -7,22 +7,19 @@ namespace VstsApp {
         assemblyName: "BuildXL.MemoizationStoreVstsApp",
         sources: globR(d`.`,"*.cs"),
         references: [
-            ...(BuildXLSdk.isDotNetCoreBuild
-                // TODO: This is to get a .Net Core build, but it may not pass tests
-                ? [importFrom("CLAP").withQualifier({targetFramework:"net451"}).pkg]
-                : [importFrom("CLAP").pkg]
-            ),
-            importFrom("Microsoft.VisualStudio.Services.ArtifactServices.Shared").pkg,
-            importFrom("Microsoft.VisualStudio.Services.Client").pkg,
+            Vsts.dll,
+            Interfaces.dll,
             ContentStore.Hashing.dll,
             ContentStore.UtilitiesCore.dll,
             ContentStore.Interfaces.dll,
             ContentStore.Library.dll,
             ContentStore.Vsts.dll,
-            Interfaces.dll,
-            Vsts.dll,
             
-            
+            // CLAP only exists for full framework net35. Ignoring the fact that this doesn't work on netcoreapp
+            importFrom("CLAP").withQualifier({targetFramework:"net472"}).pkg, 
+
+            importFrom("Microsoft.VisualStudio.Services.Client").pkg,
+            ...BuildXLSdk.visualStudioServicesArtifactServicesSharedPkg,
         ],
         appConfig: f`App.config`,
         tools: {

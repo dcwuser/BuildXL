@@ -224,7 +224,12 @@ namespace BuildXL.Utilities.Tracing
                         Contract.Assert(LogStream.Position <= (position + header.EventPayloadSize), "Event handler read beyond the event payload");
                     }
 
-                    m_logStreamReader.ReadBytes((int)(m_nextReadPosition.Value - LogStream.Position));
+                    // Seek to the start of the next event as we may not have read the entire payload (i.e. EventStatsAnalyzer)
+                    if (LogStream.Position != m_nextReadPosition.Value)
+                    {
+                        LogStream.Seek(m_nextReadPosition.Value, SeekOrigin.Begin);
+                    }
+
                     return EventReadResult.Success;
                 }
             }
@@ -248,7 +253,13 @@ namespace BuildXL.Utilities.Tracing
             AbsolutePath parent = reader.ReadAbsolutePath();
             int index = reader.ReadInt32Compact();
             string name = reader.ReadString();
-            AbsolutePath path = parent.IsValid ? parent.Combine(m_context.PathTable, PathAtom.Create(m_context.StringTable, name)) : AbsolutePath.Create(m_context.PathTable, name);
+
+            // NOTE: We use PathAtom.UnsafeCreateFrom here because when reading from an xlg produced on a different
+            // platform, the rules for path atom validity may change so we should just respect the path atom as-is without
+            // doing validation.
+            AbsolutePath path = parent.IsValid 
+                ? parent.Combine(m_context.PathTable, PathAtom.UnsafeCreateFrom(StringId.Create(m_context.StringTable, name))) 
+                : AbsolutePath.Create(m_context.PathTable, name);
             m_capturedPaths[(uint)index] = path;
             return (uint)index;
         }

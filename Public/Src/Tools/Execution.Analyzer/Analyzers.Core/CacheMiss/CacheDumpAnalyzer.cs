@@ -31,7 +31,7 @@ namespace BuildXL.Execution.Analyzer
                 else if (opt.Name.StartsWith("pip", StringComparison.OrdinalIgnoreCase) ||
                     opt.Name.StartsWith("p", StringComparison.OrdinalIgnoreCase))
                 {
-                    semistableHash = Convert.ToInt64(ParseStringOption(opt).ToUpperInvariant().Replace("PIP", ""), 16);
+                    semistableHash = ParseSemistableHash(opt);
                 }
                 else
                 {
@@ -131,7 +131,7 @@ namespace BuildXL.Execution.Analyzer
         }
 
         /// <inheritdoc />
-        public override void ExtraEventDataReported(ExtraEventData data)
+        public override void BuildSessionConfiguration(BuildSessionConfigurationEventData data)
         {
             m_model.Salts = data.ToFingerprintSalts();
         }
@@ -151,6 +151,13 @@ namespace BuildXL.Execution.Analyzer
         private void WriteStrongFingerprintData(PipCachingInfo info, TextWriter writer)
         {
             writer.WriteLine("Strong Fingerprint Info");
+            
+            if (!info.StrongFingerprintComputation.Succeeded)
+            {
+                writer.WriteLine("Strong fingerprint computation failed.");
+                return;
+            }
+
             writer.WriteLine(I($"Strong Fingerprint: {info.StrongFingerprintComputation.ComputedStrongFingerprint}"));
             writer.WriteLine(I($"Found match: {info.StrongFingerprintComputation.IsStrongFingerprintHit}"));
             writer.WriteLine(I($"Computed observed inputs: {info.StrongFingerprintComputation.Succeeded}"));

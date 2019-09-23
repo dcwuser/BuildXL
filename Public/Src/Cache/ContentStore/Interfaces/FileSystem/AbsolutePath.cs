@@ -136,13 +136,11 @@ namespace BuildXL.Cache.ContentStore.Interfaces.FileSystem
                     throw CreateIllegalCharactersInPathError(Path);
                 }
 
-#if PLATFORM_OSX
                 // CoreCLR's GetDirectoryName doesn't throw PathTooLongException for long paths
-                if (Path.Length > FileSystemConstants.MaxPath)
+                if (!OperatingSystemHelper.IsWindowsOS && Path.Length > FileSystemConstants.MaxPath)
                 {
                     throw new PathTooLongException(PathTooLongExceptionMessage(Path));
                 }
-#endif
 
                 if (string.IsNullOrEmpty(parent))
                 {
@@ -237,7 +235,7 @@ namespace BuildXL.Cache.ContentStore.Interfaces.FileSystem
             }
         }
 
-        internal IReadOnlyCollection<string> GetSegments()
+        internal IReadOnlyList<string> GetSegments()
         {
             return ParseSegments(Path, false);
         }

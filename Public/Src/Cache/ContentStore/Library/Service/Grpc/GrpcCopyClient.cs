@@ -1,20 +1,22 @@
-﻿// Copyright (c) Microsoft. All rights reserved.
+// Copyright (c) Microsoft. All rights reserved.
 // Licensed under the MIT license. See LICENSE file in the project root for full license information.
 
 using System;
-using System.Diagnostics;
+using System.Diagnostics.ContractsLight;
 using System.IO;
 using System.IO.Compression;
 using System.Threading;
 using System.Threading.Tasks;
+using BuildXL.Cache.ContentStore.Exceptions;
 using BuildXL.Cache.ContentStore.Hashing;
 using BuildXL.Cache.ContentStore.Interfaces.FileSystem;
 using BuildXL.Cache.ContentStore.Interfaces.Results;
-using BuildXL.Cache.ContentStore.Interfaces.Stores;
 using BuildXL.Cache.ContentStore.Interfaces.Tracing;
+using BuildXL.Cache.ContentStore.Tracing;
+using BuildXL.Cache.ContentStore.Tracing.Internal;
+using BuildXL.Cache.ContentStore.Utils;
 using ContentStore.Grpc;
 using Grpc.Core;
-// Can't rename ProtoBuf
 
 namespace BuildXL.Cache.ContentStore.Service.Grpc
 {
@@ -22,67 +24,33 @@ namespace BuildXL.Cache.ContentStore.Service.Grpc
     /// An implementation of a CAS copy helper client based on GRPC.
     /// TODO: Consolidate with GrpcClient to deduplicate code. (bug 1365340)
     /// </summary>
-    public sealed class GrpcCopyClient : IShutdown<BoolResult>
+    public sealed class GrpcCopyClient : StartupShutdownSlimBase
     {
         private readonly Channel _channel;
         private readonly ContentServer.ContentServerClient _client;
-        private readonly string _host;
-        private readonly int _grpcPort;
-        private bool _useCompression;
+        private readonly int _bufferSize;
 
         /// <inheritdoc />
-        public bool ShutdownCompleted { get; private set; }
+        protected override Tracer Tracer { get; } = new Tracer(nameof(GrpcCopyClient));
 
-        /// <inheritdoc />
-        public bool ShutdownStarted { get; private set; }
+        internal GrpcCopyClientKey Key { get; }
 
         /// <summary>
         /// Initializes a new instance of the <see cref="GrpcCopyClient" /> class.
         /// </summary>
-        private GrpcCopyClient(Channel channel, bool useCompression)
+        internal GrpcCopyClient(GrpcCopyClientKey key, int? clientBufferSize = null)
         {
             GrpcEnvironment.InitializeIfNeeded();
-            _client = new ContentServer.ContentServerClient(channel);
-            _useCompression = useCompression;
-        }
-
-        /// <summary>
-        /// Initializes a new instance of the <see cref="GrpcCopyClient" /> class.
-        /// </summary>
-        private GrpcCopyClient(string host, int grpcPort, bool useCompression)
-        {
-            GrpcEnvironment.InitializeIfNeeded();
-            _channel = new Channel(host, grpcPort, ChannelCredentials.Insecure);
+            _channel = new Channel(key.Host, key.GrpcPort, ChannelCredentials.Insecure, GrpcEnvironment.DefaultConfiguration);
             _client = new ContentServer.ContentServerClient(_channel);
-            _host = host;
-            _grpcPort = grpcPort;
-            _useCompression = useCompression;
-        }
-
-        /// <summary>
-        /// Use an existing GRPC client if possible, else create a new one.
-        /// </summary>
-        /// <param name="host">Name of the host for the server (e.g. 'localhost').</param>
-        /// <param name="grpcPort">GRPC port on the server.</param>
-        /// <param name="useCompression">Whether or not GZip is enabled for copies.</param>
-        public static GrpcCopyClient Create(string host, int grpcPort, bool useCompression = false)
-        {
-            // TODO: Add caching of GrpcCopyClient objects
-            // TODO: Add case where _clientPool has exceeded some maximum count
-            return new GrpcCopyClient(host, grpcPort, useCompression);
+            _bufferSize = clientBufferSize ?? ContentStore.Grpc.CopyConstants.DefaultBufferSize;
+            Key = key;
         }
 
         /// <inheritdoc />
-        public async Task<BoolResult> ShutdownAsync(Context context)
+        protected override async Task<BoolResult> ShutdownCoreAsync(OperationContext context)
         {
-            ShutdownStarted = true;
-
-            if (_channel != null)
-            {
-                await _channel.ShutdownAsync();
-            }
-
-            ShutdownCompleted = true;
+            await _channel.ShutdownAsync();
             return BoolResult.Success;
         }
 
@@ -126,34 +94,53 @@ namespace BuildXL.Cache.ContentStore.Service.Grpc
         /// <summary>
         /// Copies content from the server to the given local path.
         /// </summary>
-        public Task<CopyFileResult> CopyFileAsync(Context context, ContentHash hash, AbsolutePath destinationPath, CancellationToken ct = default(CancellationToken))
+        public async Task<CopyFileResult> CopyFileAsync(Context context, ContentHash hash, AbsolutePath destinationPath, CancellationToken ct)
         {
-            Func<Stream> streamFactory = () => new FileStream(destinationPath.Path, FileMode.Create, FileAccess.Write, FileShare.None, ContentStore.Grpc.CopyConstants.DefaultBufferSize, FileOptions.Asynchronous | FileOptions.SequentialScan);
-            return CopyToAsync(context, hash, streamFactory, ct);        
+            Func<Stream> streamFactory = () => new FileStream(destinationPath.Path, FileMode.Create, FileAccess.Write, FileShare.None, _bufferSize, FileOptions.SequentialScan);
+
+            using (var operationContext = TrackShutdown(context, ct))
+            {
+                return await CopyToCoreAsync(operationContext, hash, streamFactory);
+            }
         }
         
         /// <summary>
         /// Copies content from the server to the given stream.
         /// </summary>
-        public Task<CopyFileResult> CopyToAsync(Context context, ContentHash hash, Stream stream, CancellationToken ct = default(CancellationToken))
+        public async Task<CopyFileResult> CopyToAsync(Context context, ContentHash hash, Stream stream, CancellationToken ct)
         {
-            return CopyToAsync(context, hash, () => stream, ct);
+            using (var operationContext = TrackShutdown(context, ct))
+            {
+                return await CopyToCoreAsync(operationContext, hash, () => stream);
+            }
         }
 
         /// <summary>
         /// Copies content from the server to the stream returned by the factory.
         /// </summary>
-        public async Task<CopyFileResult> CopyToAsync(Context context, ContentHash hash, Func<Stream> streamFactory, CancellationToken ct = default(CancellationToken))
+        public async Task<CopyFileResult> CopyToAsync(Context context, ContentHash hash, Func<Stream> streamFactory, CancellationToken ct)
+        {
+            // Need to track shutdown to prevent invalid operation errors when the instance is used after it was shut down is called.
+            using (var operationContext = TrackShutdown(context, ct))
+            {
+                return await CopyToCoreAsync(operationContext, hash, streamFactory);
+            }
+        }
+
+        /// <summary>
+        /// Copies content from the server to the stream returned by the factory.
+        /// </summary>
+        private async Task<CopyFileResult> CopyToCoreAsync(OperationContext context, ContentHash hash, Func<Stream> streamFactory)
         {
             try
             {
                 CopyFileRequest request = new CopyFileRequest()
                 {
-                    TraceId = context.Id.ToString(),
+                    TraceId = context.TracingContext.Id.ToString(),
                     HashType = (int)hash.HashType,
                     ContentHash = hash.ToByteString(),
                     Offset = 0,
-                    Compression = _useCompression ? CopyCompression.Gzip : CopyCompression.None
+                    Compression = Key.UseCompression ? CopyCompression.Gzip : CopyCompression.None
                 };
 
                 AsyncServerStreamingCall<CopyFileResponse> response = _client.CopyFile(request);
@@ -166,7 +153,7 @@ namespace BuildXL.Cache.ContentStore.Service.Grpc
                 // stream. To avoid that, exit early instead.
                 if (headers.Count == 0)
                 {
-                    return new CopyFileResult(CopyFileResult.ResultCode.SourcePathError, $"Failed to connect to copy server {_host} at port {_grpcPort}.");
+                    return new CopyFileResult(CopyFileResult.ResultCode.SourcePathError, $"Failed to connect to copy server {Key.Host} at port {Key.GrpcPort}.");
                 }
 
                 // Parse header collection.
@@ -184,7 +171,7 @@ namespace BuildXL.Cache.ContentStore.Service.Grpc
                             message = header.Value;
                             break;
                         case "compression":
-                            Enum.TryParse<CopyCompression>(header.Value, out compression);
+                            Enum.TryParse(header.Value, out compression);
                             break;
                     }
                 }
@@ -192,7 +179,7 @@ namespace BuildXL.Cache.ContentStore.Service.Grpc
                 // Process reported server-side errors.
                 if (exception != null)
                 {
-                    Debug.Assert(message != null);
+                    Contract.Assert(message != null);
                     switch (exception)
                     {
                         case "ContentNotFound":
@@ -219,10 +206,10 @@ namespace BuildXL.Cache.ContentStore.Service.Grpc
                     switch (compression)
                     {
                         case CopyCompression.None:
-                            await StreamContentAsync(targetStream, response.ResponseStream, ct).ConfigureAwait(false);
+                            await StreamContentAsync(targetStream, response.ResponseStream, context.Token);
                             break;
                         case CopyCompression.Gzip:
-                            await StreamContentWithCompressionAsync(targetStream, response.ResponseStream, ct).ConfigureAwait(false);
+                            await StreamContentWithCompressionAsync(targetStream, response.ResponseStream, context.Token);
                             break;
                     }
                 }
@@ -240,14 +227,42 @@ namespace BuildXL.Cache.ContentStore.Service.Grpc
                     return new CopyFileResult(CopyFileResult.ResultCode.Unknown, r);
                 }
             }
-
         }
 
-        private async Task<(long Chunks, long Bytes)> StreamContentAsync(Stream targetStream, IAsyncStreamReader<CopyFileResponse> replyStream, CancellationToken ct = default(CancellationToken))
+        /// <summary>
+        /// Requests host to copy a file from another source machine.
+        /// </summary>
+        public async Task<BoolResult> RequestCopyFileAsync(OperationContext context, ContentHash hash)
         {
+            try
+            {
+                var request = new RequestCopyFileRequest
+                {
+                    TraceId = context.TracingContext.Id.ToString(),
+                    ContentHash = hash.ToByteString(),
+                    HashType = (int)hash.HashType
+                };
+
+                var response = await _client.RequestCopyFileAsync(request, cancellationToken: context.Token);
+
+                return response.Header.Succeeded
+                    ? BoolResult.Success
+                    : new BoolResult(response.Header.ErrorMessage);
+            }
+            catch (RpcException r)
+            {
+                return new BoolResult(r);
+            }
+        }
+
+        private async Task<(long Chunks, long Bytes)> StreamContentAsync(Stream targetStream, IAsyncStreamReader<CopyFileResponse> replyStream, CancellationToken ct)
+        {
+            Contract.Requires(targetStream != null);
+            Contract.Requires(replyStream != null);
+
             long chunks = 0L;
             long bytes = 0L;
-            while (await replyStream.MoveNext(ct).ConfigureAwait(false))
+            while (await replyStream.MoveNext(ct))
             {
                 chunks++;
                 CopyFileResponse reply = replyStream.Current;
@@ -257,16 +272,16 @@ namespace BuildXL.Cache.ContentStore.Service.Grpc
             return (chunks, bytes);
         }
 
-        private async Task<(long Chunks, long Bytes)> StreamContentWithCompressionAsync(Stream targetStream, IAsyncStreamReader<CopyFileResponse> replyStream, CancellationToken ct = default(CancellationToken))
+        private async Task<(long Chunks, long Bytes)> StreamContentWithCompressionAsync(Stream targetStream, IAsyncStreamReader<CopyFileResponse> replyStream, CancellationToken ct)
         {
-            Debug.Assert(targetStream != null);
-            Debug.Assert(replyStream != null);
+            Contract.Requires(targetStream != null);
+            Contract.Requires(replyStream != null);
 
             long chunks = 0L;
             long bytes = 0L;
             using (BufferedReadStream grpcStream = new BufferedReadStream(async () =>
             {
-                if (await replyStream.MoveNext(ct).ConfigureAwait(false))
+                if (await replyStream.MoveNext(ct))
                 {
                     chunks++;
                     bytes += replyStream.Current.Content.Length;
@@ -280,7 +295,7 @@ namespace BuildXL.Cache.ContentStore.Service.Grpc
             {
                 using (Stream decompressedStream = new GZipStream(grpcStream, CompressionMode.Decompress, true))
                 {
-                    await decompressedStream.CopyToAsync(targetStream, ContentStore.Grpc.CopyConstants.DefaultBufferSize, ct).ConfigureAwait(false);
+                    await decompressedStream.CopyToAsync(targetStream, _bufferSize, ct);
                 }
             }
 
@@ -307,21 +322,10 @@ namespace BuildXL.Cache.ContentStore.Service.Grpc
         /// <inheritdoc />
         public void Dispose()
         {
-            // noop for now
-        }
-
-        /// <inheritdoc />
-        public override bool Equals(object obj)
-        {
-            return obj is GrpcCopyClient client
-                && _host == client._host
-                && _grpcPort == client._grpcPort;
-        }
-
-        /// <inheritdoc />
-        public override int GetHashCode()
-        {
-            return BuildXL.Utilities.HashCodeHelper.Combine(_host.GetHashCode(), _grpcPort);
+            if (ShutdownStarted && !ShutdownCompleted)
+            {
+                throw new CacheException($"{nameof(GrpcCopyClient)} must be shutdown before disposing.");
+            }
         }
     }
 }

@@ -6,6 +6,7 @@ using BuildXL.Engine.Cache;
 using BuildXL.Engine.Cache.Artifacts;
 using BuildXL.Ipc.Common;
 using BuildXL.Ipc.Interfaces;
+using BuildXL.Native.IO;
 using BuildXL.Pips;
 using BuildXL.Pips.Operations;
 using BuildXL.Processes.Containers;
@@ -15,6 +16,7 @@ using BuildXL.Utilities;
 using BuildXL.Utilities.Collections;
 using BuildXL.Utilities.Configuration;
 using BuildXL.Utilities.Tracing;
+using BuildXL.Utilities.VmCommandProxy;
 using JetBrains.Annotations;
 
 namespace BuildXL.Scheduler
@@ -161,7 +163,7 @@ namespace BuildXL.Scheduler
         /// <summary>
         /// Kernel connection, needed to instrument sandboxed processes / pips on macOS
         /// </summary>
-        BuildXL.Processes.IKextConnection SandboxedKextConnection { get; }
+        BuildXL.Processes.ISandboxConnection SandboxConnection { get; }
 
         /// <summary>
         /// Sets the maximum number of external processes run concurrently so far.
@@ -183,6 +185,16 @@ namespace BuildXL.Scheduler
         /// </summary>
         [NotNull]
         ProcessInContainerManager ProcessInContainerManager { get; }
+
+        /// <summary>
+        /// VM initializer.
+        /// </summary>
+        VmInitializer VmInitializer { get; }
+
+        /// <summary>
+        /// Temp directory cleaner
+        /// </summary>
+        ITempCleaner TempCleaner { get; }
     }
 
     /// <summary>

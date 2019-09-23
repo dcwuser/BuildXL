@@ -13,15 +13,19 @@ export const dll = BuildXLSdk.library({
     references: [
         ...addIf(BuildXLSdk.isFullFramework,
             NetFx.System.Xml.dll,
-            NetFx.System.Management.dll
+            NetFx.System.Xml.Linq.dll,
+            NetFx.System.Management.dll,
+            NetFx.System.Security.dll
         ),
         Collections.dll,
         Interop.dll,
         importFrom("BuildXL.Utilities.Instrumentation").Common.dll,
         ...addIfLazy(BuildXLSdk.isDotNetCoreBuild, () => [
             importFrom("Microsoft.Win32.Registry").pkg,
+            importFrom("System.Security.Cryptography.ProtectedData").pkg
         ]),
         ...BuildXLSdk.tplPackages,
+        importFrom("Newtonsoft.Json").pkg,
     ],
     defineConstants: qualifier.configuration === "debug" ? ["DebugStringTable"] : [],
     internalsVisibleTo: [

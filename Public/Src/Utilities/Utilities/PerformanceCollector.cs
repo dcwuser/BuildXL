@@ -193,8 +193,14 @@ namespace BuildXL.Utilities
                 TimeSpan duration = temp - m_networkTimeLastCollectedAt;
                 m_networkTimeLastCollectedAt = temp;
 
-                double? machineKbitsPerSecSent = Math.Round(1000 * BytesToKbits(m_networkMonitor?.TotalSentBytes) / duration.TotalMilliseconds, 3);
-                double? machineKbitsPerSecReceived = Math.Round(1000 * BytesToKbits(m_networkMonitor?.TotalReceivedBytes) / duration.TotalMilliseconds, 3);
+                double? machineKbitsPerSecSent = null;
+                double? machineKbitsPerSecReceived = null;
+
+                if (m_networkMonitor != null)
+                {
+                    machineKbitsPerSecSent = Math.Round(1000 * BytesToKbits(m_networkMonitor.TotalSentBytes) / Math.Max(duration.TotalMilliseconds, 1.0), 3);
+                    machineKbitsPerSecReceived = Math.Round(1000 * BytesToKbits(m_networkMonitor.TotalReceivedBytes) / Math.Max(duration.TotalMilliseconds, 1.0), 3);
+                }
 
                 // Update the aggregators
                 lock (m_aggregators)
@@ -224,15 +230,10 @@ namespace BuildXL.Utilities
             }
         }
 
-        private static double BytesToKbits(long? bytes)
+        private static double BytesToKbits(long bytes)
         {
-            if (bytes.HasValue)
-            {
-                // Convert to Kbits
-                return 8 * bytes.Value / 1024;
-            }
-
-            return (double)bytes;
+            // Convert to Kbits
+            return (bytes / 1024.0) * 8;
         }
 
         private void ReschedulerTimer()
@@ -464,12 +465,6 @@ namespace BuildXL.Utilities
             // we have to look at VM statistics to calculate the actual available RAM though
             if (GetRamUsageInfo(ref ramUsageInfo) == MACOS_INTEROP_SUCCESS)
             {
-                // OLD formula based on Active pages (does not coincide with Activity Monitor)    
-                //availableAvailablePhysicalBytes =
-                //    totalPhysicalBytes - (ramUsageInfo.Active + ramUsageInfo.Speculative +
-                //        ramUsageInfo.Wired + ramUsageInfo.Compressed - ramUsageInfo.Purgable);
-
-                // "Physical Memory" - "Memory Used" from Activity Monitor
                 availableAvailablePhysicalBytes = totalPhysicalBytes
                     - ramUsageInfo.AppMemory
                     - ramUsageInfo.Wired

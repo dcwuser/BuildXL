@@ -125,7 +125,7 @@ namespace BuildXL.Pips.Operations
         /// <summary>
         /// Completes construction of this pip by assigning a unique directory artifact.
         /// </summary>
-        internal void SetDirectoryArtifact(DirectoryArtifact artifact)
+        public void SetDirectoryArtifact(DirectoryArtifact artifact)
         {
             Contract.Requires(artifact.Path == DirectoryRoot);
             Contract.Requires(!IsInitialized || Directory.Equals(artifact));
@@ -139,7 +139,7 @@ namespace BuildXL.Pips.Operations
         /// <remarks>
         /// This method should only be used for graph patching and in unit tests.
         /// </remarks>
-        internal void ResetDirectoryArtifact()
+        public void ResetDirectoryArtifact()
         {
             m_partialSealId = null;
         }

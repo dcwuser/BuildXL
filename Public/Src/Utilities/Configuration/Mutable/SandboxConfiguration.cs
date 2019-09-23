@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft. All rights reserved.
 // Licensed under the MIT license. See LICENSE file in the project root for full license information.
 
+using System.Collections.Generic;
 using System.Diagnostics.ContractsLight;
 
 namespace BuildXL.Utilities.Configuration.Mutable
@@ -8,6 +9,9 @@ namespace BuildXL.Utilities.Configuration.Mutable
     /// <nodoc />
     public sealed class SandboxConfiguration : ISandboxConfiguration
     {
+        /// <nodoc />
+        public static readonly uint DefaultProcessTimeoutInMinutes = 10;
+
         private IUnsafeSandboxConfiguration m_unsafeSandboxConfig;
 
         /// <nodoc />
@@ -16,7 +20,7 @@ namespace BuildXL.Utilities.Configuration.Mutable
             m_unsafeSandboxConfig = new UnsafeSandboxConfiguration();
 
             FailUnexpectedFileAccesses = true;
-            DefaultTimeout = 10 * 60 * 1000;
+            DefaultTimeout = ((int)DefaultProcessTimeoutInMinutes) * 60 * 1000;
             DefaultWarningTimeout = (int)(.85 * DefaultTimeout);
             TimeoutMultiplier = 1;
             WarningTimeoutMultiplier = 1;
@@ -33,7 +37,7 @@ namespace BuildXL.Utilities.Configuration.Mutable
             CheckDetoursMessageCount = true;
             AllowInternalDetoursErrorNotificationFile = true;
             EnforceAccessPoliciesOnDirectoryCreation = false;
-            KextMeasureProcessCpuTimes = false;             // measuring CPU times amounts to wrapping processes in /usr/bin/time, so let's not do that by default
+            MeasureProcessCpuTimes = true;                  // always measure process times + ram consumption
             KextReportQueueSizeMb = 0;                      // let the sandbox kernel extension apply defaults
             KextEnableReportBatching = true;                // use lock-free queue for batching access reports
             KextThrottleCpuUsageBlockThresholdPercent = 0;  // no throttling by default
@@ -41,6 +45,12 @@ namespace BuildXL.Utilities.Configuration.Mutable
             KextThrottleMinAvailableRamMB = 0;              // no throttling by default
             ContainerConfiguration = new SandboxContainerConfiguration();
             AdminRequiredProcessExecutionMode = AdminRequiredProcessExecutionMode.Internal;
+            RedirectedTempFolderRootForVmExecution = AbsolutePath.Invalid;
+            RetryOnAzureWatsonExitCode = false;
+            EnsureTempDirectoriesExistenceBeforePipExecution = false;
+            GlobalUnsafeUntrackedScopes = new List<AbsolutePath>();
+            PreserveOutputsForIncrementalTool = false;
+            GlobalUnsafePassthroughEnvironmentVariables = new List<string>();
         }
 
         /// <nodoc />
@@ -75,7 +85,7 @@ namespace BuildXL.Utilities.Configuration.Mutable
             CheckDetoursMessageCount = template.CheckDetoursMessageCount;
             AllowInternalDetoursErrorNotificationFile = template.AllowInternalDetoursErrorNotificationFile;
             EnforceAccessPoliciesOnDirectoryCreation = template.EnforceAccessPoliciesOnDirectoryCreation;
-            KextMeasureProcessCpuTimes = template.KextMeasureProcessCpuTimes;
+            MeasureProcessCpuTimes = template.MeasureProcessCpuTimes;
             KextReportQueueSizeMb = template.KextReportQueueSizeMb;
             KextEnableReportBatching = template.KextEnableReportBatching;
             KextThrottleCpuUsageBlockThresholdPercent = template.KextThrottleCpuUsageBlockThresholdPercent;
@@ -83,6 +93,12 @@ namespace BuildXL.Utilities.Configuration.Mutable
             KextThrottleMinAvailableRamMB = template.KextThrottleMinAvailableRamMB;
             ContainerConfiguration = new SandboxContainerConfiguration(template.ContainerConfiguration);
             AdminRequiredProcessExecutionMode = template.AdminRequiredProcessExecutionMode;
+            RedirectedTempFolderRootForVmExecution = pathRemapper.Remap(template.RedirectedTempFolderRootForVmExecution);
+            RetryOnAzureWatsonExitCode = template.RetryOnAzureWatsonExitCode;
+            EnsureTempDirectoriesExistenceBeforePipExecution = template.EnsureTempDirectoriesExistenceBeforePipExecution;
+            GlobalUnsafeUntrackedScopes = pathRemapper.Remap(template.GlobalUnsafeUntrackedScopes);
+            PreserveOutputsForIncrementalTool = template.PreserveOutputsForIncrementalTool;
+            GlobalUnsafePassthroughEnvironmentVariables = new List<string>(template.GlobalUnsafePassthroughEnvironmentVariables);
         }
 
         /// <inheritdoc />
@@ -192,7 +208,7 @@ namespace BuildXL.Utilities.Configuration.Mutable
         public bool AllowInternalDetoursErrorNotificationFile { get; set; }
 
         /// <inheritdoc />
-        public bool KextMeasureProcessCpuTimes { get; set; }
+        public bool MeasureProcessCpuTimes { get; set; }
 
         /// <inheritdoc />
         public uint KextReportQueueSizeMb { get; set; }
@@ -201,7 +217,7 @@ namespace BuildXL.Utilities.Configuration.Mutable
         public bool KextEnableReportBatching { get; set; }
 
         /// <inheritdoc />
-        public uint KextThrottleCpuUsageBlockThresholdPercent { get; set;  }
+        public uint KextThrottleCpuUsageBlockThresholdPercent { get; set; }
 
         /// <inheritdoc />
         public uint KextThrottleCpuUsageWakeupThresholdPercent { get; set; }
@@ -217,5 +233,29 @@ namespace BuildXL.Utilities.Configuration.Mutable
 
         /// <inheritdoc />
         public AdminRequiredProcessExecutionMode AdminRequiredProcessExecutionMode { get; set; }
+
+        /// <inheritdoc />
+        public AbsolutePath RedirectedTempFolderRootForVmExecution { get; set; }
+
+        /// <inheritdoc />
+        public bool RetryOnAzureWatsonExitCode { get; set; }
+
+        /// <inheritdoc />
+        public bool EnsureTempDirectoriesExistenceBeforePipExecution { get; set; }
+
+        /// <nodoc />
+        public List<AbsolutePath> GlobalUnsafeUntrackedScopes { get; set; }
+
+        /// <inheritdoc />
+        IReadOnlyList<AbsolutePath> ISandboxConfiguration.GlobalUnsafeUntrackedScopes => GlobalUnsafeUntrackedScopes;
+
+        /// <inheritdoc />
+        public bool PreserveOutputsForIncrementalTool { get; set; }
+
+        /// <nodoc />
+        public List<string> GlobalUnsafePassthroughEnvironmentVariables { get; set; }
+
+        /// <inheritdoc />
+        IReadOnlyList<string> ISandboxConfiguration.GlobalUnsafePassthroughEnvironmentVariables => GlobalUnsafePassthroughEnvironmentVariables;
     }
 }

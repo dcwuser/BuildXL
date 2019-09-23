@@ -4,6 +4,7 @@
 
 import * as BuildXLSdk from "Sdk.BuildXL";
 import * as Deployment from "Sdk.Deployment";
+import * as MemoizationStore from "BuildXL.Cache.MemoizationStore";
 
 export declare const qualifier : BuildXLSdk.DefaultQualifierWithNet451;
 
@@ -21,16 +22,7 @@ namespace Default {
             {
                 subfolder: r`App`,
                 contents: [
-                    App.exe,
-                    // Back-Compat naming
-                    {
-                        file: App.exe.runtime.binary,
-                        targetFileName: "Microsoft.ContentStoreApp.exe",
-                    },
-                    {
-                        file: App.exe.runtime.pdb,
-                        targetFileName: "Microsoft.ContentStoreApp.pdb",
-                    }
+                    App.exe
                 ]
             },
             {
@@ -119,14 +111,6 @@ namespace DotNetCore {
 export const deploymentForBuildXL: Deployment.Definition = {
     contents: [
         App.exe,
-        {
-            file: App.exe.runtime.binary,
-            targetFileName: "Microsoft.ContentStoreApp.exe",
-        },
-        {
-            file: App.exe.runtime.pdb,
-            targetFileName: "Microsoft.ContentStoreApp.pdb",
-        },
 
         importFrom("Grpc.Core").pkg,
         importFrom("Google.Protobuf").pkg,
@@ -139,6 +123,5 @@ export const deploymentForBuildXL: Deployment.Definition = {
             importFrom("Grpc.Core").Contents.all.getFile("runtimes/osx/native/libgrpc_csharp_ext.x86.dylib")),
 
         importFrom("TransientFaultHandling.Core").Contents.all.getFile("lib/NET4/Microsoft.Practices.TransientFaultHandling.Core.dll"),
-        importFrom("Sdk.SelfHost.Sqlite").runtimeLibs,
     ]
 };

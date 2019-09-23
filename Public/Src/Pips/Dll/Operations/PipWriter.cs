@@ -13,18 +13,14 @@ namespace BuildXL.Pips.Operations
     /// <remarks>
     /// This type is internal, as the serialization/deserialization functionality is encapsulated by the PipTable.
     /// </remarks>
-    internal sealed class PipWriter : BuildXLWriter
+    internal class PipWriter : BuildXLWriter
     {
-        public PipWriter(PageableStore store, Stream stream, bool leaveOpen, bool logStats)
-            : base(store.Debug, stream, leaveOpen, logStats)
+        public PipWriter(bool debug, Stream stream, bool leaveOpen, bool logStats)
+            : base(debug, stream, leaveOpen, logStats)
         {
-            Contract.Requires(store != null);
-            Store = store;
         }
 
-        public PageableStore Store { get; }
-
-        public void Write(Pip pip)
+        public virtual void Write(Pip pip)
         {
             Contract.Requires(pip != null);
             Start<Pip>();
@@ -32,28 +28,33 @@ namespace BuildXL.Pips.Operations
             End();
         }
 
-        public void Write(in PipData value)
+        public virtual void Write(in PipData value)
         {
             Start<PipData>();
             value.Serialize(this);
             End();
         }
 
-        public void Write(in EnvironmentVariable value)
+        public virtual void WritePipDataEntriesPointer(in StringId value)
+        {
+            Write(value);
+        }
+
+        public virtual void Write(in EnvironmentVariable value)
         {
             Start<EnvironmentVariable>();
             value.Serialize(this);
             End();
         }
 
-        public void Write(RegexDescriptor value)
+        public virtual void Write(RegexDescriptor value)
         {
             Start<RegexDescriptor>();
             value.Serialize(this);
             End();
         }
 
-        public void Write(PipProvenance value)
+        public virtual void Write(PipProvenance value)
         {
             Contract.Requires(value != null);
             Start<PipProvenance>();
@@ -61,14 +62,14 @@ namespace BuildXL.Pips.Operations
             End();
         }
 
-        public void Write(PipId value)
+        public virtual void Write(PipId value)
         {
             Start<PipId>();
             Write(value.Value);
             End();
         }
 
-        public void Write(in ProcessSemaphoreInfo value)
+        public virtual void Write(in ProcessSemaphoreInfo value)
         {
             Contract.Requires(value != null);
             Start<ProcessSemaphoreInfo>();

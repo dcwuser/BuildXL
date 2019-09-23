@@ -279,7 +279,7 @@ namespace BuildXL.Utilities
         /// <summary>
         /// Writes a DirectoryArtifact
         /// </summary>
-        public void Write(DirectoryArtifact value)
+        public virtual void Write(DirectoryArtifact value)
         {
             Start<DirectoryArtifact>();
             Write(value.Path);
@@ -480,10 +480,10 @@ namespace BuildXL.Utilities
         /// <summary>
         /// Writes a ModuleId
         /// </summary>
-        public void Write(ModuleId value)
+        public virtual void Write(ModuleId value)
         {
             Start<ModuleId>();
-            WriteCompact(value.Value);
+            value.Serialize(this);
             End();
         }
 

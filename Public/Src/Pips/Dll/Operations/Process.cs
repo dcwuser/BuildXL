@@ -22,6 +22,16 @@ namespace BuildXL.Pips.Operations
         public const int MinWeight = 1;
 
         /// <summary>
+        /// Minimum priority.  These pips go last.
+        /// </summary>
+        public const int MinPriority = 0;
+
+        /// <summary>
+        /// Maximum priority.  These pips go first.
+        /// </summary>
+        public const int MaxPriority = 127;
+
+        /// <summary>
         /// Maximum allowed timeout
         /// </summary>
         public static readonly TimeSpan MaxTimeout = int.MaxValue.MillisecondsToTimeSpan();
@@ -100,6 +110,12 @@ namespace BuildXL.Pips.Operations
         public AbsolutePath UniqueRedirectedDirectoryRoot { get; }
 
         /// <summary>
+        /// File path of which the source shange affected inputs are written into.
+        /// </summary>
+        [PipCaching(FingerprintingRole = FingerprintingRole.None)]
+        public FileArtifact ChangeAffectedInputListWrittenFilePath { get; }
+
+        /// <summary>
         /// If valid, points to the response (that is also referenced by <see cref="Arguments" />).
         /// </summary>
         [PipCaching(FingerprintingRole = FingerprintingRole.None)]
@@ -172,7 +188,7 @@ namespace BuildXL.Pips.Operations
         /// </summary>
         [SuppressMessage("Microsoft.Performance", "CA1819:PropertiesShouldNotReturnArrays")]
         [PipCaching(FingerprintingRole = FingerprintingRole.Content)]
-        public ReadOnlyArray<DirectoryArtifact> DirectoryDependencies { get; }
+        public ReadOnlyArray<DirectoryArtifact> DirectoryDependencies { get; private set; }
 
         /// <summary>
         /// Order-only dependencies.
@@ -237,6 +253,29 @@ namespace BuildXL.Pips.Operations
         public RegexDescriptor ErrorRegex { get; }
 
         /// <summary>
+        /// When false (or not set): process output is scanned for error messages line by line;
+        /// 'errorRegex' is applied to each line and if ANY match is found the ENTIRE line is reported.
+        /// 
+        /// When true: process output is scanned in chunks of up to 10000 lines; 'errorRegex' is applied to
+        /// each chunk and only the matches are reported. Furthermore, if 'errorRegex' contains a capture
+        /// group named "ErrorMessage", the value of that group is reported; otherwise, the value of the
+        /// entire match is reported.
+        /// 
+        ///   NOTE: because this scanning is done against chunks of text (instead of the entire process output),
+        ///         false negatives are possible if an error message spans across multiple chunks.  The scanning
+        ///         is done in chunks because attempting to construct a single string from the entire process
+        ///         output can easily lead to an "out of memory" exception.
+        /// </summary>
+        /// <remarks>
+        /// Regarding fingerprinting: <see cref="ErrorRegex"/> is currently a part of the process fingerprint, 
+        /// even though it cannot affect the outcome (success vs failure) of the process.  This is kind of
+        /// strange and should probably be changed in the future.  In that vain, <see cref="EnableMultiLineErrorScanning"/>
+        /// is decided to not be included in the process fingerprint.
+        /// </remarks>
+        [PipCaching(FingerprintingRole = FingerprintingRole.None)]
+        public bool EnableMultiLineErrorScanning { get; }
+
+        /// <summary>
         /// File outputs. Each member of the array is distinct.
         /// </summary>
         /// <remarks>
@@ -292,6 +331,14 @@ namespace BuildXL.Pips.Operations
         public int Weight { get; }
 
         /// <summary>
+        /// Priority hint for scheduling a process pip.
+        /// Higher priorities will be scheduled before lower priorities.
+        /// Minimum value is 0, max is 99
+        /// </summary>
+        [PipCaching(FingerprintingRole = FingerprintingRole.None)]
+        public int Priority { get; }
+
+        /// <summary>
         /// A helper flag to indicate if the Test for execution retries is executing.
         /// </summary>
         public bool TestRetries { get; }
@@ -301,6 +348,17 @@ namespace BuildXL.Pips.Operations
         /// </summary>
         [Pure]
         public bool IsStartOrShutdownKind => ServiceInfo != null && ServiceInfo.IsStartOrShutdownKind;
+
+        /// <summary>
+        /// File/directory output paths that are preserved if <see cref="AllowPreserveOutputs"/> is enabled. 
+        /// </summary>
+        /// <remarks>
+        /// If the list is empty, all file and directory outputs are preserved. If the list is not empty,
+        /// only given paths are preserved and the rest is deleted.
+        /// </remarks>
+        [SuppressMessage("Microsoft.Performance", "CA1819:PropertiesShouldNotReturnArrays")]
+        [PipCaching(FingerprintingRole = FingerprintingRole.Semantic)]
+        public ReadOnlyArray<AbsolutePath> PreserveOutputWhitelist { get; }
 
         /// <summary>
         /// Class constructor
@@ -333,6 +391,7 @@ namespace BuildXL.Pips.Operations
             ReadOnlyArray<AbsolutePath> additionalTempDirectories,
             RegexDescriptor warningRegex = default,
             RegexDescriptor errorRegex = default,
+            bool enableMultiLineErrorScanning = false,
             AbsolutePath uniqueOutputDirectory = default,
             AbsolutePath uniqueRedirectedDirectoryRoot = default,
             AbsolutePath tempDirectory = default,
@@ -345,7 +404,10 @@ namespace BuildXL.Pips.Operations
             AbsentPathProbeInUndeclaredOpaquesMode absentPathProbeMode = AbsentPathProbeInUndeclaredOpaquesMode.Unsafe,
             DoubleWritePolicy doubleWritePolicy = DoubleWritePolicy.DoubleWritesAreErrors,
             ContainerIsolationLevel containerIsolationLevel = ContainerIsolationLevel.None,
-            int? weight = null)
+            int? weight = null,
+            int? priority = null,
+            ReadOnlyArray<AbsolutePath>? preserveOutputWhitelist = null,
+            FileArtifact changeAffectedInputListWrittenFilePath = default)
         {
             Contract.Requires(executable.IsValid);
             Contract.Requires(workingDirectory.IsValid);
@@ -431,20 +493,30 @@ namespace BuildXL.Pips.Operations
             RetryExitCodes = retryExitCodes ?? ReadOnlyArray<int>.Empty;
             WarningRegex = warningRegex;
             ErrorRegex = errorRegex;
+            EnableMultiLineErrorScanning = enableMultiLineErrorScanning;
             UniqueOutputDirectory = uniqueOutputDirectory;
             UniqueRedirectedDirectoryRoot = uniqueRedirectedDirectoryRoot;
             Semaphores = semaphores;
             TempDirectory = tempDirectory;
             TestRetries = testRetries;
             ServiceInfo = serviceInfo;
-            ProcessOptions = options;
             AdditionalTempDirectories = additionalTempDirectories;
             AllowedSurvivingChildProcessNames = allowedSurvivingChildProcessNames ?? ReadOnlyArray<PathAtom>.Empty;
             NestedProcessTerminationTimeout = nestedProcessTerminationTimeout;
             ProcessAbsentPathProbeInUndeclaredOpaquesMode = absentPathProbeMode;
             DoubleWritePolicy = doubleWritePolicy;
             ContainerIsolationLevel = containerIsolationLevel;
-            Weight = weight.HasValue && weight.Value > 0 ? weight.Value : MinWeight;
+            Weight = weight.HasValue && weight.Value >= MinWeight ? weight.Value : MinWeight;
+            Priority = priority.HasValue && priority.Value >= MinPriority ? (priority <= MaxPriority ? priority.Value : MaxPriority) : MinPriority;
+            PreserveOutputWhitelist = preserveOutputWhitelist ?? ReadOnlyArray<AbsolutePath>.Empty;
+            ChangeAffectedInputListWrittenFilePath = changeAffectedInputListWrittenFilePath;
+
+            if (PreserveOutputWhitelist.Length != 0)
+            {
+                options |= Options.HasPreserveOutputWhitelist;
+            }
+
+            ProcessOptions = options;
         }
 
         /// <summary>
@@ -478,6 +550,7 @@ namespace BuildXL.Pips.Operations
             ReadOnlyArray<AbsolutePath>? additionalTempDirectories = null,
             RegexDescriptor? warningRegex = null,
             RegexDescriptor? errorRegex = null,
+            bool? enableMultiLineErrorScanning = null,
             AbsolutePath? uniqueOutputDirectory = null,
             AbsolutePath? redirectedDirectoryRoot = null,
             AbsolutePath? tempDirectory = null,
@@ -490,7 +563,10 @@ namespace BuildXL.Pips.Operations
             AbsentPathProbeInUndeclaredOpaquesMode absentPathProbeMode = AbsentPathProbeInUndeclaredOpaquesMode.Unsafe,
             DoubleWritePolicy doubleWritePolicy = DoubleWritePolicy.DoubleWritesAreErrors,
             ContainerIsolationLevel containerIsolationLevel = ContainerIsolationLevel.None,
-            int? weight = null)
+            int? weight = null,
+            int? priority = null,
+            ReadOnlyArray<AbsolutePath>? preserveOutputWhitelist = null,
+            FileArtifact? changeAffectedInputListWrittenFilePath = default)
         {
             return new Process(
                 executable ?? Executable,
@@ -520,6 +596,7 @@ namespace BuildXL.Pips.Operations
                 additionalTempDirectories ?? AdditionalTempDirectories,
                 warningRegex ?? WarningRegex,
                 errorRegex ?? ErrorRegex,
+                enableMultiLineErrorScanning ?? EnableMultiLineErrorScanning,
                 uniqueOutputDirectory ?? UniqueOutputDirectory,
                 redirectedDirectoryRoot ?? UniqueRedirectedDirectoryRoot,
                 tempDirectory ?? TempDirectory,
@@ -532,7 +609,10 @@ namespace BuildXL.Pips.Operations
                 absentPathProbeMode,
                 doubleWritePolicy,
                 containerIsolationLevel,
-                weight);
+                weight,
+                priority,
+                preserveOutputWhitelist ?? PreserveOutputWhitelist,
+                changeAffectedInputListWrittenFilePath ?? ChangeAffectedInputListWrittenFilePath);
         }
 
         /// <inheritdoc />
@@ -573,6 +653,11 @@ namespace BuildXL.Pips.Operations
         /// Indicates the process may run without deleting prior outputs from a previous run.
         /// </summary>
         public bool AllowPreserveOutputs => (ProcessOptions & Options.AllowPreserveOutputs) != 0;
+
+        /// <summary>
+        /// Indicates the process run for tool that has incremental build capability.
+        /// </summary>
+        public bool IncrementalTool => (ProcessOptions & Options.IncrementalTool) == Options.IncrementalTool;
 
         /// <summary>
         /// Indicates whether this is a light process.
@@ -646,6 +731,11 @@ namespace BuildXL.Pips.Operations
         [PipCaching(FingerprintingRole = FingerprintingRole.Semantic)]
         public ContainerIsolationLevel ContainerIsolationLevel { get; }
 
+        internal void UnsafeUpdateDirectoryDependencies(ReadOnlyArray<DirectoryArtifact> newDirectoryDependencies)
+        {
+            DirectoryDependencies = newDirectoryDependencies;
+        }
+
         #region PipUniqueOutputHash
 
         /// <summary>
@@ -712,7 +802,7 @@ namespace BuildXL.Pips.Operations
             m_cachedUniqueOutputHash = pipUniqueOutputHash;
             return true;
         }
-
+       
         #endregion PipUniqueOutputHash
 
         #region Serialization
@@ -746,18 +836,22 @@ namespace BuildXL.Pips.Operations
                 additionalTempDirectories: reader.ReadReadOnlyArray(reader1 => reader1.ReadAbsolutePath()),
                 warningRegex: reader.ReadRegexDescriptor(),
                 errorRegex: reader.ReadRegexDescriptor(),
+                enableMultiLineErrorScanning: reader.ReadBoolean(),
                 uniqueOutputDirectory: reader.ReadAbsolutePath(),
                 uniqueRedirectedDirectoryRoot: reader.ReadAbsolutePath(),
                 tempDirectory: reader.ReadAbsolutePath(),
                 options: (Options)reader.ReadInt32(),
-                serviceInfo: reader.ReadNullable(reader1 => Operations.ServiceInfo.InternalDeserialize(reader1)),
+                serviceInfo: reader.ReadNullable(reader1 => ServiceInfo.InternalDeserialize(reader1)),
                 retryExitCodes: reader.ReadReadOnlyArray(r => r.ReadInt32()),
                 allowedSurvivingChildProcessNames: reader.ReadReadOnlyArray(reader1 => reader1.ReadPathAtom()),
                 nestedProcessTerminationTimeout: reader.ReadNullableStruct(reader1 => reader1.ReadTimeSpan()),
                 absentPathProbeMode: (AbsentPathProbeInUndeclaredOpaquesMode)reader.ReadByte(),
                 doubleWritePolicy: (DoubleWritePolicy)reader.ReadByte(),
                 containerIsolationLevel: (ContainerIsolationLevel)reader.ReadByte(),
-                weight: reader.ReadInt32Compact()
+                weight: reader.ReadInt32Compact(),
+                priority: reader.ReadInt32Compact(),
+                preserveOutputWhitelist: reader.ReadReadOnlyArray(r => r.ReadAbsolutePath()),
+                changeAffectedInputListWrittenFilePath: reader.ReadFileArtifact()
                 );
         }
 
@@ -791,6 +885,7 @@ namespace BuildXL.Pips.Operations
             writer.Write(AdditionalTempDirectories, (w, v) => w.Write(v));
             writer.Write(WarningRegex);
             writer.Write(ErrorRegex);
+            writer.Write(EnableMultiLineErrorScanning);
             writer.Write(UniqueOutputDirectory);
             writer.Write(UniqueRedirectedDirectoryRoot);
             writer.Write(TempDirectory);
@@ -803,6 +898,9 @@ namespace BuildXL.Pips.Operations
             writer.Write((byte)DoubleWritePolicy);
             writer.Write((byte)ContainerIsolationLevel);
             writer.WriteCompact(Weight);
+            writer.WriteCompact(Priority);
+            writer.Write(PreserveOutputWhitelist, (w, v) => w.Write(v));
+            writer.Write(ChangeAffectedInputListWrittenFilePath);
         }
         #endregion
     }

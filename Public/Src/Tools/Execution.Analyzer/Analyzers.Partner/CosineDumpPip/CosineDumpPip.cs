@@ -36,12 +36,7 @@ namespace BuildXL.Execution.Analyzer
                 }
                 else if (opt.Name.Equals(PipHashOption, StringComparison.OrdinalIgnoreCase))
                 {
-                    string sshAsString = ParseStringOption(opt);
-                    if (!sshAsString.StartsWith(Pip.SemiStableHashPrefix, StringComparison.OrdinalIgnoreCase))
-                    {
-                        throw Error($"Invalid pip:{sshAsString}. Id must be a semistable hash that starts with the prefix '{Pip.SemiStableHashPrefix}' i.e.: {Pip.SemiStableHashPrefix}C623BCE303738C69");
-                    }
-                    filters.PipSemiStableHash = Convert.ToInt64(sshAsString.Substring(3), 16);
+                    filters.PipSemiStableHash = ParseSemistableHash(opt);
                 }
                 else if (opt.Name.Equals(PipTypeOption, StringComparison.OrdinalIgnoreCase))
                 {
@@ -283,7 +278,7 @@ namespace BuildXL.Execution.Analyzer
             pipMetadata.Usage = provenance.Usage.IsValid ? provenance.Usage.ToString(PathTable) : null;
             pipMetadata.SpecFilePath = provenance.Token.Path.ToString(PathTable);
             pipMetadata.OutputValueSymbol = provenance.OutputValueSymbol.ToString(SymbolTable);
-            pipMetadata.ModuleId = provenance.ModuleId.Value;
+            pipMetadata.ModuleId = provenance.ModuleId.Value.Value;
             pipMetadata.SpecFilePath = provenance.Token.Path.ToString(PathTable);
 
             pipMetadata.PipDependencies = PipGraph.RetrievePipReferenceImmediateDependencies(pip.PipId, null)
@@ -471,7 +466,7 @@ namespace BuildXL.Execution.Analyzer
                 SpecFile = pip.SpecFile.Path.ToString(PathTable),
                 DefinitionFilePath = pip.DefinitionLocation.Path.ToString(PathTable),
                 Location = pip.DefinitionLocation.ToString(PathTable),
-                ModuleId = pip.OwningModule.Value
+                ModuleId = pip.OwningModule.Value.Value
             };
 
             return specFilePipDetails;

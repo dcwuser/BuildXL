@@ -260,7 +260,7 @@ namespace BuildXL.FrontEnd.Script.Tracing
         DivideByZero = 9352,
         StackOverflow = 9353,
         InvalidPathAtom = 9354,
-        // Deprecated 9355,
+        DisallowedUnsafeAmbientCall = 9355,
         InvalidTypeFormat = 9356,
         InputValidationError = 9357,
         UndefinedMapKey = 9358,
@@ -324,8 +324,6 @@ namespace BuildXL.FrontEnd.Script.Tracing
         DuplicateAllowedModuleDependencies = 9398,
         DuplicateCyclicalFriendModules = 9399,
 
-        PropertyAccessOnValueWithTypeAny = 9404,
-
         // 4. Statistics
         ArrayEvaluationStatistics = 9400,
         /*Was ThunkEvaluationStatistics. Now: reserved.*/
@@ -333,6 +331,7 @@ namespace BuildXL.FrontEnd.Script.Tracing
         GlobStatistics = 9401,
         ContextStatistics = 9402,
         MethodInvocationCountStatistics = 9403,
+        PropertyAccessOnValueWithTypeAny = 9404,
         InvalidRadix = 9405,
         InvalidPathOperation = 9406,
         EvaluationCanceled = 9407,
@@ -342,6 +341,10 @@ namespace BuildXL.FrontEnd.Script.Tracing
         ReportXmlReadError = 9411,
         ReportXmlUnsuportedTypeForSerialization = 9412,
         ReportUnsupportedTypeValueObjectException = 9413,
+        DirectoryNotSupportedException = 9414,
+
+        CGManifestValidationException = 9415,
+        CGManifestGenerationException = 9416,
         // Obsolete syntax rules (starting from 9500)
 
         // Don't go beyond 9899

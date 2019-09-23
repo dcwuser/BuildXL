@@ -10,6 +10,7 @@ using System.Linq;
 using System.Threading.Tasks;
 using BuildXL.Interop;
 using BuildXL.Utilities;
+using BuildXL.Utilities.Configuration.Mutable;
 using static BuildXL.Utilities.FormattableStringEx;
 using JetBrains.Annotations;
 #if FEATURE_SAFE_PROCESS_HANDLE
@@ -26,9 +27,10 @@ namespace BuildXL.Processes
     /// <summary>
     /// An implementation of <see cref="ISandboxedProcess"/> that doesn't perform any sandboxing.
     /// </summary>
-    public class UnSandboxedProcess : ISandboxedProcess
+    public class UnsandboxedProcess : ISandboxedProcess
     {
         private static readonly ISet<ReportedFileAccess> s_emptyFileAccessesSet = new HashSet<ReportedFileAccess>();
+        private static readonly TimeSpan DefaultProcessTimeout = TimeSpan.FromMinutes(SandboxConfiguration.DefaultProcessTimeoutInMinutes);
 
         private readonly SandboxedProcessOutputBuilder m_output;
         private readonly SandboxedProcessOutputBuilder m_error;
@@ -90,12 +92,11 @@ namespace BuildXL.Processes
         protected virtual bool HasSandboxFailures => false;
 
         /// <nodoc />
-        public UnSandboxedProcess(SandboxedProcessInfo info)
+        public UnsandboxedProcess(SandboxedProcessInfo info)
         {
             Contract.Requires(info != null);
 
-            info.Timeout = info.Timeout ?? TimeSpan.FromMinutes(10);
-
+            info.Timeout = info.Timeout ?? DefaultProcessTimeout;
             ProcessInfo = info;
 
             m_output = new SandboxedProcessOutputBuilder(
@@ -134,10 +135,10 @@ namespace BuildXL.Processes
 
             m_processExecutor = new AsyncProcessExecutor(
                 CreateProcess(),
-                ProcessInfo.Timeout ?? TimeSpan.FromMinutes(10),
+                ProcessInfo.Timeout ?? DefaultProcessTimeout,
                 line => FeedStdOut(m_output, line),
                 line => FeedStdErr(m_error, line),
-                ProcessInfo,
+                ProcessInfo.Provenance,
                 msg => LogProcessState(msg));
 
             m_processExecutor.Start();
@@ -205,13 +206,19 @@ namespace BuildXL.Processes
         public int GetLastMessageCount() => 0;
 
         /// <inheritdoc />
-        public virtual async Task<SandboxedProcessResult> GetResultAsync()
+        public async Task<SandboxedProcessResult> GetResultAsync()
         {
             Contract.Requires(Started);
 
             SandboxedProcessReports reports = null;
 
             await m_processExecutor.WaitForExitAsync();
+            if (m_processExecutor.Killed)
+            {
+                // call here this.KillAsync() because a subclass may override it
+                // to do some extra processing when a process is killed
+                await KillAsync();
+            }
 
             LogProcessState("Waiting for reports to be received");
             reports = await GetReportsAsync();
@@ -229,6 +236,7 @@ namespace BuildXL.Processes
                 Killed                              = Killed,
                 TimedOut                            = m_processExecutor.TimedOut,
                 HasDetoursInjectionFailures         = HasSandboxFailures,
+                JobAccountingInformation            = GetJobAccountingInfo(),
                 StandardOutput                      = m_output.Freeze(),
                 StandardError                       = m_error.Freeze(),
                 HasReadWriteToReadFileAccessRequest = reports?.HasReadWriteToReadFileAccessRequest ?? false,
@@ -263,7 +271,7 @@ namespace BuildXL.Processes
 
             ProcessDumper.TryDumpProcessAndChildren(ProcessId, ProcessInfo.TimeoutDumpDirectory, out m_dumpCreationException);
 
-            LogProcessState($"UnSandboxedProcess::KillAsync()");
+            LogProcessState($"UnsandboxedProcess::KillAsync()");
             return m_processExecutor.KillAsync();
         }
 
@@ -274,7 +282,7 @@ namespace BuildXL.Processes
         {
             Contract.Requires(Process == null);
 
-#if PLATFORM_OSX
+#if !PLATFORM_WIN
             var mode = GetFilePermissionsForFilePath(ProcessInfo.FileName, followSymlink: false);
             if (mode < 0)
             {
@@ -359,9 +367,9 @@ namespace BuildXL.Processes
         }
 
         /// <summary>
-        /// Returns surviving child processes in the case when the pip had to be terminated because its child
-        /// processes didn't exit within allotted time (<see cref="SandboxedProcessInfo.NestedProcessTerminationTimeout"/>)
-        /// after the main pip process has already exited.
+        /// Returns surviving child processes in the case when the pip finished and potential child
+        /// processes didn't exit within an allotted time (<see cref="SandboxedProcessInfo.NestedProcessTerminationTimeout"/>)
+        /// after the main pip parent process has already exited.
         /// </summary>
         protected virtual IEnumerable<ReportedProcess> GetSurvivingChildProcesses() => null;
 
@@ -382,8 +390,14 @@ namespace BuildXL.Processes
         [NotNull]
         internal virtual CpuTimes GetCpuTimes()
         {
-            // 'Dispatch.GetProcessTimes()' doesn't work because the process has already exited
+            // 'Dispatch.GetProcessResourceUsage()' doesn't work because the process has already exited
             return CpuTimes.Zeros;
+        }
+
+        /// <nodoc/>
+        internal virtual JobObject.AccountingInformation GetJobAccountingInfo()
+        {
+            return default;
         }
 
         private ProcessTimes GetProcessTimes()

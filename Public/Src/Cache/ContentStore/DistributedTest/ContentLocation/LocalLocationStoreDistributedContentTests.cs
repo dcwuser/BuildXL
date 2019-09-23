@@ -7,7 +7,6 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
-using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using BuildXL.Cache.ContentStore.Distributed;
@@ -16,7 +15,6 @@ using BuildXL.Cache.ContentStore.Distributed.NuCache.EventStreaming;
 using BuildXL.Cache.ContentStore.Distributed.Redis;
 using BuildXL.Cache.ContentStore.Distributed.Sessions;
 using BuildXL.Cache.ContentStore.Distributed.Stores;
-using BuildXL.Cache.ContentStore.Distributed.Utilities;
 using BuildXL.Cache.ContentStore.Extensions;
 using BuildXL.Cache.ContentStore.FileSystem;
 using BuildXL.Cache.ContentStore.Hashing;
@@ -28,15 +26,16 @@ using BuildXL.Cache.ContentStore.Interfaces.Time;
 using BuildXL.Cache.ContentStore.Interfaces.Tracing;
 using BuildXL.Cache.ContentStore.InterfacesTest.Results;
 using BuildXL.Cache.ContentStore.Stores;
-using BuildXL.Cache.ContentStore.Tracing.Internal;
 using BuildXL.Cache.ContentStore.UtilitiesCore;
-using BuildXL.Utilities;
+using BuildXL.Cache.ContentStore.Utils;
 using BuildXL.Utilities.Collections;
 using BuildXL.Utilities.Tracing;
 using ContentStoreTest.Distributed.ContentLocation;
 using ContentStoreTest.Distributed.Redis;
 using ContentStoreTest.Test;
 using FluentAssertions;
+using Microsoft.WindowsAzure.Storage;
+using Microsoft.WindowsAzure.Storage.Auth;
 using Xunit;
 using Xunit.Abstractions;
 using AbsolutePath = BuildXL.Cache.ContentStore.Interfaces.FileSystem.AbsolutePath;
@@ -54,7 +53,7 @@ namespace ContentStoreTest.Distributed.Sessions
 
         private readonly ConcurrentDictionary<(Guid, int), LocalRedisProcessDatabase> _localDatabases = new ConcurrentDictionary<(Guid, int), LocalRedisProcessDatabase>();
 
-        private PinConfiguration PinConfiguration { get; set; }
+        protected PinConfiguration PinConfiguration { get; set; }
 
         private readonly Dictionary<int, RedisContentLocationStoreConfiguration> _configurations
             = new Dictionary<int, RedisContentLocationStoreConfiguration>();
@@ -81,6 +80,9 @@ namespace ContentStoreTest.Distributed.Sessions
             base.Dispose(disposing);
         }
 
+        /// <nodoc />
+        protected bool EnableProactiveCopy { get; set; } = false;
+
         protected override IContentStore CreateStore(
             Context context,
             TestFileCopier fileCopier,
@@ -89,7 +91,8 @@ namespace ContentStoreTest.Distributed.Sessions
             bool enableDistributedEviction,
             int? replicaCreditInMinutes,
             bool enableRepairHandling,
-            bool emptyFileHashShortcutEnabled)
+            bool emptyFileHashShortcutEnabled,
+            object additionalArgs)
         {
             var rootPath = testDirectory.Path / "Root";
             var tempPath = testDirectory.Path / "Temp";
@@ -137,7 +140,6 @@ namespace ContentStoreTest.Distributed.Sessions
                 TestClock,
                 contentHashBumpTime: TimeSpan.FromHours(1),
                 keySpace: RedisContentLocationStoreFactory.DefaultKeySpace,
-                localMachineLocation: testPathTransformer.GetLocalMachineLocation(rootPath),
                 fileSystem: null,
                 configuration: configuration);
 
@@ -159,13 +161,18 @@ namespace ContentStoreTest.Distributed.Sessions
                 fileCopier,
                 fileCopier,
                 pathTransformer,
+                fileCopier,
                 ContentAvailabilityGuarantee,
                 tempPath,
                 FileSystem,
-                retryIntervalForCopies: DistributedContentSessionTests.DefaultRetryIntervalsForTest,
                 locationStoreBatchSize: 1,
+                settings: new DistributedContentStoreSettings()
+                {
+                    RetryIntervalForCopies = DistributedContentSessionTests.DefaultRetryIntervalsForTest,
+                    PinConfiguration = PinConfiguration,
+                    ProactiveCopyMode = EnableProactiveCopy ? ProactiveCopyMode.Both : ProactiveCopyMode.Disabled
+                },
                 replicaCreditInMinutes: replicaCreditInMinutes,
-                pinConfiguration: PinConfiguration,
                 clock: TestClock,
                 enableRepairHandling: enableRepairHandling,
                 contentStoreSettings: new ContentStoreSettings()
@@ -173,11 +180,61 @@ namespace ContentStoreTest.Distributed.Sessions
                     CheckFiles = true,
                     UseEmptyFileHashShortcut = emptyFileHashShortcutEnabled,
                     UseLegacyQuotaKeeperImplementation = false,
-                }
+                },
+                setPostInitializationCompletionAfterStartup: true
                 );
 
             distributedContentStore.DisposeContentStoreFactory = false;
             return distributedContentStore;
+        }
+
+        [Fact]
+        public async Task ProactiveCopyDistributedTest()
+        {
+            EnableProactiveCopy = true;
+
+            // Use the same context in two sessions when checking for file existence
+            var loggingContext = new Context(Logger);
+
+            var contentHashes = new List<ContentHash>();
+
+            int machineCount = 3;
+            ConfigureWithOneMaster();
+
+            // We need pin better to be triggered.
+            PinConfiguration = new PinConfiguration();
+
+            await RunTestAsync(
+                loggingContext,
+                machineCount,
+                async context =>
+                {
+                    var masterStore = context.GetMaster();
+                    var defaultFileSize = (Config.MaxSizeQuota.Hard / 4) + 1;
+
+                    var sessions = context.EnumerateWorkersIndices().Select(i => context.GetDistributedSession(i)).ToArray();
+
+                    // Insert random file #1 into worker #1
+                    var putResult1 = await sessions[0].PutRandomAsync(context, HashType.Vso0, false, defaultFileSize, Token).ShouldBeSuccess();
+                    var hash1 = putResult1.ContentHash;
+
+                    var getBulkResult1 = await masterStore.GetBulkAsync(context, hash1, GetBulkOrigin.Global).ShouldBeSuccess();
+
+                    // LocationStore knew no machines, so copying should not be possible. However, next time it will know location 1.
+                    getBulkResult1.ContentHashesInfo[0].Locations.Count.Should().Be(1);
+
+                    // Insert random file #2 into worker #2
+                    var putResult2 = await sessions[0].PutRandomAsync(context, HashType.Vso0, false, defaultFileSize, Token).ShouldBeSuccess();
+                    var hash2 = putResult2.ContentHash;
+
+                    await Task.Delay(TimeSpan.FromSeconds(1)); // Wait for proactive copy to finish in the background.
+
+                    var getBulkResult2 = await masterStore.GetBulkAsync(context, hash2, GetBulkOrigin.Global).ShouldBeSuccess();
+
+                    // Should have proactively copied to worker #1
+                    getBulkResult2.ContentHashesInfo[0].Locations.Count.Should().Be(2);
+                },
+                implicitPin: ImplicitPin.None);
         }
 
         private LocalRedisProcessDatabase GetDatabase(Context context, ref int index)
@@ -311,7 +368,6 @@ namespace ContentStoreTest.Distributed.Sessions
             int machineCount = 5;
             ConfigureWithOneMaster();
 
-            // HACK: Existing purge code removes an extra file. Testing with this in mind.
             await RunTestAsync(
                 loggingContext,
                 machineCount,
@@ -323,18 +379,18 @@ namespace ContentStoreTest.Distributed.Sessions
 
                     var defaultFileSize = (Config.MaxSizeQuota.Hard / 4) + 1;
 
-                    // Insert random file #1 into session
+                    // Insert random file #0 into session
                     var putResult = await session.PutRandomAsync(context, HashType.Vso0, false, defaultFileSize, Token).ShouldBeSuccess();
                     contentHashes.Add(putResult.ContentHash);
 
                     // Ensure first piece of content older than other content by at least the replica credit
                     TestClock.UtcNow += TimeSpan.FromMinutes(ReplicaCreditInMinutes);
 
-                    // Put random large file #2 into session.
+                    // Put random large file #1 into session.
                     putResult = await session.PutRandomAsync(context, HashType.Vso0, false, defaultFileSize, Token).ShouldBeSuccess();
                     contentHashes.Add(putResult.ContentHash);
 
-                    // Put random large file #3 into session.
+                    // Put random large file #2 into session.
                     putResult = await session.PutRandomAsync(context, HashType.Vso0, false, defaultFileSize, Token).ShouldBeSuccess();
                     contentHashes.Add(putResult.ContentHash);
 
@@ -356,14 +412,13 @@ namespace ContentStoreTest.Distributed.Sessions
                         UrgencyHint.Nominal,
                         GetBulkOrigin.Local).ShouldBeSuccess();
 
-                    // Random file #2 and 3 should not be found
+                    // Random file #2 should be found in all machines.
                     locationsResult.ContentHashesInfo.Count.Should().Be(3);
                     locationsResult.ContentHashesInfo[0].Locations.Count.Should().Be(1);
                     locationsResult.ContentHashesInfo[1].Locations.Count.Should().Be(1);
                     locationsResult.ContentHashesInfo[2].Locations.Count.Should().Be(machineCount);
 
-                    // Put random large file #4 into session that will evict file #2 and #3.
-                    putResult = await session.PutRandomAsync(context, HashType.Vso0, false, defaultFileSize, Token).ShouldBeSuccess();
+                    // Put random large file #3 into session that will evict file #2.
                     putResult = await session.PutRandomAsync(context, HashType.Vso0, false, defaultFileSize, Token).ShouldBeSuccess();
                     contentHashes.Add(putResult.ContentHash);
 
@@ -376,9 +431,10 @@ namespace ContentStoreTest.Distributed.Sessions
                         UrgencyHint.Nominal,
                         GetBulkOrigin.Local).ShouldBeSuccess();
 
-                    // Random file #2 and 3 should not be found
+                    // Random file #2 should have been evicted from master.
                     locationsResult.ContentHashesInfo.Count.Should().Be(4);
-                    locationsResult.ContentHashesInfo[0].Locations.Should().BeEmpty();
+                    locationsResult.ContentHashesInfo[0].Locations.Should().NotBeEmpty();
+                    locationsResult.ContentHashesInfo[1].Locations.Should().NotBeEmpty();
                     locationsResult.ContentHashesInfo[2].Locations.Count.Should().Be(machineCount - 1, "Master should have evicted newer content because effective age due to replicas was older than other content");
                     locationsResult.ContentHashesInfo[3].Locations.Should().NotBeEmpty();
                 },
@@ -642,7 +698,7 @@ namespace ContentStoreTest.Distributed.Sessions
                 });
         }
 
-        private static bool HasLocation(ContentLocationDatabase db, OperationContext context, ContentHash hash, MachineId machine, long size)
+        private static bool HasLocation(ContentLocationDatabase db, BuildXL.Cache.ContentStore.Tracing.Internal.OperationContext context, ContentHash hash, MachineId machine, long size)
         {
             if (!db.TryGetEntry(context, hash, out var entry))
             {
@@ -770,7 +826,7 @@ namespace ContentStoreTest.Distributed.Sessions
         [Theory]
         [InlineData(true)]
         [InlineData(false)]
-        public async Task MultiLevelContentLocationStoreDatabasePinTests(bool usePinBulk)
+        public virtual async Task MultiLevelContentLocationStoreDatabasePinTests(bool usePinBulk)
         {
             ConfigureWithOneMaster();
             int storeCount = 3;
@@ -895,7 +951,9 @@ namespace ContentStoreTest.Distributed.Sessions
                         contentHash,
                         Token).ShouldBeSuccess();
 
+#pragma warning disable AsyncFixer02
                     openStreamResult.Stream.Dispose();
+#pragma warning restore AsyncFixer02
                 });
         }
 
@@ -1172,7 +1230,7 @@ namespace ContentStoreTest.Distributed.Sessions
                     // Increment the time to ensure master lease expires
                     // then heartbeat worker first to ensure it steals the lease
                     // Master heartbeat trigger it to become a worker since the other
-                    // machine will 
+                    // machine will
                     TestClock.UtcNow += masterLeaseExpiryTime;
                     TestClock.UtcNow += TimeSpan.FromMinutes(masterLeaseExpiryTime.TotalMinutes * 2);
                     await workerRedisStore.LocalLocationStore.HeartbeatAsync(context).ShouldBeSuccess();
@@ -1190,6 +1248,116 @@ namespace ContentStoreTest.Distributed.Sessions
                     // Master redis store should now be able to reacquire master role
                     await masterRedisStore.LocalLocationStore.HeartbeatAsync(context).ShouldBeSuccess();
                     Assert.Equal(Role.Master, masterRedisStore.LocalLocationStore.CurrentRole);
+                });
+        }
+
+        [Fact]
+        public async Task IncrementalCheckpointingResetWithEpochChangeTest()
+        {
+            // Test Description:
+            // In loop:
+            // Set epoch to new value
+            // Create checkpoint with data (files should not be reused from prior iteration)
+
+            var centralStoreConfiguration = new LocalDiskCentralStoreConfiguration(TestRootDirectoryPath / "centralstore", Guid.NewGuid().ToString());
+
+            var masterLeaseExpiryTime = TimeSpan.FromMinutes(3);
+
+            int iteration = 0;
+
+            ConfigureRocksDbContentLocationBasedTest(
+                configureInMemoryEventStore: true,
+                (index, testRootDirectory, config) =>
+                {
+                    config.Checkpoint = new CheckpointConfiguration(testRootDirectory)
+                    {
+                        Role = index == 0 ? Role.Master : Role.Worker,
+                        UseIncrementalCheckpointing = true,
+                        CreateCheckpointInterval = TimeSpan.FromMinutes(1),
+                        RestoreCheckpointInterval = TimeSpan.FromMinutes(1),
+                        HeartbeatInterval = Timeout.InfiniteTimeSpan,
+                        MasterLeaseExpiryTime = masterLeaseExpiryTime,
+                    };
+                    config.CentralStore = centralStoreConfiguration;
+                    config.EventStore.Epoch = $"Epoch:{iteration}";
+                });
+
+            long diff<TEnum>(CounterCollection<TEnum> c1, CounterCollection<TEnum> c2, TEnum name)
+                where TEnum : struct => c1[name].Value - c2[name].Value;
+
+            await RunTestAsync(
+                new Context(Logger),
+                iterations: 5,
+                storeCount: 2,
+                testFunc: async context =>
+                {
+                    // +1 because this value is not consumed until the next iteration
+                    iteration = context.Iteration + 1;
+
+                    var sessions = context.Sessions;
+
+                    var ls0 = context.GetLocationStore(0);
+                    var ls1 = context.GetLocationStore(1);
+
+                    var lls0 = context.GetLocalLocationStore(0);
+                    var lls1 = context.GetLocalLocationStore(1);
+
+                    // Machines must acquire role on startup
+                    Assert.True(lls0.CurrentRole != null);
+                    Assert.True(lls1.CurrentRole != null);
+
+                    // One of the machines must acquire the master role
+                    Assert.True(lls0.CurrentRole == Role.Master || lls1.CurrentRole == Role.Master);
+
+                    // One of the machines should be a worker (i.e. only one master is allowed)
+                    Assert.True(lls0.CurrentRole == Role.Worker || lls1.CurrentRole == Role.Worker);
+
+                    var masterRedisStore = lls0.CurrentRole == Role.Master ? ls0 : ls1;
+                    var workerRedisStore = lls0.CurrentRole == Role.Master ? ls1 : ls0;
+
+                    var masterCounters = masterRedisStore.LocalLocationStore.Counters.Snapshot();
+                    var workerCounters = workerRedisStore.LocalLocationStore.Counters.Snapshot();
+
+                    // Insert random file in session 0
+                    var putResult0 = await sessions[0].PutRandomAsync(context, ContentHashType, false, ContentByteCount, Token).ShouldBeSuccess();
+
+                    // Content should be available in session 0
+                    var masterResult = await masterRedisStore.GetBulkAsync(
+                    context,
+                    new[] { putResult0.ContentHash },
+                    Token,
+                    UrgencyHint.Nominal,
+                    GetBulkOrigin.Local).ShouldBeSuccess();
+                    masterResult.ContentHashesInfo[0].Locations.Should().NotBeEmpty();
+
+                    // Making sure that the data exists in the master session but not in the worker
+                    var workerResult = await workerRedisStore.GetBulkAsync(
+                    context,
+                    new[] { putResult0.ContentHash },
+                    Token,
+                    UrgencyHint.Nominal,
+                    GetBulkOrigin.Local).ShouldBeSuccess();
+                    workerResult.ContentHashesInfo[0].Locations.Should().BeNullOrEmpty();
+
+                    TestClock.UtcNow += TimeSpan.FromMinutes(2);
+                    TestClock.UtcNow += TimeSpan.FromMinutes(masterLeaseExpiryTime.TotalMinutes / 2);
+
+                    // Save checkpoint by heartbeating master
+                    await masterRedisStore.LocalLocationStore.HeartbeatAsync(context).ShouldBeSuccess();
+
+                    // Restore checkpoint by  heartbeating worker
+                    await workerRedisStore.LocalLocationStore.HeartbeatAsync(context).ShouldBeSuccess();
+
+                    // Files should be uploaded by master and downloaded by worker
+                    diff(masterRedisStore.LocalLocationStore.Counters, masterCounters, ContentLocationStoreCounters.IncrementalCheckpointFilesUploaded).Should().BePositive();
+                    diff(workerRedisStore.LocalLocationStore.Counters, workerCounters, ContentLocationStoreCounters.IncrementalCheckpointFilesDownloaded).Should().BePositive();
+
+                    if (context.Iteration != 0)
+                    {
+                        // No files should be reused since the epoch is changing
+                        diff(masterRedisStore.LocalLocationStore.Counters, masterCounters, ContentLocationStoreCounters.IncrementalCheckpointFilesUploadSkipped).Should().Be(0);
+                        diff(workerRedisStore.LocalLocationStore.Counters, workerCounters, ContentLocationStoreCounters.IncrementalCheckpointFilesDownloadSkipped).Should().Be(0);
+                    }
                 });
         }
 
@@ -1283,6 +1451,61 @@ namespace ContentStoreTest.Distributed.Sessions
                 });
         }
 
+        [Fact]
+        public async Task TestRegisterActions()
+        {
+            // This test validates that events (like add location/remove location) are properly generated
+            // based on the local location store's internal state and configuration.
+            // For instance, some events are skipped because they were added recently, and some events should be eager
+            // and the central store should be updated.
+            ConfigureWithOneMaster();
+
+            await RunTestAsync(
+                new Context(Logger),
+                3,
+                async context =>
+                {
+                    var sessions = context.Sessions;
+
+                    var workersSession = sessions[context.GetFirstWorkerIndex()];
+                    var worker = context.GetFirstWorker();
+
+                    // Insert random file to a worker.
+                    var worker1Lls = worker.LocalLocationStore;
+
+                    worker1Lls.Counters[ContentLocationStoreCounters.LocationAddEager].Value.Should().Be(0);
+                    var putResult0 = await workersSession.PutRandomAsync(context, ContentHashType, false, ContentByteCount, Token).ShouldBeSuccess();
+                    worker1Lls.Counters[ContentLocationStoreCounters.LocationAddEager].Value.Should().Be(1);
+
+                    var hashWithSize = new ContentHashWithSize(putResult0.ContentHash, putResult0.ContentSize);
+
+                    worker1Lls.Counters[ContentLocationStoreCounters.RedundantRecentLocationAddSkipped].Value.Should().Be(0);
+                    await worker1Lls.RegisterLocalLocationAsync(context, new[] { hashWithSize }).ThrowIfFailure();
+                    // Still should be one, because we just recently added the content.
+                    worker1Lls.Counters[ContentLocationStoreCounters.LocationAddEager].Value.Should().Be(1);
+                    worker1Lls.Counters[ContentLocationStoreCounters.RedundantRecentLocationAddSkipped].Value.Should().Be(1);
+
+                    // Force the roundtrip to get the locations on the worker.
+                    await UploadCheckpointOnMasterAndRestoreOnWorkers(context);
+
+                    TestClock.UtcNow += TimeSpan.FromHours(1.5);
+                    await worker.GetBulkLocalAsync(context, putResult0.ContentHash).ShouldBeSuccess();
+                    TestClock.UtcNow += TimeSpan.FromHours(1.5);
+
+                    // It was 3 hours since the content was added and 1.5h since the last touch.
+                    worker1Lls.Counters[ContentLocationStoreCounters.LazyTouchEventOnly].Value.Should().Be(0);
+                    await worker1Lls.RegisterLocalLocationAsync(context, new[] { hashWithSize }).ThrowIfFailure();
+                    worker1Lls.Counters[ContentLocationStoreCounters.LazyTouchEventOnly].Value.Should().Be(1);
+
+                    await worker.TrimBulkAsync(context, new[] { hashWithSize.Hash }, Token, UrgencyHint.Nominal).ThrowIfFailure();
+
+                    // We just removed the content, now, if we'll add it back, we should notify the global store eagerly.
+                    worker1Lls.Counters[ContentLocationStoreCounters.LocationAddRecentRemoveEager].Value.Should().Be(0);
+                    await worker1Lls.RegisterLocalLocationAsync(context, new[] { hashWithSize }).ThrowIfFailure();
+                    worker1Lls.Counters[ContentLocationStoreCounters.LocationAddRecentRemoveEager].Value.Should().Be(1);
+                });
+        }
+
         private static void CopyDirectory(string sourceRoot, string destinationRoot, bool overwriteExistingFiles = false)
         {
             sourceRoot = sourceRoot.TrimEnd('\\');
@@ -1343,7 +1566,6 @@ namespace ContentStoreTest.Distributed.Sessions
                     int pageNumber = 0;
                     int cumulativeCount = 0;
                     long lastTime = 0;
-                    long lastOriginalTime = 0;
                     HashSet<ContentHash> hashes = new HashSet<ContentHash>();
                     foreach (var page in master.GetLruPages(context, lruContent))
                     {
@@ -1353,10 +1575,9 @@ namespace ContentStoreTest.Distributed.Sessions
                         foreach (var item in page)
                         {
                             tracer.Debug($"{item}");
-                            tracer.Debug($"LTO: {item.LastAccessTime.Ticks - lastTime}, LOTO: {item.OriginalLastAccessTime.Ticks - lastOriginalTime}, IsDupe: {!hashes.Add(item.ContentHash)}");
+                            tracer.Debug($"LTO: {item.LastAccessTime.Ticks - lastTime}, LOTO: {item.LastAccessTime.Ticks - lastTime}, IsDupe: {!hashes.Add(item.ContentHash)}");
 
                             lastTime = item.LastAccessTime.Ticks;
-                            lastOriginalTime = item.OriginalLastAccessTime.Ticks;
                         }
                     }
 
@@ -1553,7 +1774,7 @@ namespace ContentStoreTest.Distributed.Sessions
                     var worker0 = context.GetFirstWorker();
                     var worker1 = context.EnumerateWorkers().ElementAt(1);
                     var workerSession = sessions[context.GetFirstWorkerIndex()];
-                    var workerContentStore = (IRepairStore)context.Stores[context.GetFirstWorkerIndex()];
+                    var workerContentStore = (IRepairStore)context.GetDistributedStore(context.GetFirstWorkerIndex());
                     var master = context.GetMaster();
 
                     // Insert random file in session 0
@@ -1589,6 +1810,8 @@ namespace ContentStoreTest.Distributed.Sessions
 
                     master.LocalLocationStore.Database.Counters[ContentLocationDatabaseCounters.TotalNumberOfCleanedEntries].Value.Should().Be(0, "No entries should be cleaned before GC is called");
                     master.LocalLocationStore.Database.Counters[ContentLocationDatabaseCounters.TotalNumberOfCollectedEntries].Value.Should().Be(0, "No entries should be cleaned before GC is called");
+
+                    master.LocalLocationStore.Database.ForceCacheFlush(context);
 
                     master.LocalLocationStore.Database.GarbageCollect(context);
 
@@ -1723,7 +1946,7 @@ namespace ContentStoreTest.Distributed.Sessions
                     config.CentralStore = centralStoreConfiguration;
 
                     config.CentralStore = new BlobCentralStoreConfiguration(
-                                              connectionString: storageConnectionString,
+                                              credentials: new AzureBlobStorageCredentials(storageConnectionString),
                                               containerName: "checkpointscontainer",
                                               checkpointsKey: checkpointsKey)
                     {
@@ -1900,13 +2123,13 @@ namespace ContentStoreTest.Distributed.Sessions
         }
 
         private static readonly TimeSpan LocalDatabaseEntryTimeToLive = TimeSpan.FromMinutes(3);
-        private const int SafeToLazilyUpdateMachineCountThreshold = 3;
-        private const int ReplicaCreditInMinutes = 3;
+        protected const int SafeToLazilyUpdateMachineCountThreshold = 3;
+        protected const int ReplicaCreditInMinutes = 3;
         protected bool _enableReconciliation;
-        private ContentLocationMode _readMode = ContentLocationMode.LocalLocationStore;
-        private ContentLocationMode _writeMode = ContentLocationMode.LocalLocationStore;
-        private bool _enableSecondaryRedis = false;
-        private AbsolutePath _testDatabasePath = null;
+        protected ContentLocationMode _readMode = ContentLocationMode.LocalLocationStore;
+        protected ContentLocationMode _writeMode = ContentLocationMode.LocalLocationStore;
+        protected bool _enableSecondaryRedis = false;
+        protected AbsolutePath _testDatabasePath = null;
 
         private RedisContentLocationStoreConfiguration CreateRedisContentLocationStoreConfiguration(
             AbsolutePath storeLocationRoot,
@@ -1917,7 +2140,7 @@ namespace ContentStoreTest.Distributed.Sessions
                 MachineExpiry = TimeSpan.FromMinutes(10),
                 EnableReconciliation = _enableReconciliation,
                 InlinePostInitialization = true,
-                ReplicaPenaltyInMinutes = ReplicaCreditInMinutes,
+                ContentLifetime = TimeSpan.FromMinutes(ReplicaCreditInMinutes),
 
                 // Set recompute time to zero to force recomputation on every heartbeat
                 RecomputeInactiveMachinesExpiry = TimeSpan.Zero,
@@ -1925,7 +2148,7 @@ namespace ContentStoreTest.Distributed.Sessions
                            new RocksDbContentLocationDatabaseConfiguration(storeLocationRoot / "rocksdb")
                            {
                                // Don't GC
-                               LocalDatabaseGarbageCollectionInterval = Timeout.InfiniteTimeSpan,
+                               GarbageCollectionInterval = Timeout.InfiniteTimeSpan,
                                TestInitialCheckpointPath = _testDatabasePath,
 
                            },
@@ -1941,13 +2164,13 @@ namespace ContentStoreTest.Distributed.Sessions
             };
         }
 
-        private void ConfigureRocksDbContentLocationBasedTest(bool configureInMemoryEventStore = false, Action<int, AbsolutePath, RedisContentLocationStoreConfiguration> configurationPostProcessor = null, bool configurePin = true)
+        private void ConfigureRocksDbContentLocationBasedTest(bool configureInMemoryEventStore = false, Action<int, AbsolutePath, RedisContentLocationStoreConfiguration> configurationPostProcessor = null, bool configurePin = true, AbsolutePath overrideContentLocationStoreDirectory = null)
         {
             var eventStoreConfiguration = configureInMemoryEventStore ? new MemoryContentLocationEventStoreConfiguration() : null;
             CreateContentLocationStoreConfiguration = (testRootDirectory, index) =>
             {
                 var result = CreateRedisContentLocationStoreConfiguration(
-                    testRootDirectory,
+                    overrideContentLocationStoreDirectory ?? testRootDirectory,
                     eventStoreConfiguration);
 
                 configurationPostProcessor?.Invoke(index, testRootDirectory, result);
@@ -2045,6 +2268,508 @@ namespace ContentStoreTest.Distributed.Sessions
 
             Output.WriteLine("The test is configured correctly.");
             return true;
+        }
+
+        [Fact(Skip = "For manual testing only. Requires storage account credentials")]
+        public async Task BlobCentralStorageCredentialsUpdate()
+        {
+            var testBasePath = FileSystem.GetTempPath();
+            var containerName = "checkpoints";
+            var checkpointsKey = "checkpoints-eventhub";
+
+            if (!ReadConfiguration(out var storageAccountKey, out var storageAccountName, out var eventHubConnectionString, out var eventHubName))
+            {
+                Output.WriteLine("The test is skipped due to misconfiguration.");
+                return;
+            }
+
+            var credentials = new StorageCredentials(storageAccountName, storageAccountKey);
+            var account = new CloudStorageAccount(credentials, storageAccountName, endpointSuffix: null, useHttps: true);
+
+            var sasToken = account.GetSharedAccessSignature(new SharedAccessAccountPolicy
+            {
+                SharedAccessExpiryTime = DateTimeOffset.UtcNow + TimeSpan.FromMinutes(5),
+                Permissions = SharedAccessAccountPermissions.None,
+                Services = SharedAccessAccountServices.Blob,
+                ResourceTypes = SharedAccessAccountResourceTypes.Object,
+                Protocols = SharedAccessProtocol.HttpsOnly
+            });
+            var blobStoreCredentials = new StorageCredentials(sasToken);
+
+            var blobCentralStoreConfiguration = new BlobCentralStoreConfiguration(
+                new AzureBlobStorageCredentials(blobStoreCredentials, storageAccountName, endpointSuffix: null),
+                containerName,
+                checkpointsKey);
+            var blobCentralStore = new BlobCentralStorage(blobCentralStoreConfiguration);
+
+            var operationContext = new BuildXL.Cache.ContentStore.Tracing.Internal.OperationContext(new Context(Logger));
+
+            // Attempt a get of an inexistent file. It should fail due to permissions.
+            var forbiddenReadResult = await blobCentralStore.TryGetFileAsync(operationContext,
+                "fail",
+                AbsolutePath.CreateRandomFileName(testBasePath));
+            forbiddenReadResult.ShouldBeError("(403) Forbidden");
+
+            // Update the token, this would usually be done by the secret store.
+            var sasTokenWithReadPermission = account.GetSharedAccessSignature(new SharedAccessAccountPolicy
+            {
+                SharedAccessExpiryTime = DateTimeOffset.UtcNow + TimeSpan.FromMinutes(5),
+                Permissions = SharedAccessAccountPermissions.Read | SharedAccessAccountPermissions.List,
+                Services = SharedAccessAccountServices.Blob,
+                ResourceTypes = SharedAccessAccountResourceTypes.Object,
+                Protocols = SharedAccessProtocol.HttpsOnly
+            });
+            blobStoreCredentials.UpdateSASToken(sasTokenWithReadPermission);
+
+            // Attempt a get of an inexistent file. It should fail due to it not existing.
+            var allowedReadResult = await blobCentralStore.TryGetFileAsync(operationContext,
+                "fail",
+                AbsolutePath.CreateRandomFileName(testBasePath));
+            allowedReadResult.ShouldBeError(@"Checkpoint blob 'checkpoints\fail' does not exist in shard #0.");
+        }
+
+        [Fact(Skip = "For manual usage only")]
+        public async Task MultiThreadedStressTestRocksDbContentLocationDatabaseOnNewEntries()
+        {
+            bool useIncrementalCheckpointing = true;
+            int numberOfMachines = 100;
+            int addsPerMachine = 25000;
+            int maximumBatchSize = 1000;
+            int warmupBatches = 10000;
+
+            var centralStoreConfiguration = new LocalDiskCentralStoreConfiguration(TestRootDirectoryPath / "centralstore", Guid.NewGuid().ToString());
+            var masterLeaseExpiryTime = TimeSpan.FromMinutes(3);
+
+            MemoryContentLocationEventStoreConfiguration memoryContentLocationEventStore = null;
+            ConfigureRocksDbContentLocationBasedTest(
+                configureInMemoryEventStore: true,
+                (index, testRootDirectory, config) =>
+                {
+                    config.Checkpoint = new CheckpointConfiguration(testRootDirectory)
+                    {
+                        /* Set role to null to automatically choose role using master election */
+                        Role = null,
+                        UseIncrementalCheckpointing = useIncrementalCheckpointing,
+                        CreateCheckpointInterval = TimeSpan.FromMinutes(1),
+                        RestoreCheckpointInterval = TimeSpan.FromMinutes(1),
+                        HeartbeatInterval = Timeout.InfiniteTimeSpan,
+                        MasterLeaseExpiryTime = masterLeaseExpiryTime
+                    };
+                    config.CentralStore = centralStoreConfiguration;
+                    memoryContentLocationEventStore = (MemoryContentLocationEventStoreConfiguration)config.EventStore;
+                });
+
+            var events = GenerateAddEvents(numberOfMachines, addsPerMachine, maximumBatchSize);
+
+            await RunTestAsync(
+                new Context(Logger),
+                2,
+                async context =>
+                {
+                    var master = context.GetMaster();
+                    var sessions = context.Sessions;
+                    Warmup(context, maximumBatchSize, warmupBatches);
+                    context.GetMaster().LocalLocationStore.Database.ForceCacheFlush(context);
+                    PrintCacheStatistics(context);
+
+                    {
+                        var stopWatch = new Stopwatch();
+                        Output.WriteLine("[Benchmark] Starting in 5s (use this when analyzing with dotTrace)");
+                        await Task.Delay(5000);
+
+                        // Benchmark
+                        stopWatch.Restart();
+                        Parallel.ForEach(Enumerable.Range(0, numberOfMachines), machineId =>
+                        {
+                            var eventHub = memoryContentLocationEventStore.Hub;
+
+                            foreach (var ev in events[machineId])
+                            {
+                                context.SendEventToMaster(ev);
+                            }
+                        });
+                        context.GetMaster().LocalLocationStore.Database.ForceCacheFlush(context);
+                        stopWatch.Stop();
+
+                        var ts = stopWatch.Elapsed;
+                        var elapsedTime = string.Format("{0:00}:{1:00}:{2:00}.{3:00}",
+                            ts.Hours, ts.Minutes, ts.Seconds,
+                            ts.Milliseconds / 10);
+                        Output.WriteLine("[Benchmark] Total Time: " + ts);
+                    }
+
+                    PrintCacheStatistics(context);
+                    await Task.Delay(5000);
+                });
+        }
+
+        private void Warmup(TestContext context, int maximumBatchSize, int warmupBatches)
+        {
+            Output.WriteLine("[Warmup] Starting");
+            var warmupRng = new Random(Environment.TickCount);
+
+            var stopWatch = new Stopwatch();
+            stopWatch.Start();
+            foreach (var _ in Enumerable.Range(0, warmupBatches))
+            {
+                var machineId = new MachineId(warmupRng.Next());
+                var batch = Enumerable.Range(0, maximumBatchSize).Select(x => new ShortHash(ContentHash.Random())).ToList();
+                context.SendEventToMaster(new RemoveContentLocationEventData(machineId, batch));
+            }
+            stopWatch.Stop();
+
+            var ts = stopWatch.Elapsed;
+            var elapsedTime = string.Format("{0:00}:{1:00}:{2:00}.{3:00}",
+                ts.Hours, ts.Minutes, ts.Seconds,
+                ts.Milliseconds / 10);
+            Output.WriteLine("[Warmup] Total Time: " + ts);
+        }
+
+        private static List<List<ContentLocationEventData>> GenerateAddEvents(int numberOfMachines, int addsPerMachine, int maximumBatchSize)
+        {
+            var randomSeed = Environment.TickCount;
+            var events = new List<List<ContentLocationEventData>>(numberOfMachines);
+            events.AddRange(Enumerable.Range(0, numberOfMachines).Select(x => (List<ContentLocationEventData>)null));
+
+            Parallel.ForEach(Enumerable.Range(0, numberOfMachines), machineId =>
+            {
+                var machineIdObject = new MachineId(machineId);
+                var rng = new Random(Interlocked.Increment(ref randomSeed));
+
+                var addedContent = Enumerable.Range(0, addsPerMachine).Select(_ => ContentHash.Random()).ToList();
+
+                var machineEvents = new List<ContentLocationEventData>();
+                for (var pendingHashes = addedContent.Count; pendingHashes > 0;)
+                {
+                    // Add the hashes in random batches
+                    var batchSize = rng.Next(1, Math.Min(maximumBatchSize, pendingHashes));
+                    var batch = addedContent.GetRange(addedContent.Count - pendingHashes, batchSize).Select(hash => new ShortHashWithSize(new ShortHash(hash), 200)).ToList();
+                    machineEvents.Add(new AddContentLocationEventData(machineIdObject, batch));
+                    pendingHashes -= batchSize;
+                }
+                events[machineId] = machineEvents;
+            });
+
+            return events;
+        }
+
+        [Fact(Skip = "For manual usage only")]
+        public async Task MultiThreadedStressTestRocksDbContentLocationDatabaseOnMixedAddAndDelete()
+        {
+            bool useIncrementalCheckpointing = true;
+            int numberOfMachines = 100;
+            int deletesPerMachine = 25000;
+            int maximumBatchSize = 2000;
+            int warmupBatches = 10000;
+
+            var centralStoreConfiguration = new LocalDiskCentralStoreConfiguration(TestRootDirectoryPath / "centralstore", Guid.NewGuid().ToString());
+            var masterLeaseExpiryTime = TimeSpan.FromMinutes(3);
+
+            MemoryContentLocationEventStoreConfiguration memoryContentLocationEventStore = null;
+            ConfigureRocksDbContentLocationBasedTest(
+                configureInMemoryEventStore: true,
+                (index, testRootDirectory, config) =>
+                {
+                    config.Checkpoint = new CheckpointConfiguration(testRootDirectory)
+                    {
+                        /* Set role to null to automatically choose role using master election */
+                        Role = null,
+                        UseIncrementalCheckpointing = useIncrementalCheckpointing,
+                        CreateCheckpointInterval = TimeSpan.FromMinutes(1),
+                        RestoreCheckpointInterval = TimeSpan.FromMinutes(1),
+                        HeartbeatInterval = Timeout.InfiniteTimeSpan,
+                        MasterLeaseExpiryTime = masterLeaseExpiryTime
+                    };
+                    config.CentralStore = centralStoreConfiguration;
+                    memoryContentLocationEventStore = (MemoryContentLocationEventStoreConfiguration)config.EventStore;
+                });
+
+            var events = GenerateMixedAddAndDeleteEvents(numberOfMachines, deletesPerMachine, maximumBatchSize);
+
+            await RunTestAsync(
+                new Context(Logger),
+                2,
+                async context =>
+                {
+                    var sessions = context.Sessions;
+                    var master = context.GetMaster();
+                    Warmup(context, maximumBatchSize, warmupBatches);
+                    context.GetMaster().LocalLocationStore.Database.ForceCacheFlush(context);
+                    PrintCacheStatistics(context);
+
+                    {
+                        var stopWatch = new Stopwatch();
+                        Output.WriteLine("[Benchmark] Starting in 5s (use this when analyzing with dotTrace)");
+                        await Task.Delay(5000);
+
+                        // Benchmark
+                        stopWatch.Restart();
+                        Parallel.ForEach(Enumerable.Range(0, numberOfMachines), machineId =>
+                        {
+                            var eventHub = memoryContentLocationEventStore.Hub;
+
+                            foreach (var ev in events[machineId])
+                            {
+                                context.SendEventToMaster(ev);
+                            }
+                        });
+                        context.GetMaster().LocalLocationStore.Database.ForceCacheFlush(context);
+                        stopWatch.Stop();
+
+                        var ts = stopWatch.Elapsed;
+                        var elapsedTime = string.Format("{0:00}:{1:00}:{2:00}.{3:00}",
+                            ts.Hours, ts.Minutes, ts.Seconds,
+                            ts.Milliseconds / 10);
+                        Output.WriteLine("[Benchmark] Total Time: " + ts);
+
+                        PrintCacheStatistics(context);
+                    }
+
+                    await Task.Delay(5000);
+                });
+        }
+
+        private class FstComparer<T> : IComparer<(int, T)>
+        {
+            public int Compare((int, T) x, (int, T) y)
+            {
+                return x.Item1.CompareTo(y.Item1);
+            }
+        }
+
+        private static List<List<ContentLocationEventData>> GenerateMixedAddAndDeleteEvents(int numberOfMachines, int deletesPerMachine, int maximumBatchSize)
+        {
+            var randomSeed = Environment.TickCount;
+
+            var events = new List<List<ContentLocationEventData>>(numberOfMachines);
+            events.AddRange(Enumerable.Range(0, numberOfMachines).Select(x => (List<ContentLocationEventData>)null));
+
+            Parallel.ForEach(Enumerable.Range(0, numberOfMachines), machineId =>
+            {
+                var machineIdObject = new MachineId(machineId);
+                var rng = new Random(Interlocked.Increment(ref randomSeed));
+
+                // We want deletes to be performed in any arbitrary order, so the first in the pair is a random integer
+                // This distribution is obviously not uniform at the end, but it doesn't matter, all we want is for
+                // add -> delete pairs not to be contiguous.
+                var addedPool = new BuildXL.Cache.ContentStore.Utils.PriorityQueue<(int, ShortHash)>(deletesPerMachine, new FstComparer<ShortHash>());
+
+                var machineEvents = new List<ContentLocationEventData>();
+                var totalAddsPerfomed = 0;
+                // We can only delete after we have added, so we only reach the condition at the end
+                for (var totalDeletesPerformed = 0; totalDeletesPerformed < deletesPerMachine;)
+                {
+                    bool addEnabled = totalAddsPerfomed < deletesPerMachine;
+                    // We can only delete when it is causally consistent to do so
+                    bool deleteEnabled = totalDeletesPerformed < deletesPerMachine && addedPool.Count > 0;
+                    bool performDelete = deleteEnabled && rng.Next(0, 10) > 8 || !addEnabled;
+
+                    if (performDelete)
+                    {
+                        var batchSize = Math.Min(deletesPerMachine - totalDeletesPerformed, addedPool.Count);
+                        batchSize = rng.Next(1, batchSize);
+                        batchSize = Math.Min(batchSize, maximumBatchSize);
+
+                        var batch = new List<ShortHash>(batchSize);
+                        foreach (var _ in Enumerable.Range(0, batchSize))
+                        {
+                            var shortHash = addedPool.Top.Item2;
+                            addedPool.Pop();
+                            batch.Add(shortHash);
+                        }
+
+                        machineEvents.Add(new RemoveContentLocationEventData(machineIdObject, batch));
+                        totalDeletesPerformed += batch.Count;
+                    }
+                    else
+                    {
+                        var batchSize = Math.Min(deletesPerMachine - totalAddsPerfomed, maximumBatchSize);
+                        batchSize = rng.Next(1, batchSize);
+
+                        var batch = new List<ShortHashWithSize>(batchSize);
+                        foreach (var x in Enumerable.Range(0, batchSize))
+                        {
+                            var shortHash = new ShortHash(ContentHash.Random());
+                            batch.Add(new ShortHashWithSize(shortHash, 200));
+                            addedPool.Push((rng.Next(), shortHash));
+                        }
+
+                        machineEvents.Add(new AddContentLocationEventData(machineIdObject, batch));
+                        totalAddsPerfomed += batch.Count;
+                    }
+                }
+
+                events[machineId] = machineEvents;
+            });
+
+            return events;
+        }
+
+        [Fact(Skip = "For manual usage only")]
+        public async Task MultiThreadedStressTestRocksDbContentLocationDatabaseOnUniqueAddsWithCacheHit()
+        {
+            bool useIncrementalCheckpointing = true;
+            int warmupBatches = 10000;
+            int numberOfMachines = 100;
+            int operationsPerMachine = 25000;
+            float cacheHitRatio = 0.5f;
+            int maximumBatchSize = 1000;
+
+            var centralStoreConfiguration = new LocalDiskCentralStoreConfiguration(TestRootDirectoryPath / "centralstore", Guid.NewGuid().ToString());
+            var masterLeaseExpiryTime = TimeSpan.FromMinutes(3);
+
+            MemoryContentLocationEventStoreConfiguration memoryContentLocationEventStore = null;
+            ConfigureRocksDbContentLocationBasedTest(
+                configureInMemoryEventStore: true,
+                (index, testRootDirectory, config) =>
+                {
+                    config.Checkpoint = new CheckpointConfiguration(testRootDirectory)
+                    {
+                        /* Set role to null to automatically choose role using master election */
+                        Role = null,
+                        UseIncrementalCheckpointing = useIncrementalCheckpointing,
+                        CreateCheckpointInterval = TimeSpan.FromMinutes(1),
+                        RestoreCheckpointInterval = TimeSpan.FromMinutes(1),
+                        HeartbeatInterval = Timeout.InfiniteTimeSpan,
+                        MasterLeaseExpiryTime = masterLeaseExpiryTime
+                    };
+                    config.CentralStore = centralStoreConfiguration;
+                    memoryContentLocationEventStore = (MemoryContentLocationEventStoreConfiguration)config.EventStore;
+                });
+
+            var events = GenerateUniquenessWorkload(numberOfMachines, cacheHitRatio, maximumBatchSize, operationsPerMachine, randomSeedOverride: 42);
+
+            await RunTestAsync(
+                new Context(Logger),
+                2,
+                async context =>
+                {
+                    var sessions = context.Sessions;
+                    var master = context.GetMaster();
+                    Warmup(context, maximumBatchSize, warmupBatches);
+                    context.GetMaster().LocalLocationStore.Database.ForceCacheFlush(context);
+                    PrintCacheStatistics(context);
+
+                    {
+                        var stopWatch = new Stopwatch();
+                        Output.WriteLine("[Benchmark] Starting in 5s (use this when analyzing with dotTrace)");
+                        await Task.Delay(5000);
+
+                        // Benchmark
+                        stopWatch.Restart();
+                        Parallel.ForEach(Enumerable.Range(0, numberOfMachines), machineId =>
+                        {
+                            var eventHub = memoryContentLocationEventStore.Hub;
+
+                            foreach (var ev in events[machineId])
+                            {
+                                context.SendEventToMaster(ev);
+                            }
+                        });
+                        context.GetMaster().LocalLocationStore.Database.ForceCacheFlush(context);
+                        stopWatch.Stop();
+
+                        var ts = stopWatch.Elapsed;
+                        var elapsedTime = string.Format("{0:00}:{1:00}:{2:00}.{3:00}",
+                            ts.Hours, ts.Minutes, ts.Seconds,
+                            ts.Milliseconds / 10);
+                        Output.WriteLine("[Benchmark] Total Time: " + ts);
+
+                        PrintCacheStatistics(context);
+                    }
+
+                    await Task.Delay(5000);
+                });
+        }
+
+        private void PrintCacheStatistics(TestContext context)
+        {
+            var db = context.GetMaster().LocalLocationStore.Database;
+            var counters = db.Counters;
+
+            if (db.IsInMemoryCacheEnabled)
+            {
+                Output.WriteLine("CACHE ENABLED");
+            }
+            else
+            {
+                Output.WriteLine("CACHE DISABLED");
+            }
+
+            Output.WriteLine("[Statistics] NumberOfStoreOperations: " + counters[ContentLocationDatabaseCounters.NumberOfStoreOperations].ToString());
+            Output.WriteLine("[Statistics] NumberOfGetOperations: " + counters[ContentLocationDatabaseCounters.NumberOfGetOperations].ToString());
+            Output.WriteLine("[Statistics] TotalNumberOfCacheHit: " + counters[ContentLocationDatabaseCounters.TotalNumberOfCacheHit].ToString());
+            Output.WriteLine("[Statistics] TotalNumberOfCacheMiss: " + counters[ContentLocationDatabaseCounters.TotalNumberOfCacheMiss].ToString());
+            var totalCacheRequests = counters[ContentLocationDatabaseCounters.TotalNumberOfCacheHit].Value + counters[ContentLocationDatabaseCounters.TotalNumberOfCacheMiss].Value;
+            if (totalCacheRequests > 0)
+            {
+                double cacheHitRate = ((double)counters[ContentLocationDatabaseCounters.TotalNumberOfCacheHit].Value) / ((double)totalCacheRequests);
+                Output.WriteLine("[Statistics] Cache Hit Rate: " + cacheHitRate.ToString());
+            }
+
+            Output.WriteLine("[Statistics] NumberOfPersistedEntries: " + counters[ContentLocationDatabaseCounters.NumberOfPersistedEntries].ToString());
+            Output.WriteLine("[Statistics] TotalNumberOfCacheFlushes: " + counters[ContentLocationDatabaseCounters.TotalNumberOfCacheFlushes].ToString());
+            Output.WriteLine("[Statistics] NumberOfCacheFlushesTriggeredByUpdates: " + counters[ContentLocationDatabaseCounters.NumberOfCacheFlushesTriggeredByUpdates].ToString());
+            Output.WriteLine("[Statistics] NumberOfCacheFlushesTriggeredByTimer: " + counters[ContentLocationDatabaseCounters.NumberOfCacheFlushesTriggeredByTimer].ToString());
+            Output.WriteLine("[Statistics] NumberOfCacheFlushesTriggeredByGarbageCollection: " + counters[ContentLocationDatabaseCounters.NumberOfCacheFlushesTriggeredByGarbageCollection].ToString());
+            Output.WriteLine("[Statistics] NumberOfCacheFlushesTriggeredByCheckpoint: " + counters[ContentLocationDatabaseCounters.NumberOfCacheFlushesTriggeredByCheckpoint].ToString());
+
+            Output.WriteLine("[Statistics] CacheFlush: " + counters[ContentLocationDatabaseCounters.CacheFlush].ToString());
+        }
+
+        private static List<List<ContentLocationEventData>> GenerateUniquenessWorkload(int numberOfMachines, float cacheHitRatio, int maximumBatchSize, int operationsPerMachine, int? randomSeedOverride = null)
+        {
+            var randomSeed = randomSeedOverride ?? Environment.TickCount;
+
+            var events = new List<List<ContentLocationEventData>>(numberOfMachines);
+            events.AddRange(Enumerable.Range(0, numberOfMachines).Select(x => (List<ContentLocationEventData>)null));
+
+            var cacheHitHashPool = new ConcurrentBigSet<ShortHash>();
+            Parallel.ForEach(Enumerable.Range(0, numberOfMachines), machineId =>
+            {
+                var machineIdObject = new MachineId(machineId);
+                var rng = new Random(Interlocked.Increment(ref randomSeed));
+
+                var machineEvents = new List<ContentLocationEventData>();
+                for (var operations = 0; operations < operationsPerMachine;)
+                {
+                    // Done this way to ensure batches don't get progressively smaller and hog memory
+                    var batchSize = rng.Next(1, maximumBatchSize);
+                    batchSize = Math.Min(batchSize, operationsPerMachine - operations);
+
+                    var hashes = new List<ShortHashWithSize>();
+                    while (hashes.Count < batchSize)
+                    {
+                        var shouldHitCache = rng.NextDouble() < cacheHitRatio;
+
+                        ShortHash hashToUse;
+                        if (cacheHitHashPool.Count > 0 && shouldHitCache)
+                        {
+                            // Since this set is grow-only, this should always work
+                            hashToUse = cacheHitHashPool[rng.Next(0, cacheHitHashPool.Count)];
+                        }
+                        else
+                        {
+                            do
+                            {
+                                hashToUse = new ShortHash(ContentHash.Random());
+                            } while (cacheHitHashPool.Contains(hashToUse) || !cacheHitHashPool.Add(hashToUse));
+                        }
+
+                        hashes.Add(new ShortHashWithSize(hashToUse, 200));
+                    }
+
+                    machineEvents.Add(new AddContentLocationEventData(
+                        machineIdObject,
+                        hashes));
+
+                    operations += batchSize;
+                }
+
+                events[machineId] = machineEvents;
+            });
+
+            return events;
         }
     }
 }

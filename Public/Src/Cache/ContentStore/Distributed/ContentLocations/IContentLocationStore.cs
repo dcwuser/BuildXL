@@ -109,6 +109,16 @@ namespace BuildXL.Cache.ContentStore.Distributed
         /// Gets the max size for blobs.
         /// </summary>
         long MaxBlobSize { get; }
+
+        /// <summary>
+        /// Reports about new reputation for a given location.
+        /// </summary>
+        void ReportReputation(MachineLocation location, MachineReputation reputation);
+
+        /// <summary>
+        /// Returns a random machine location, excluding the specified location. Returns default if operation is not possible.
+        /// </summary>
+        Result<MachineLocation> GetRandomMachineLocation(IReadOnlyList<MachineLocation> except);
     }
 
     /// <summary>

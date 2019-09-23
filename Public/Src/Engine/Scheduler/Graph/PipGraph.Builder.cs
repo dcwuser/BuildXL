@@ -194,7 +194,9 @@ namespace BuildXL.Scheduler.Graph
                 m_untrackedPathsAndScopes = new ConcurrentBigMap<AbsolutePath, PipId>();
                 m_sourceFiles = new ConcurrentBigMap<AbsolutePath, PipId>();
 
-                m_lazyApiServerMoniker = Lazy.Create(() => IpcFactory.GetProvider().CreateNewMoniker());
+                m_lazyApiServerMoniker = configuration.Schedule.UseFixedApiServerMoniker
+                    ? Lazy.Create(() => IpcFactory.GetFixedMoniker())
+                    : Lazy.Create(() => IpcFactory.GetProvider().CreateNewMoniker());
 
                 LockManager = new LockManager();
 
@@ -235,7 +237,7 @@ namespace BuildXL.Scheduler.Graph
 
                     if (!IsImmutable)
                     {
-                        StringId apiServerMonikerId = m_lazyApiServerMoniker.IsValueCreated
+                        StringId apiServerMonikerId = m_lazyApiServerMoniker.IsValueCreated || m_servicePipToServiceInfoMap.Count > 0
                             ? StringId.Create(Context.StringTable, m_lazyApiServerMoniker.Value.Id)
                             : StringId.Invalid;
 
@@ -1168,6 +1170,8 @@ namespace BuildXL.Scheduler.Graph
                 var semanticPathExpander = SemanticPathExpander.GetModuleExpander(process.Provenance.ModuleId);
                 dependenciesByPath = new Dictionary<AbsolutePath, FileArtifact>(process.Dependencies.Length);
                 outputsByPath = new Dictionary<AbsolutePath, FileArtifact>(process.FileOutputs.Length);
+                var outputDirectorySet = new HashSet<AbsolutePath>();
+
 
                 // Process dependencies.
                 foreach (FileArtifact dependency in process.Dependencies)
@@ -1204,7 +1208,7 @@ namespace BuildXL.Scheduler.Graph
                 }
 
                 // Process outputs
-                
+
                 // Every pip must have at least one output artifact
                 if (process.FileOutputs.Length == 0 && process.DirectoryOutputs.Length == 0)
                 {
@@ -1279,6 +1283,8 @@ namespace BuildXL.Scheduler.Graph
                     {
                         return false;
                     }
+
+                    outputDirectorySet.Add(directory.Path);
                 }
 
                 // TODO: no explicit inputs are allowed in OD dependencies.
@@ -1302,6 +1308,24 @@ namespace BuildXL.Scheduler.Graph
                 {
                     LogEventWithPipProvenance(Logger.ScheduleFailAddPipDueToInvalidServicePipDependency, process);
                     return false;
+                }
+
+                if (process.PreserveOutputWhitelist.IsValid && process.PreserveOutputWhitelist.Length > 0)
+                {
+                    if (!process.AllowPreserveOutputs)
+                    {
+                        LogEventWithPipProvenance(Logger.ScheduleFailAddPipDueToInvalidAllowPreserveOutputsFlag, process);
+                        return false;
+                    }
+
+                    foreach (var whitelistPath in process.PreserveOutputWhitelist)
+                    {
+                        if (!outputsByPath.ContainsKey(whitelistPath) && !outputDirectorySet.Contains(whitelistPath))
+                        {
+                            LogEventWithPipProvenance(Logger.ScheduleFailAddPipDueToInvalidPreserveOutputWhitelist, process);
+                            return false;
+                        }
+                    }
                 }
 
                 Contract.Assert(
@@ -1446,9 +1470,12 @@ namespace BuildXL.Scheduler.Graph
                 }
                 else
                 {
-                    Contract.Assume(
-                        !input.IsOutputFile,
-                        "Output artifact has no producer. This should be impossible by construction, since creating an output file artifact is supposed to require scheduling a producer.");
+                    if (input.IsOutputFile)
+                    {
+                        Contract.Assert(
+                            false,
+                            I($"Output artifact '{input.Path.ToString(Context.PathTable)}' has no producer. This should be impossible by construction, since creating an output file artifact is supposed to require scheduling a producer."));
+                    }
                 }
 
                 return true;
@@ -2880,9 +2907,19 @@ namespace BuildXL.Scheduler.Graph
 
                 string fingerprintText = null;
 
-                ContentFingerprint fingerprint = m_pipStaticFingerprinter.FingerprintTextEnabled
-                    ? m_pipStaticFingerprinter.ComputeWeakFingerprint(pip, out fingerprintText)
-                    : m_pipStaticFingerprinter.ComputeWeakFingerprint(pip);
+                ContentFingerprint fingerprint;
+                if (m_pipStaticFingerprinter.FingerprintTextEnabled)
+                {
+                    fingerprint = m_pipStaticFingerprinter.ComputeWeakFingerprint(pip, out fingerprintText);
+                }
+                else if (pip.StaticFingerprint.Length > 0)
+                {
+                    fingerprint = new ContentFingerprint(pip.StaticFingerprint);
+                }
+                else
+                {
+                    fingerprint = m_pipStaticFingerprinter.ComputeWeakFingerprint(pip);
+                }
 
                 m_pipStaticFingerprints.AddFingerprint(pip, fingerprint);
 

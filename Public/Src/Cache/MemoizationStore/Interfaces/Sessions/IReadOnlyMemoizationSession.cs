@@ -1,6 +1,8 @@
 // Copyright (c) Microsoft. All rights reserved.
 // Licensed under the MIT license. See LICENSE file in the project root for full license information.
 
+extern alias Async;
+
 using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
@@ -20,7 +22,7 @@ namespace BuildXL.Cache.MemoizationStore.Interfaces.Sessions
         /// <summary>
         /// Gets known selectors for a given weak fingerprint.
         /// </summary>
-        IAsyncEnumerable<GetSelectorResult> GetSelectors(
+        Async::System.Collections.Generic.IAsyncEnumerable<GetSelectorResult> GetSelectors(
             Context context,
             Fingerprint weakFingerprint,
             CancellationToken cts,
@@ -40,7 +42,14 @@ namespace BuildXL.Cache.MemoizationStore.Interfaces.Sessions
     /// <summary>
     /// A related set of read accesses to a cache with support for multi-level GetSelectors.
     /// </summary>
-    public interface IReadOnlyMemoizationSessionWithLevelSelectors : IReadOnlyMemoizationSession
+    public interface IReadOnlyMemoizationSessionWithLevelSelectors : IReadOnlyMemoizationSession, ILevelSelectorsProvider
+    {
+    }
+
+    /// <summary>
+    /// A related set of read accesses to a cache with support for multi-level GetSelectors.
+    /// </summary>
+    public interface ILevelSelectorsProvider
     {
         /// <summary>
         /// Gets known selectors for a given weak fingerprint for a given "level".

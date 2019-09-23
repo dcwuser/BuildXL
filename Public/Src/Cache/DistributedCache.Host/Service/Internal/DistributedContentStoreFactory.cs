@@ -6,7 +6,6 @@ using System.Collections.Generic;
 using System.Diagnostics.ContractsLight;
 using System.Linq;
 using System.Text;
-using System.Threading;
 using System.Threading.Tasks;
 using BuildXL.Cache.ContentStore.Distributed;
 using BuildXL.Cache.ContentStore.Distributed.NuCache;
@@ -19,12 +18,17 @@ using BuildXL.Cache.ContentStore.Hashing;
 using BuildXL.Cache.ContentStore.Interfaces.Distributed;
 using BuildXL.Cache.ContentStore.Interfaces.FileSystem;
 using BuildXL.Cache.ContentStore.Interfaces.Logging;
+using BuildXL.Cache.ContentStore.Interfaces.Results;
 using BuildXL.Cache.ContentStore.Interfaces.Stores;
 using BuildXL.Cache.ContentStore.Interfaces.Time;
+using BuildXL.Cache.ContentStore.Interfaces.Tracing;
 using BuildXL.Cache.ContentStore.Stores;
 using BuildXL.Cache.ContentStore.Utils;
 using BuildXL.Cache.Host.Configuration;
+using BuildXL.Cache.MemoizationStore.Distributed.Stores;
+using BuildXL.Cache.MemoizationStore.Interfaces.Stores;
 using Microsoft.Practices.TransientFaultHandling;
+using Microsoft.WindowsAzure.Storage.Auth;
 
 namespace BuildXL.Cache.Host.Service.Internal
 {
@@ -33,6 +37,7 @@ namespace BuildXL.Cache.Host.Service.Internal
         private readonly RedisContentSecretNames _redisContentSecretNames;
         private readonly string _keySpace;
         private readonly IAbsFileSystem _fileSystem;
+        private readonly DistributedCacheSecretRetriever _secretRetriever;
         private readonly ILogger _logger;
 
         private readonly DistributedContentSettings _distributedSettings;
@@ -42,7 +47,8 @@ namespace BuildXL.Cache.Host.Service.Internal
 
         public DistributedContentStoreFactory(
             DistributedCacheServiceArguments arguments,
-            RedisContentSecretNames redisContentSecretNames)
+            RedisContentSecretNames redisContentSecretNames,
+            DistributedCacheSecretRetriever secretRetriever)
         {
             _logger = arguments.Logger;
             _arguments = arguments;
@@ -50,28 +56,23 @@ namespace BuildXL.Cache.Host.Service.Internal
             _distributedSettings = arguments.Configuration.DistributedContentSettings;
             _keySpace = string.IsNullOrWhiteSpace(_arguments.Keyspace) ? RedisContentLocationStoreFactory.DefaultKeySpace : _arguments.Keyspace;
             _fileSystem = new PassThroughFileSystem(_logger);
+            _secretRetriever = secretRetriever;
         }
 
-        public IContentStore CreateContentStore(
-            AbsolutePath localCacheRoot,
-            NagleQueue<ContentHash> evictionAnnouncer = null,
-            ProactiveReplicationArgs replicationSettings = null,
-            DistributedEvictionSettings distributedEvictionSettings = null,
-            bool checkLocalFiles = true,
-            TrimBulkAsync trimBulkAsync = null)
+        public RedisMemoizationStoreFactory CreateRedisCacheFactory(AbsolutePath localCacheRoot, out RedisContentLocationStoreConfiguration config)
         {
-            var contentConnectionStringProvider = new HostConnectionStringProvider(_arguments.Host, _redisContentSecretNames.RedisContentSecretName, _logger);
-            var machineLocationsConnectionStringProvider = new HostConnectionStringProvider(_arguments.Host, _redisContentSecretNames.RedisMachineLocationsSecretName, _logger);
-
-            var redisContentLocationStoreConfiguration = new RedisContentLocationStoreConfiguration
+            var redisContentLocationStoreConfiguration = new RedisMemoizationStoreConfiguration
             {
                 RedisBatchPageSize = _distributedSettings.RedisBatchPageSize,
                 BlobExpiryTimeMinutes = _distributedSettings.BlobExpiryTimeMinutes,
                 MaxBlobCapacity = _distributedSettings.MaxBlobCapacity,
-                MaxBlobSize = _distributedSettings.MaxBlobSize
+                MaxBlobSize = _distributedSettings.MaxBlobSize,
+                EvictionWindowSize = _distributedSettings.EvictionWindowSize,
+                MemoizationExpiryTime = TimeSpan.FromMinutes(_distributedSettings.RedisMemoizationExpiryTimeMinutes)
             };
 
-            ApplyIfNotNull(_distributedSettings.ReplicaCreditInMinutes, v => redisContentLocationStoreConfiguration.ReplicaPenaltyInMinutes = v);
+            ApplyIfNotNull(_distributedSettings.ReplicaCreditInMinutes, v => redisContentLocationStoreConfiguration.ContentLifetime = TimeSpan.FromMinutes(v));
+            ApplyIfNotNull(_distributedSettings.MachineRisk, v => redisContentLocationStoreConfiguration.MachineRisk = v);
             ApplyIfNotNull(_distributedSettings.LocationEntryExpiryMinutes, v => redisContentLocationStoreConfiguration.LocationEntryExpiry = TimeSpan.FromMinutes(v));
             ApplyIfNotNull(_distributedSettings.MachineExpiryMinutes, v => redisContentLocationStoreConfiguration.MachineExpiry = TimeSpan.FromMinutes(v));
 
@@ -84,13 +85,24 @@ namespace BuildXL.Cache.Host.Service.Internal
                     StoreClusterState = _distributedSettings.StoreClusterStateInDatabase
                 };
 
-                redisContentLocationStoreConfiguration.Database = dbConfig;
                 if (_distributedSettings.ContentLocationDatabaseGcIntervalMinutes != null)
                 {
-                    dbConfig.LocalDatabaseGarbageCollectionInterval = TimeSpan.FromMinutes(_distributedSettings.ContentLocationDatabaseGcIntervalMinutes.Value);
+                    dbConfig.GarbageCollectionInterval = TimeSpan.FromMinutes(_distributedSettings.ContentLocationDatabaseGcIntervalMinutes.Value);
                 }
 
-                ApplyKeyVaultSettingsForLlsAsync(redisContentLocationStoreConfiguration, localCacheRoot).GetAwaiter().GetResult();
+                ApplyIfNotNull(_distributedSettings.ContentLocationDatabaseCacheEnabled, v => dbConfig.ContentCacheEnabled = v);
+                ApplyIfNotNull(_distributedSettings.ContentLocationDatabaseFlushDegreeOfParallelism, v => dbConfig.FlushDegreeOfParallelism = v);
+                ApplyIfNotNull(_distributedSettings.ContentLocationDatabaseFlushSingleTransaction, v => dbConfig.FlushSingleTransaction = v);
+                ApplyIfNotNull(_distributedSettings.ContentLocationDatabaseFlushPreservePercentInMemory, v => dbConfig.FlushPreservePercentInMemory = v);
+                ApplyIfNotNull(_distributedSettings.ContentLocationDatabaseCacheMaximumUpdatesPerFlush, v => dbConfig.CacheMaximumUpdatesPerFlush = v);
+                ApplyIfNotNull(_distributedSettings.ContentLocationDatabaseCacheFlushingMaximumInterval, v => dbConfig.CacheFlushingMaximumInterval = v);
+
+                ApplyIfNotNull(
+                    _distributedSettings.FullRangeCompactionIntervalMinutes,
+                    v => dbConfig.FullRangeCompactionInterval = TimeSpan.FromMinutes(v));
+
+                redisContentLocationStoreConfiguration.Database = dbConfig;
+                ApplySecretSettingsForLlsAsync(redisContentLocationStoreConfiguration, localCacheRoot).GetAwaiter().GetResult();
             }
 
             if (_distributedSettings.IsRedisGarbageCollectionEnabled)
@@ -107,16 +119,36 @@ namespace BuildXL.Cache.Host.Service.Internal
 
             var localMachineLocation = _arguments.PathTransformer.GetLocalMachineLocation(localCacheRoot);
             var contentHashBumpTime = TimeSpan.FromMinutes(_distributedSettings.ContentHashBumpTimeMinutes);
+            var memoizationExpiryTime = TimeSpan.FromMinutes(_distributedSettings.RedisMemoizationExpiryTimeMinutes);
 
-            var redisContentLocationStoreFactory = new RedisContentLocationStoreFactory(
+            // RedisContentSecretName and RedisMachineLocationsSecretName can be null. HostConnectionStringProvider won't fail in this case.
+            IConnectionStringProvider contentConnectionStringProvider = TryCreateRedisConnectionStringProvider(_redisContentSecretNames.RedisContentSecretName);
+            IConnectionStringProvider machineLocationsConnectionStringProvider = TryCreateRedisConnectionStringProvider(_redisContentSecretNames.RedisMachineLocationsSecretName);
+
+            config = redisContentLocationStoreConfiguration;
+
+            return new RedisMemoizationStoreFactory(
                 contentConnectionStringProvider,
                 machineLocationsConnectionStringProvider,
                 SystemClock.Instance,
                 contentHashBumpTime,
                 _keySpace,
-                localMachineLocation,
                 configuration: redisContentLocationStoreConfiguration
                 );
+        }
+
+        public async Task<IMemoizationStore> CreateMemoizationStoreAsync(AbsolutePath localCacheRoot)
+        {
+            var cacheFactory = CreateRedisCacheFactory(localCacheRoot, out var _);
+            await cacheFactory.StartupAsync(new Context(_logger)).ThrowIfFailure();
+            return cacheFactory.CreateMemoizationStore(_logger);
+        }
+
+        public IContentStore CreateContentStore(AbsolutePath localCacheRoot)
+        {
+            var redisContentLocationStoreFactory = CreateRedisCacheFactory(localCacheRoot, out var redisContentLocationStoreConfiguration);
+
+            var localMachineLocation = _arguments.PathTransformer.GetLocalMachineLocation(localCacheRoot);
 
             ReadOnlyDistributedContentSession<AbsolutePath>.ContentAvailabilityGuarantee contentAvailabilityGuarantee;
             if (string.IsNullOrEmpty(_distributedSettings.ContentAvailabilityGuarantee))
@@ -143,6 +175,7 @@ namespace BuildXL.Cache.Host.Service.Internal
                 if (_distributedSettings.PinCacheReplicaCreditRetentionDecay.HasValue) pinConfiguration.PinCacheReplicaCreditRetentionDecay = _distributedSettings.PinCacheReplicaCreditRetentionDecay.Value;
             }
 
+            var contentHashBumpTime = TimeSpan.FromMinutes(_distributedSettings.ContentHashBumpTimeMinutes);
             var lazyTouchContentHashBumpTime = _distributedSettings.IsTouchEnabled ? (TimeSpan?)contentHashBumpTime : null;
             if (redisContentLocationStoreConfiguration.ReadMode == ContentLocationMode.LocalLocationStore)
             {
@@ -170,6 +203,7 @@ namespace BuildXL.Cache.Host.Service.Internal
                     _arguments.Copier,
                     _arguments.Copier,
                     _arguments.PathTransformer,
+                    _arguments.CopyRequester,
                     contentAvailabilityGuarantee,
                     localCacheRoot,
                     _fileSystem,
@@ -182,6 +216,13 @@ namespace BuildXL.Cache.Host.Service.Internal
                         ParallelHashingFileSizeBoundary = _distributedSettings.ParallelHashingFileSizeBoundary,
                         MaxConcurrentCopyOperations = _distributedSettings.MaxConcurrentCopyOperations,
                         PinConfiguration = pinConfiguration,
+                        EmptyFileHashShortcutEnabled = _distributedSettings.EmptyFileHashShortcutEnabled,
+                        RetryIntervalForCopies = _distributedSettings.RetryIntervalForCopies,
+                        TimeoutForProactiveCopies = TimeSpan.FromMinutes(_distributedSettings.TimeoutForProactiveCopiesMinutes),
+                        ProactiveCopyMode = (ProactiveCopyMode)Enum.Parse(typeof(ProactiveCopyMode), _distributedSettings.ProactiveCopyMode),
+                        MaxConcurrentProactiveCopyOperations = _distributedSettings.MaxConcurrentProactiveCopyOperations,
+                        ProactiveCopyLocationsThreshold = _distributedSettings.ProactiveCopyLocationsThreshold,
+                        MaximumConcurrentPutFileOperations = _distributedSettings.MaximumConcurrentPutFileOperations,
                     },
                     replicaCreditInMinutes: _distributedSettings.IsDistributedEvictionEnabled ? _distributedSettings.ReplicaCreditInMinutes : null,
                     enableRepairHandling: _distributedSettings.IsRepairHandlingEnabled,
@@ -191,25 +232,36 @@ namespace BuildXL.Cache.Host.Service.Internal
             return contentStore;
         }
 
+        private IConnectionStringProvider TryCreateRedisConnectionStringProvider(string secretName)
+        {
+            return string.IsNullOrEmpty(secretName)
+                ? null
+                : new HostConnectionStringProvider(_arguments.Host, secretName, _logger);
+        }
+
         private static ContentStoreSettings FromDistributedSettings(DistributedContentSettings settings)
         {
             return new ContentStoreSettings()
-                         {
-                             UseEmptyFileHashShortcut = settings.EmptyFileHashShortcutEnabled,
-                             CheckFiles = settings.CheckLocalFiles,
-                             UseLegacyQuotaKeeperImplementation = settings.UseLegacyQuotaKeeperImplementation,
-                             StartPurgingAtStartup = settings.StartPurgingAtStartup,
-                             UseNativeBlobEnumeration = settings.UseNativeBlobEnumeration,
-                         };
+            {
+                UseEmptyFileHashShortcut = settings.EmptyFileHashShortcutEnabled,
+                CheckFiles = settings.CheckLocalFiles,
+                UseLegacyQuotaKeeperImplementation = settings.UseLegacyQuotaKeeperImplementation,
+                StartPurgingAtStartup = settings.StartPurgingAtStartup,
+                UseNativeBlobEnumeration = settings.UseNativeBlobEnumeration,
+                SelfCheckEpoch = settings.SelfCheckEpoch,
+                StartSelfCheckInStartup = settings.StartSelfCheckAtStartup,
+                SelfCheckFrequency = TimeSpan.FromMinutes(settings.SelfCheckFrequencyInMinutes),
+                OverrideUnixFileAccessMode = settings.OverrideUnixFileAccessMode,
+                UseRedundantPutFileShortcut = settings.UseRedundantPutFileShortcut
+            };
         }
 
-        private async Task ApplyKeyVaultSettingsForLlsAsync(RedisContentLocationStoreConfiguration configuration, AbsolutePath localCacheRoot)
+        private async Task ApplySecretSettingsForLlsAsync(RedisContentLocationStoreConfiguration configuration, AbsolutePath localCacheRoot)
         {
-            var errorBuilder = new StringBuilder();
-            var secrets = await TryRetrieveKeyVaultSecretsAsync(CancellationToken.None, errorBuilder);
+            (var secrets, var errors) = await _secretRetriever.TryRetrieveSecretsAsync();
             if (secrets == null)
             {
-                _logger.Error($"Unable to configure Local Location Store. {errorBuilder}");
+                _logger.Error($"Unable to configure Local Location Store. {errors}");
                 return;
             }
 
@@ -244,14 +296,15 @@ namespace BuildXL.Cache.Host.Service.Internal
                 value => configuration.SafeToLazilyUpdateMachineCountThreshold = value);
             ApplyIfNotNull(_distributedSettings.IsReconciliationEnabled, value => configuration.EnableReconciliation = value);
             ApplyIfNotNull(_distributedSettings.UseIncrementalCheckpointing, value => configuration.Checkpoint.UseIncrementalCheckpointing = value);
+            ApplyIfNotNull(_distributedSettings.IncrementalCheckpointDegreeOfParallelism, value => configuration.Checkpoint.IncrementalCheckpointDegreeOfParallelism = value);
 
-            configuration.RedisGlobalStoreConnectionString = GetRequiredSecret(secrets, _distributedSettings.GlobalRedisSecretName);
+            configuration.RedisGlobalStoreConnectionString = ((PlainTextSecret) GetRequiredSecret(secrets, _distributedSettings.GlobalRedisSecretName)).Secret;
 
             if (_distributedSettings.SecondaryGlobalRedisSecretName != null)
             {
-                configuration.RedisGlobalStoreSecondaryConnectionString = GetRequiredSecret(
+                configuration.RedisGlobalStoreSecondaryConnectionString = ((PlainTextSecret) GetRequiredSecret(
                     secrets,
-                    _distributedSettings.SecondaryGlobalRedisSecretName);
+                    _distributedSettings.SecondaryGlobalRedisSecretName)).Secret;
             }
 
             ApplyIfNotNull(
@@ -262,12 +315,12 @@ namespace BuildXL.Cache.Host.Service.Internal
                 value => configuration.WriteMode = (ContentLocationMode)Enum.Parse(typeof(ContentLocationMode), value));
             ApplyIfNotNull(_distributedSettings.LocationEntryExpiryMinutes, value => configuration.LocationEntryExpiry = TimeSpan.FromMinutes(value));
 
-            var storageConnectionStrings = GetStorageConnectionStrings(secrets, errorBuilder);
-            // We already retrieved storage connection strings, so the result should not be null.
-            Contract.Assert(storageConnectionStrings != null);
+            var errorBuilder = new StringBuilder();
+            var storageCredentials = GetStorageCredentials(secrets, errorBuilder);
+            Contract.Assert(storageCredentials != null && storageCredentials.Length > 0);
 
             var blobStoreConfiguration = new BlobCentralStoreConfiguration(
-                connectionStrings: storageConnectionStrings,
+                credentials: storageCredentials,
                 containerName: "checkpoints",
                 checkpointsKey: "checkpoints-eventhub");
 
@@ -279,18 +332,18 @@ namespace BuildXL.Cache.Host.Service.Internal
             if (_distributedSettings.UseDistributedCentralStorage)
             {
                 configuration.DistributedCentralStore = new DistributedCentralStoreConfiguration(localCacheRoot)
-                                                        {
-                                                            MaxRetentionGb = _distributedSettings.MaxCentralStorageRetentionGb,
-                                                            PropagationDelay = TimeSpan.FromSeconds(
+                {
+                    MaxRetentionGb = _distributedSettings.MaxCentralStorageRetentionGb,
+                    PropagationDelay = TimeSpan.FromSeconds(
                                                                 _distributedSettings.CentralStoragePropagationDelaySeconds),
-                                                            PropagationIterations = _distributedSettings.CentralStoragePropagationIterations,
-                                                            MaxSimultaneousCopies = _distributedSettings.CentralStorageMaxSimultaneousCopies
-                                                        };
+                    PropagationIterations = _distributedSettings.CentralStoragePropagationIterations,
+                    MaxSimultaneousCopies = _distributedSettings.CentralStorageMaxSimultaneousCopies
+                };
             }
 
             var eventStoreConfiguration = new EventHubContentLocationEventStoreConfiguration(
                 eventHubName: "eventhub",
-                eventHubConnectionString: GetRequiredSecret(secrets, _distributedSettings.EventHubSecretName),
+                eventHubConnectionString: ((PlainTextSecret)GetRequiredSecret(secrets, _distributedSettings.EventHubSecretName)).Secret,
                 consumerGroupName: "$Default",
                 epoch: _keySpace + _distributedSettings.EventHubEpoch);
 
@@ -298,114 +351,82 @@ namespace BuildXL.Cache.Host.Service.Internal
             ApplyIfNotNull(
                 _distributedSettings.MaxEventProcessingConcurrency,
                 value => eventStoreConfiguration.MaxEventProcessingConcurrency = value);
+
+            ApplyIfNotNull(
+                _distributedSettings.EventBatchSize,
+                value => eventStoreConfiguration.EventBatchSize = value);
+
+            ApplyIfNotNull(
+                _distributedSettings.EventProcessingMaxQueueSize,
+                value => eventStoreConfiguration.EventProcessingMaxQueueSize = value);
         }
 
-        private string[] GetStorageConnectionStrings(Dictionary<string, string> settings, StringBuilder errorBuilder)
+        private AzureBlobStorageCredentials[] GetStorageCredentials(Dictionary<string, Secret> secrets, StringBuilder errorBuilder)
         {
             var storageSecretNames = GetAzureStorageSecretNames(errorBuilder);
-            if (storageSecretNames == null)
+            // This would have failed earlier otherwise
+            Contract.Assert(storageSecretNames != null);
+
+            var credentials = new List<AzureBlobStorageCredentials>();
+            foreach (var secretName in storageSecretNames)
             {
-                return null;
+                var secret = GetRequiredSecret(secrets, secretName);
+
+                if (_distributedSettings.AzureBlobStorageUseSasTokens)
+                {
+                    var updatingSasToken = secret as UpdatingSasToken;
+                    Contract.Assert(!(updatingSasToken is null));
+
+                    credentials.Add(CreateAzureBlobCredentialsFromSasToken(secretName, updatingSasToken));
+                }
+                else
+                {
+                    var plainTextSecret = secret as PlainTextSecret;
+                    Contract.Assert(!(plainTextSecret is null));
+
+                    credentials.Add(new AzureBlobStorageCredentials(plainTextSecret.Secret));
+                }
             }
 
-            return storageSecretNames.Select(name => GetRequiredSecret(settings, name)).ToArray();
+            return credentials.ToArray();
+        }
+
+        private AzureBlobStorageCredentials CreateAzureBlobCredentialsFromSasToken(string secretName, UpdatingSasToken updatingSasToken)
+        {
+            var storageCredentials = new StorageCredentials(sasToken: updatingSasToken.Token.Token);
+            updatingSasToken.TokenUpdated += (_, sasToken) =>
+            {
+                _logger.Debug($"Updating SAS token for Azure Storage secret {secretName}");
+                storageCredentials.UpdateSASToken(sasToken.Token);
+            };
+
+            // The account name should never actually be updated, so its OK to take it from the initial token
+            var azureCredentials = new AzureBlobStorageCredentials(storageCredentials, updatingSasToken.Token.StorageAccount);
+            return azureCredentials;
         }
 
         private List<string> GetAzureStorageSecretNames(StringBuilder errorBuilder)
         {
-            List<string> secretNames = new List<string>();
-            if (_distributedSettings.AzureStorageSecretName != null)
+            var secretNames = new List<string>();
+            if (_distributedSettings.AzureStorageSecretName != null && !string.IsNullOrEmpty(_distributedSettings.AzureStorageSecretName))
             {
                 secretNames.Add(_distributedSettings.AzureStorageSecretName);
             }
 
-            if (_distributedSettings.AzureStorageSecretNames != null)
+            if (_distributedSettings.AzureStorageSecretNames != null && !_distributedSettings.AzureStorageSecretNames.Any(string.IsNullOrEmpty))
             {
                 secretNames.AddRange(_distributedSettings.AzureStorageSecretNames);
             }
 
-            if (secretNames.Count == 0)
+            if (secretNames.Count > 0)
             {
-                errorBuilder.Append(
-                    $"Unable to configure Azure Storage. {nameof(DistributedContentSettings.AzureStorageSecretName)} or {nameof(DistributedContentSettings.AzureStorageSecretNames)} configuration options should be provided. ");
-                return null;
+                return secretNames;
             }
 
-            return secretNames;
-        }
-
-        private async Task<Dictionary<string, string>> TryRetrieveKeyVaultSecretsAsync(CancellationToken token, StringBuilder errorBuilder)
-        {
-            var keyVaultSettingsString = _distributedSettings.KeyVaultSettingsString;
-
-            if (keyVaultSettingsString is null && _redisContentSecretNames.KeyVaultSecretName is null)
-            {
-                errorBuilder.Append(
-                    $"Either {nameof(DistributedContentSettings)}.{nameof(DistributedContentSettings.KeyVaultSettingsString)} or {nameof(RedisContentSecretNames)}.{nameof(RedisContentSecretNames.KeyVaultSecretName)} should be specified. ");
-                return null;
-            }
-
-            if (keyVaultSettingsString is null && _redisContentSecretNames.KeyVaultSecretName != null)
-            {
-                var keyVaultSettingsStringProvider = new HostConnectionStringProvider(_arguments.Host, _redisContentSecretNames.KeyVaultSecretName, _logger);
-                var keyVaultSettingsStringResult = await keyVaultSettingsStringProvider.GetConnectionString();
-                if (!keyVaultSettingsStringResult.Succeeded)
-                {
-                    errorBuilder.Append($"Unable to get key vault settings string: {keyVaultSettingsStringResult}. ");
-                    return null;
-                }
-
-                keyVaultSettingsString = keyVaultSettingsStringResult.ConnectionString;
-            }
-
-            _logger.Debug($"KeyVaultSettingsString: <non-null secret>, "
-                + $"EventHubSecretName: {_distributedSettings.EventHubSecretName}, AzureStorageSecretName: {_distributedSettings.AzureStorageSecretName}, GlobalRedisSecretName: {_distributedSettings.GlobalRedisSecretName}, SecondaryGlobalRedisSecretName: {_distributedSettings.SecondaryGlobalRedisSecretName}.");
-
-            bool invalidConfiguration = appendIfNull(_distributedSettings.EventHubSecretName, $"{nameof(DistributedContentSettings)}.{nameof(DistributedContentSettings.EventHubSecretName)}");
-            invalidConfiguration |= appendIfNull(_distributedSettings.GlobalRedisSecretName, $"{nameof(DistributedContentSettings)}.{nameof(DistributedContentSettings.GlobalRedisSecretName)}");
-
-            if (invalidConfiguration)
-            {
-                return null;
-            }
-
-            var storageSecretNames = GetAzureStorageSecretNames(errorBuilder);
-            if (storageSecretNames == null)
-            {
-                return null;
-            }
-
-            if (_distributedSettings.EventHubSecretName != null &&
-                _distributedSettings.GlobalRedisSecretName != null)
-            {
-                var retryPolicy = CreateKeyVaultRetryPolicy(_distributedSettings);
-                return await retryPolicy.ExecuteAsync(
-                    async () =>
-                    {
-                        return await _arguments.Host.RetrieveKeyVaultSecretsAsync(
-                            new List<string>(storageSecretNames)
-                            {
-                                _distributedSettings.EventHubSecretName,
-                                _distributedSettings.GlobalRedisSecretName,
-                                _distributedSettings.SecondaryGlobalRedisSecretName
-                            }.Where(s => s != null).ToList(),
-                            token);
-                    },
-                    token);
-            }
-
+            errorBuilder.Append(
+                $"Unable to configure Azure Storage. {nameof(DistributedContentSettings.AzureStorageSecretName)} or {nameof(DistributedContentSettings.AzureStorageSecretNames)} configuration options should be provided. ");
             return null;
 
-            bool appendIfNull(object value, string propertyName)
-            {
-                if (value is null)
-                {
-                    errorBuilder.Append($"{propertyName} should be provided. ");
-                    return true;
-                }
-
-                return false;
-            }
         }
 
         private static void ApplyIfNotNull<T>(T value, Action<T> apply) where T : class
@@ -424,41 +445,26 @@ namespace BuildXL.Cache.Host.Service.Internal
             }
         }
 
-        private static string GetRequiredSecret(Dictionary<string, string> secrets, string secretName)
+        private static Secret GetRequiredSecret(Dictionary<string, Secret> secrets, string secretName)
         {
-            if (!secrets.TryGetValue(secretName, out var value) || string.IsNullOrEmpty(value))
+            if (!secrets.TryGetValue(secretName, out var value))
             {
-                throw new KeyNotFoundException($"Missing key vault secret: {secretName}");
+                throw new KeyNotFoundException($"Missing secret: {secretName}");
             }
 
             return value;
         }
 
-        private sealed class KeyVaultConfigurationException : Exception
-        {
-            /// <inheritdoc />
-            public KeyVaultConfigurationException(string message)
-                : base(message)
-            {
-            }
-
-            /// <inheritdoc />
-            public KeyVaultConfigurationException(string message, Exception innerException)
-                : base(message, innerException)
-            {
-            }
-        }
-
-        private static RetryPolicy CreateKeyVaultRetryPolicy(DistributedContentSettings settings)
+        private static RetryPolicy CreateSecretsRetrievalRetryPolicy(DistributedContentSettings settings)
         {
             return new RetryPolicy(
                 new KeyVaultRetryPolicy(),
                 new ExponentialBackoff(
-                    name: "KeyVaultExponentialBackoff",
-                    retryCount: settings.KeyVaultRetryCount,
-                    minBackoff: TimeSpan.FromSeconds(settings.KeyVaultMinBackoffSeconds),
-                    maxBackoff: TimeSpan.FromSeconds(settings.KeyVaultMaxBackoffSeconds),
-                    deltaBackoff: TimeSpan.FromSeconds(settings.KeyVaultDeltaBackoffSeconds),
+                    name: "SecretsRetrievalBackoff",
+                    retryCount: settings.SecretsRetrievalRetryCount,
+                    minBackoff: TimeSpan.FromSeconds(settings.SecretsRetrievalMinBackoffSeconds),
+                    maxBackoff: TimeSpan.FromSeconds(settings.SecretsRetrievalMaxBackoffSeconds),
+                    deltaBackoff: TimeSpan.FromSeconds(settings.SecretsRetrievalDeltaBackoffSeconds),
                     firstFastRetry: false)); // All retries are subjects to the policy, even the first one
         }
 
@@ -476,7 +482,7 @@ namespace BuildXL.Cache.Host.Service.Internal
                     // This is a recoverable error.
                     return true;
                 }
-                
+
                 if (message.Contains("429"))
                 {
                     // This is a throttling response which is recoverable as well.

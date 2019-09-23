@@ -15,6 +15,7 @@
 		3C2614AE20D7E85E00488B0B /* DataTypes.h in Headers */ = {isa = PBXBuildFile; fileRef = 3C2614A620D7E85E00488B0B /* DataTypes.h */; };
 		3C2614AF20D7E85E00488B0B /* PolicySearch.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 3C2614A720D7E85E00488B0B /* PolicySearch.cpp */; };
 		3C2614B020D7E85E00488B0B /* StringOperations.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 3C2614A820D7E85E00488B0B /* StringOperations.cpp */; };
+		3C44209B22F1F796000E1003 /* Common.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 3C44209922F1F782000E1003 /* Common.cpp */; };
 		3C73ADD22135A37700035B21 /* ClientInfo.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 3C73ADD02135A37700035B21 /* ClientInfo.cpp */; };
 		3C73ADD32135A37700035B21 /* ClientInfo.hpp in Headers */ = {isa = PBXBuildFile; fileRef = 3C73ADD12135A37700035B21 /* ClientInfo.hpp */; };
 		3C8327D42146927500EE8022 /* FileAccessManifestParser.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 3C8327D22146927500EE8022 /* FileAccessManifestParser.cpp */; };
@@ -54,7 +55,7 @@
 		F54B6ADA21D3E37A00069515 /* ResourceManager.cpp in Sources */ = {isa = PBXBuildFile; fileRef = F54B6AD821D3E37A00069515 /* ResourceManager.cpp */; };
 		F54B6ADB21D3E37A00069515 /* ResourceManager.hpp in Headers */ = {isa = PBXBuildFile; fileRef = F54B6AD921D3E37A00069515 /* ResourceManager.hpp */; };
 		F557784D219217E60006B275 /* arg_parse.cpp in Sources */ = {isa = PBXBuildFile; fileRef = F557784B219217E60006B275 /* arg_parse.cpp */; };
-		F57355F0224444A400264A6C /* Sandbox.cpp in Sources */ = {isa = PBXBuildFile; fileRef = F57355EF224444A400264A6C /* Sandbox.cpp */; };
+		F57355F0224444A400264A6C /* KextSandbox.cpp in Sources */ = {isa = PBXBuildFile; fileRef = F57355EF224444A400264A6C /* KextSandbox.cpp */; };
 		F57355F22244450600264A6C /* CoreFoundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = F57355F12244450600264A6C /* CoreFoundation.framework */; };
 		F57355F32244456B00264A6C /* StringOperations.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 3C2614A820D7E85E00488B0B /* StringOperations.cpp */; };
 		F57355F42244458E00264A6C /* utf8proc.c in Sources */ = {isa = PBXBuildFile; fileRef = F58E91FD220B595B0083C57E /* utf8proc.c */; };
@@ -191,6 +192,7 @@
 		3C2614A620D7E85E00488B0B /* DataTypes.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; name = DataTypes.h; path = ../../../Windows/DetoursServices/DataTypes.h; sourceTree = "<group>"; };
 		3C2614A720D7E85E00488B0B /* PolicySearch.cpp */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.cpp.cpp; name = PolicySearch.cpp; path = ../../../Windows/DetoursServices/PolicySearch.cpp; sourceTree = "<group>"; };
 		3C2614A820D7E85E00488B0B /* StringOperations.cpp */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.cpp.cpp; name = StringOperations.cpp; path = ../../../Windows/DetoursServices/StringOperations.cpp; sourceTree = "<group>"; };
+		3C44209922F1F782000E1003 /* Common.cpp */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.cpp.cpp; name = Common.cpp; path = ../../../../Interop/Sandbox/Common.cpp; sourceTree = "<group>"; };
 		3C48422220D290BD002760DE /* IOKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = IOKit.framework; path = System/Library/Frameworks/IOKit.framework; sourceTree = SDKROOT; };
 		3C73ADD02135A37700035B21 /* ClientInfo.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = ClientInfo.cpp; sourceTree = "<group>"; };
 		3C73ADD12135A37700035B21 /* ClientInfo.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = ClientInfo.hpp; sourceTree = "<group>"; };
@@ -240,7 +242,7 @@
 		F557784C219217E60006B275 /* arg_parse.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = arg_parse.hpp; sourceTree = "<group>"; };
 		F557784E21921BA20006B275 /* args.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = args.hpp; sourceTree = "<group>"; };
 		F5577851219367F70006B275 /* lambda.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = lambda.hpp; sourceTree = "<group>"; };
-		F57355EF224444A400264A6C /* Sandbox.cpp */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.cpp.cpp; name = Sandbox.cpp; path = ../../../../Interop/Sandbox/Sandbox.cpp; sourceTree = "<group>"; };
+		F57355EF224444A400264A6C /* KextSandbox.cpp */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.cpp.cpp; name = KextSandbox.cpp; path = ../../../../Interop/Sandbox/KextSandbox.cpp; sourceTree = "<group>"; };
 		F57355F12244450600264A6C /* CoreFoundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreFoundation.framework; path = System/Library/Frameworks/CoreFoundation.framework; sourceTree = SDKROOT; };
 		F577F04E21BEE0270066F2EF /* Trie.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = Trie.cpp; sourceTree = "<group>"; };
 		F577F04F21BEE0270066F2EF /* Trie.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = Trie.hpp; sourceTree = "<group>"; };
@@ -345,7 +347,7 @@
 		F58E91FD220B595B0083C57E /* utf8proc.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; path = utf8proc.c; sourceTree = "<group>"; };
 		F58E91FE220B595B0083C57E /* utf8proc_data.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; path = utf8proc_data.c; sourceTree = "<group>"; };
 		F58E91FF220B595B0083C57E /* utf8proc.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = utf8proc.h; sourceTree = "<group>"; };
-		F598838C22527E7400A7A2D9 /* BundleInfoTest.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; name = BundleInfoTest.xcconfig; path = ../BundleInfoTest.xcconfig; sourceTree = "<group>"; };
+		F598838C22527E7400A7A2D9 /* BundleInfoDebug.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; name = BundleInfoDebug.xcconfig; path = ../BundleInfoDebug.xcconfig; sourceTree = "<group>"; };
 		F598838D22527E7400A7A2D9 /* BundleInfo.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; name = BundleInfo.xcconfig; path = ../BundleInfo.xcconfig; sourceTree = "<group>"; };
 		F5A804C42182937400626B9C /* Checkers.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = Checkers.cpp; sourceTree = "<group>"; };
 		F5A804C52182937400626B9C /* Checkers.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = Checkers.hpp; sourceTree = "<group>"; };
@@ -443,7 +445,7 @@
 			isa = PBXGroup;
 			children = (
 				F598838D22527E7400A7A2D9 /* BundleInfo.xcconfig */,
-				F598838C22527E7400A7A2D9 /* BundleInfoTest.xcconfig */,
+				F598838C22527E7400A7A2D9 /* BundleInfoDebug.xcconfig */,
 				3CCA66C720D15BBD0051F984 /* Src */,
 				F58E912F220B562A0083C57E /* External */,
 				3CCA66C620D15BBD0051F984 /* Products */,
@@ -508,12 +510,13 @@
 				F557784B219217E60006B275 /* arg_parse.cpp */,
 				F557784C219217E60006B275 /* arg_parse.hpp */,
 				F557784E21921BA20006B275 /* args.hpp */,
+				3C44209922F1F782000E1003 /* Common.cpp */,
 				F5577851219367F70006B275 /* lambda.hpp */,
 				F51A2BFB2190C67500880752 /* main.cpp */,
 				F5490C072196345F0036B941 /* ps.cpp */,
 				F5490C082196345F0036B941 /* ps.hpp */,
 				F5490C052195F0C60036B941 /* render.hpp */,
-				F57355EF224444A400264A6C /* Sandbox.cpp */,
+				F57355EF224444A400264A6C /* KextSandbox.cpp */,
 			);
 			path = SandboxMonitor;
 			sourceTree = "<group>";
@@ -919,7 +922,7 @@
 		3CCA66BC20D15BBD0051F984 /* Project object */ = {
 			isa = PBXProject;
 			attributes = {
-				LastUpgradeCheck = 0940;
+				LastUpgradeCheck = 1020;
 				ORGANIZATIONNAME = Microsoft;
 				TargetAttributes = {
 					3CCA66C420D15BBD0051F984 = {
@@ -1066,8 +1069,9 @@
 				F57355F42244458E00264A6C /* utf8proc.c in Sources */,
 				F57355F32244456B00264A6C /* StringOperations.cpp in Sources */,
 				F557784D219217E60006B275 /* arg_parse.cpp in Sources */,
-				F57355F0224444A400264A6C /* Sandbox.cpp in Sources */,
+				F57355F0224444A400264A6C /* KextSandbox.cpp in Sources */,
 				F51A2BFC2190C67500880752 /* main.cpp in Sources */,
+				3C44209B22F1F796000E1003 /* Common.cpp in Sources */,
 				F5490C092196345F0036B941 /* ps.cpp in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -1077,7 +1081,7 @@
 /* Begin XCBuildConfiguration section */
 		3CCA66CD20D15BBD0051F984 /* debug */ = {
 			isa = XCBuildConfiguration;
-			baseConfigurationReference = F598838D22527E7400A7A2D9 /* BundleInfo.xcconfig */;
+			baseConfigurationReference = F598838C22527E7400A7A2D9 /* BundleInfoDebug.xcconfig */;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
 				CLANG_ANALYZER_NONNULL = YES;
@@ -1121,8 +1125,8 @@
 					"DEBUG=1",
 					"_DEBUG=1",
 					"MACH_ASSERT=1",
-                    "BUILDXL_BUNDLE_IDENTIFIER=$(BUILDXL_BUNDLE_IDENTIFIER)",
-                    "BUILDXL_CLASS_PREFIX=$(BUILDXL_CLASS_PREFIX)",
+					"BUILDXL_BUNDLE_IDENTIFIER=$(BUILDXL_BUNDLE_IDENTIFIER)",
+					"BUILDXL_CLASS_PREFIX=$(BUILDXL_CLASS_PREFIX)",
 				);
 				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
 				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
@@ -1180,8 +1184,8 @@
 				GCC_PREPROCESSOR_DEFINITIONS = (
 					"RELEASE=1",
 					"NDEBUG=1",
-                    "BUILDXL_BUNDLE_IDENTIFIER=$(BUILDXL_BUNDLE_IDENTIFIER)",
-                    "BUILDXL_CLASS_PREFIX=$(BUILDXL_CLASS_PREFIX)",
+					"BUILDXL_BUNDLE_IDENTIFIER=$(BUILDXL_BUNDLE_IDENTIFIER)",
+					"BUILDXL_CLASS_PREFIX=$(BUILDXL_CLASS_PREFIX)",
 				);
 				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
 				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
@@ -1208,6 +1212,7 @@
 				INFOPLIST_FILE = Src/Resources/Info.plist;
 				MODULE_NAME = com.microsoft.buildxl.sandbox;
 				MODULE_VERSION = 1.0.0d1;
+				PRODUCT_BUNDLE_IDENTIFIER = "$(BUILDXL_BUNDLE_IDENTIFIER)";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				USER_HEADER_SEARCH_PATHS = "../../Windows/DetoursServices/**";
 				WRAPPER_EXTENSION = kext;
@@ -1227,6 +1232,7 @@
 				INFOPLIST_FILE = Src/Resources/Info.plist;
 				MODULE_NAME = com.microsoft.buildxl.sandbox;
 				MODULE_VERSION = 1.0.0d1;
+				PRODUCT_BUNDLE_IDENTIFIER = "$(BUILDXL_BUNDLE_IDENTIFIER)";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				USER_HEADER_SEARCH_PATHS = "../../Windows/DetoursServices/**";
 				WRAPPER_EXTENSION = kext;
@@ -1241,6 +1247,7 @@
 				GCC_PREPROCESSOR_DEFINITIONS = (
 					"$(inherited)",
 					"MAC_OS_LIBRARY=1",
+					"SB_MONITOR=1",
 				);
 				HEADER_SEARCH_PATHS = "$(SOURCE_ROOT)/../Interop/Sandbox";
 				MACOSX_DEPLOYMENT_TARGET = 10.13;
@@ -1258,8 +1265,9 @@
 				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
 				CODE_SIGN_STYLE = Automatic;
 				GCC_PREPROCESSOR_DEFINITIONS = (
-                    "$(inherited)",
+					"$(inherited)",
 					"MAC_OS_LIBRARY=1",
+					"SB_MONITOR=1",
 				);
 				HEADER_SEARCH_PATHS = "$(SOURCE_ROOT)/../Interop/Sandbox";
 				MACOSX_DEPLOYMENT_TARGET = 10.13;

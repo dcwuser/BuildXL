@@ -2,17 +2,14 @@
 // Licensed under the MIT license. See LICENSE file in the project root for full license information.
 
 using System;
+using System.Collections.Generic;
 using System.ComponentModel;
 using System.Diagnostics.ContractsLight;
+using System.Linq;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using BuildXL.Cache.Interfaces;
 using BuildXL.Utilities;
-
-[module: System.Diagnostics.CodeAnalysis.SuppressMessage("Microsoft.Performance", "CA1812:AvoidUninstantiatedInternalClasses",
-    Scope = "type",
-    Target = "BuildXL.Cache.InputListFilter.InputListFilterCacheFactory+Config",
-    Justification = "Tool is confused - it is constructed generically")]
 
 namespace BuildXL.Cache.InputListFilter
 {
@@ -137,6 +134,44 @@ namespace BuildXL.Cache.InputListFilter
                 Analysis.IgnoreResult(await cache.ShutdownAsync(), justification: "Okay to ignore shutdown");
                 throw;
             }
+        }
+
+        /// <inheritdoc />
+        public IEnumerable<Failure> ValidateConfiguration(ICacheConfigData cacheData)
+        {
+            return CacheConfigDataValidator.ValidateConfiguration<Config>(cacheData, config =>
+            {
+                var failures = new List<Failure>();
+                if (!string.IsNullOrWhiteSpace(config.MustInclude))
+                {
+                    try
+                    {
+                        var mustIncludeRegex = new Regex(config.MustInclude, RegexOptions.Compiled);
+                    }
+                    catch (Exception e)
+                    {
+                        failures.Add(new RegexFailure(config.MustInclude, e));
+                    }
+                }
+
+                if (!string.IsNullOrWhiteSpace(config.MustNotInclude))
+                {
+                    try
+                    {
+                        var mustNotIncludeRegex = new Regex(config.MustNotInclude, RegexOptions.Compiled);
+                    }
+                    catch (Exception e)
+                    {
+                        failures.Add(new RegexFailure(config.MustNotInclude, e));
+                    }
+                }
+
+                failures.AddRange(
+                    CacheFactory.ValidateConfig(config.FilteredCache)
+                        .Select(failure => new Failure<string>($"{nameof(config.FilteredCache)} validation failed.", failure)));
+
+                return failures;
+            });
         }
     }
 }

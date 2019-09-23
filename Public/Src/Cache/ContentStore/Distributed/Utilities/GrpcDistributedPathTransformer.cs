@@ -5,10 +5,13 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Net.Sockets;
 using System.Text;
+using BuildXL.Cache.ContentStore.Extensions;
 using BuildXL.Cache.ContentStore.Hashing;
 using BuildXL.Cache.ContentStore.Interfaces.Distributed;
 using BuildXL.Cache.ContentStore.Interfaces.FileSystem;
+using BuildXL.Cache.ContentStore.Interfaces.Logging;
 using BuildXL.Cache.ContentStore.Interfaces.Utils;
 using BuildXL.Cache.ContentStore.Utils;
 
@@ -19,14 +22,36 @@ namespace BuildXL.Cache.ContentStore.Distributed.Utilities
     /// </summary>
     public class GrpcDistributedPathTransformer : IAbsolutePathTransformer
     {
-        private readonly IReadOnlyDictionary<string, string> _junctionsByDirectory;
-        private static readonly string _localMachineName = Environment.MachineName;
+        private readonly IReadOnlyDictionary<AbsolutePath, AbsolutePath> _junctionsByDirectory;
         internal const string BlobFileExtension = ".blob";
+        private readonly string _localMachineName;
 
         /// <nodoc />
-        public GrpcDistributedPathTransformer(IReadOnlyDictionary<string, string> junctionsByDirectory = null)
+        public GrpcDistributedPathTransformer(ILogger logger)
         {
-            _junctionsByDirectory = junctionsByDirectory ?? new Dictionary<string,string>();
+            try
+            {
+                _localMachineName = System.Net.Dns.GetHostName();
+            }
+            catch (Exception e)
+            {
+                logger.Warning($"Failed to get machine name from `Dns.GetHostName`. Falling back to `Environment.MachineName`. {e.ToString()}");
+                _localMachineName = Environment.MachineName;
+            }
+
+            _junctionsByDirectory = new Dictionary<AbsolutePath, AbsolutePath>();
+        }
+
+        /// <nodoc />
+        public GrpcDistributedPathTransformer(IReadOnlyDictionary<string, string> junctionsByDirectory, ILogger logger) : this(logger)
+        {
+            _junctionsByDirectory = junctionsByDirectory.ToDictionary(kvp => new AbsolutePath(kvp.Key), kvp => new AbsolutePath(kvp.Value));
+        }
+
+        /// <nodoc />
+        public GrpcDistributedPathTransformer(IReadOnlyDictionary<AbsolutePath, AbsolutePath> junctionsByDirectory, ILogger logger) : this(logger)
+        {
+            _junctionsByDirectory = junctionsByDirectory;
         }
 
         /// <inheritdoc />
@@ -55,29 +80,28 @@ namespace BuildXL.Cache.ContentStore.Distributed.Utilities
             // Determine if cacheRoot needs to be accessed through its directory junction
             var directories = _junctionsByDirectory.Keys;
             var directoryToReplace = directories.SingleOrDefault(directory =>
-                                        cacheRootString.StartsWith(directory, StringComparison.OrdinalIgnoreCase));
+                                        cacheRootString.StartsWith(directory.Path, StringComparison.OrdinalIgnoreCase));
 
-            if (!string.IsNullOrEmpty(directoryToReplace))
+            if (directoryToReplace != null)
             {
                 // Replace directory with its junction
                 var junction = _junctionsByDirectory[directoryToReplace];
-                cacheRootString = cacheRootString.Replace(directoryToReplace.ToUpperInvariant(), junction);
+                cacheRootString = cacheRootString.Replace(directoryToReplace.Path.ToUpperInvariant(), junction.Path);
             }
 
-            string networkPathRoot = cacheRootString.Replace(":", "$");
-
+            string networkPathRoot = null;
             if (OperatingSystemHelper.IsWindowsOS)
             {
                 // Only unify paths along casing if on Windows
-                networkPathRoot = Path.Combine(@"\\" + _localMachineName, networkPathRoot).ToUpperInvariant();
+                networkPathRoot = Path.Combine(@"\\" + _localMachineName, cacheRootString.Replace(":", "$"));
             }
             else
             {
                 // Path.Combine ignores the first parameter if the second is a rooted path. To get the machine name before the rooted network path, the combination must be done manually.
-                networkPathRoot = Path.Combine(Path.DirectorySeparatorChar + _localMachineName, networkPathRoot.TrimStart(Path.DirectorySeparatorChar));
+                networkPathRoot = Path.Combine(Path.DirectorySeparatorChar + _localMachineName, cacheRootString.TrimStart(Path.DirectorySeparatorChar));
             }
 
-            return Encoding.UTF8.GetBytes(networkPathRoot);
+            return Encoding.UTF8.GetBytes(networkPathRoot.ToUpperInvariant());
         }
 
         /// <inheritdoc />

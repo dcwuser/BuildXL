@@ -2,17 +2,13 @@
 // Licensed under the MIT license. See LICENSE file in the project root for full license information.
 
 using System;
+using System.Collections.Generic;
 using System.ComponentModel;
 using System.Diagnostics.ContractsLight;
 using System.Threading.Tasks;
 using BuildXL.Cache.ImplementationSupport;
 using BuildXL.Cache.Interfaces;
 using BuildXL.Utilities;
-
-[module: System.Diagnostics.CodeAnalysis.SuppressMessage("Microsoft.Performance", "CA1812:AvoidUninstantiatedInternalClasses",
-    Scope = "type",
-    Target = "BuildXL.Cache.BasicFilesystem.BasicFilesystemCacheFactory+Config",
-    Justification = "Tool is confused - it is constructed generically")]
 
 namespace BuildXL.Cache.BasicFilesystem
 {
@@ -167,6 +163,25 @@ namespace BuildXL.Cache.BasicFilesystem
         {
             Contract.Requires(cacheData != null);
             return Task.FromResult(InitializeCache(cacheData, activityId));
+        }
+
+        /// <inheritdoc />
+        public IEnumerable<Failure> ValidateConfiguration(ICacheConfigData cacheData)
+        {
+            return CacheConfigDataValidator.ValidateConfiguration<Config>(cacheData, cacheConfig =>
+            {
+                var failures = new List<Failure>();
+
+                failures.AddFailureIfNull(cacheConfig.CacheId, nameof(cacheConfig.CacheId));
+                failures.AddFailureIfNull(cacheConfig.CacheRootPath, nameof(cacheConfig.CacheRootPath));
+
+                if (cacheConfig.IsAuthoritative && !cacheConfig.StrictMetadataCasCoupling)
+                {
+                    failures.Add(new IncorrectJsonConfigDataFailure($"If {nameof(cacheConfig.IsAuthoritative)} is enabled, {nameof(cacheConfig.StrictMetadataCasCoupling)} must be enabled as well."));
+                }
+
+                return failures;
+            });
         }
     }
 }

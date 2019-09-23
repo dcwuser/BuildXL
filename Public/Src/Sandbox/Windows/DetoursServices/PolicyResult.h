@@ -158,12 +158,18 @@ public:
     CanonicalizedPathType const& GetCanonicalizedPath() const { return m_canonicalizedPath; }
     bool AllowRead() const { return (m_policy & FileAccessPolicy_AllowRead) != 0; }
     bool AllowReadIfNonexistent() const { return (m_policy & FileAccessPolicy_AllowReadIfNonExistent) != 0; }
+#if !(MAC_OS_SANDBOX) && !(MAC_OS_LIBRARY)
+    bool AllowWrite() const;
+#else
     bool AllowWrite() const { return (m_policy & FileAccessPolicy_AllowWrite) != 0; }
+#endif
     bool AllowSymlinkCreation() const { return (m_policy & FileAccessPolicy_AllowSymlinkCreation) != 0; }
     bool AllowCreateDirectory() const { return (m_policy & FileAccessPolicy_AllowCreateDirectory) != 0; }
 	bool AllowRealInputTimestamps() const { return (m_policy & FileAccessPolicy_AllowRealInputTimestamps) != 0; }
+    bool OverrideAllowWriteForExistingFiles() const { return (m_policy & FileAccessPolicy_OverrideAllowWriteForExistingFiles) != 0; }
     bool ReportUsnAfterOpen() const { return (m_policy & FileAccessPolicy_ReportUsnAfterOpen) != 0; }
     bool ReportDirectoryEnumeration() const { return (m_policy & FileAccessPolicy_ReportDirectoryEnumerationAccess) != 0; }
+    bool IndicateUntracked() const { return ((m_policy & FileAccessPolicy_AllowAll) == FileAccessPolicy_AllowAll) && ((m_policy & FileAccessPolicy_ReportAccess) == 0); }
     DWORD GetPathId() const { return m_policySearchCursor.IsValid() ? m_policySearchCursor.Record->GetPathId() : 0; }
     FileAccessPolicy GetPolicy() const { return m_policy; }
     USN GetExpectedUsn() const { return m_policySearchCursor.GetExpectedUsn(); }
@@ -171,7 +177,7 @@ public:
     bool IsIndeterminate() const { return m_isIndeterminate; }
 
     // Indicates if a file-open should have FILE_SHARE_READ implicitly added (as a hack to workaround tools accidentally
-    // asking for exclusive read. We are conservative here:
+    // asking for exclusive read). We are conservative here:
     // - If the process is allowed to write the file, we leave it to their discretion (even if they did not ask for write access on a particular handle).
     // - If the access result is Warn or Deny, we leave it to their discretion (maybe the access is whitelisted, and the policy should really have AllowWrite).
     bool ShouldForceReadSharing(AccessCheckResult const& accessCheck) {
@@ -182,7 +188,7 @@ public:
     bool ShouldOverrideTimestamps(AccessCheckResult const& accessCheck) const {
         return (accessCheck.ResultAction == ResultAction::Allow || accessCheck.ResultAction == ResultAction::Warn) && !AllowRealInputTimestamps();
     }
-
+    
 private:
     /// Performs common work when checking for writable access
     AccessCheckResult CreateAccessCheckResult(ResultAction result, ReportLevel reportLevel) const;

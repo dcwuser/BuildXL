@@ -3,6 +3,7 @@
 
 using System;
 using System.Linq;
+using BuildXL.Pips;
 using BuildXL.Pips.Builders;
 using BuildXL.Pips.Operations;
 using BuildXL.Utilities;
@@ -37,7 +38,7 @@ namespace BuildXL.Scheduler.Graph
             private readonly DirectoryArtifact[] m_untrackedDirectories;
 
             /// <nodoc />
-            public MacOsDefaults(PathTable pathTable, PipGraph.Builder pipGraph)
+            public MacOsDefaults(PathTable pathTable, IPipGraph pipGraph)
             {
                 m_provenance = new PipProvenance(
                     0,
@@ -53,42 +54,53 @@ namespace BuildXL.Scheduler.Graph
                 m_lazySourceSealDirectories = Lazy.Create(() =>
                     new DefaultSourceSealDirectories(new[]
                     {
-                        GetSourceSeal(pathTable, pipGraph, MacPaths.Applications),
-                        GetSourceSeal(pathTable, pipGraph, MacPaths.Library),
-                        GetSourceSeal(pathTable, pipGraph, MacPaths.UserProvisioning),
-                        GetSourceSeal(pathTable, pipGraph, MacPaths.UsrBin),
-                        GetSourceSeal(pathTable, pipGraph, MacPaths.UsrInclude),
-                        GetSourceSeal(pathTable, pipGraph, MacPaths.UsrLib),
-                    }));
+                        MacPaths.Applications,
+                        MacPaths.Library,
+                        MacPaths.UserProvisioning,
+                        // consider untracking /usr/bin and /usr/include because they are not writable by default
+                        MacPaths.UsrBin,
+                        MacPaths.UsrInclude,
+                    }
+                    .Select(p => GetSourceSeal(pathTable, pipGraph, p))
+                    .ToArray()));
 
                 m_untrackedFiles =
                     new[]
                     {
                         // login.keychain is created by the OS the first time any process invokes an OS API that references the keychain.
                         // Untracked because build state will not be stored there and code signing will fail if required certs are in the keychain
-                        FileArtifact.CreateSourceFile(AbsolutePath.Create(pathTable, MacPaths.Etc)),
-                        FileArtifact.CreateSourceFile(AbsolutePath.Create(pathTable, MacPaths.UserKeyChainsDb)),
-                        FileArtifact.CreateSourceFile(AbsolutePath.Create(pathTable, MacPaths.UserKeyChains)),
-                        FileArtifact.CreateSourceFile(AbsolutePath.Create(pathTable, MacPaths.UserCFTextEncoding)),
-                        FileArtifact.CreateSourceFile(AbsolutePath.Create(pathTable, MacPaths.TmpDir)),
-                        
-                    };
+                        MacPaths.Etc,
+                        MacPaths.UserKeyChainsDb,
+                        MacPaths.UserKeyChains,
+                        MacPaths.UserCFTextEncoding,
+                        MacPaths.TmpDir
+                    }
+                    .Select(p => FileArtifact.CreateSourceFile(AbsolutePath.Create(pathTable, p)))
+                    .ToArray();
 
                 m_untrackedDirectories =
                     new[]
                     {
-                        DirectoryArtifact.CreateWithZeroPartialSealId(pathTable, MacPaths.Bin),
-                        DirectoryArtifact.CreateWithZeroPartialSealId(pathTable, MacPaths.Dev),
-                        DirectoryArtifact.CreateWithZeroPartialSealId(pathTable, MacPaths.Private),
-                        DirectoryArtifact.CreateWithZeroPartialSealId(pathTable, MacPaths.Sbin),
-                        DirectoryArtifact.CreateWithZeroPartialSealId(pathTable, MacPaths.SystemLibrary),
-                        DirectoryArtifact.CreateWithZeroPartialSealId(pathTable, MacPaths.UsrLibexec),
-                        DirectoryArtifact.CreateWithZeroPartialSealId(pathTable, MacPaths.UsrShare),
-                        DirectoryArtifact.CreateWithZeroPartialSealId(pathTable, MacPaths.UsrStandalone),
-                        DirectoryArtifact.CreateWithZeroPartialSealId(pathTable, MacPaths.UsrSbin),
-                        DirectoryArtifact.CreateWithZeroPartialSealId(pathTable, MacPaths.Var),
-                        DirectoryArtifact.CreateWithZeroPartialSealId(pathTable, MacPaths.UserPreferences),
-                    };
+                        MacPaths.Bin,
+                        MacPaths.Dev,
+                        MacPaths.Private,
+                        MacPaths.Sbin,
+                        MacPaths.SystemLibrary,
+                        MacPaths.UsrLibexec,
+                        MacPaths.UsrShare,
+                        MacPaths.UsrStandalone,
+                        MacPaths.UsrSbin,
+                        MacPaths.Var,
+                        MacPaths.UserPreferences,
+                        // it's important to untrack /usr/lib instead of creating a sealed source directory
+                        //   - the set of dynamically loaded libraries during an execution of a process is 
+                        //     not necessarily deterministic, i.e., when the same process---which itself is
+                        //     deterministic---is executed multiple times on same inputs, the set of 
+                        //     dynamically loaded libraries is not necessarily going to stay the same.
+                        MacPaths.UsrLib
+                    }
+                    .Select(p => DirectoryArtifact.CreateWithZeroPartialSealId(pathTable, p))
+                    .ToArray();
             }
 
             /// <summary>
@@ -123,7 +135,7 @@ namespace BuildXL.Scheduler.Graph
                 return true;
             }
 
-            private DirectoryArtifact GetSourceSeal(PathTable pathTable, PipGraph.Builder pipGraph, string path)
+            private DirectoryArtifact GetSourceSeal(PathTable pathTable, IPipGraph pipGraph, string path)
             {
                 var sealDirectory = new SealDirectory(
                     AbsolutePath.Create(pathTable, path),
@@ -134,7 +146,7 @@ namespace BuildXL.Scheduler.Graph
                     patterns: ReadOnlyArray<StringId>.Empty,
                     scrub: false);
 
-                return pipGraph.AddSealDirectory(sealDirectory);
+                return pipGraph.AddSealDirectory(sealDirectory, default);
             }
         }
     }

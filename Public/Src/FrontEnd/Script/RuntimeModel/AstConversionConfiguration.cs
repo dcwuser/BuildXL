@@ -16,15 +16,20 @@ namespace BuildXL.FrontEnd.Script.RuntimeModel.AstBridge
         /// <nodoc/>
         public AstConversionConfiguration(
             [CanBeNull]IEnumerable<string> policyRules,
-            int degreeOfParallelism,
             bool disableLanguagePolicies,
-            bool useLegacyOfficeLogic)
+            bool unsafeOptimized = false)
         {
             PolicyRules = policyRules ?? CollectionUtilities.EmptyArray<string>();
             UnsafeOptions = UnsafeConversionConfiguration.GetConfigurationFromEnvironmentVariables();
 
-            // In DScript V2 AST converter itself does not convert nodes in parallel.
-            DegreeOfParalellism = useLegacyOfficeLogic ? degreeOfParallelism : 1;
+            if (unsafeOptimized)
+            {
+                UnsafeOptions.DisableAnalysis = true;
+                UnsafeOptions.DisableDeclarationBeforeUseCheck = true;
+                UnsafeOptions.SkipTypeConversion = true;
+            }
+
+            DegreeOfParalellism = 1;
             DisableLanguagePolicies = disableLanguagePolicies;
         }
 
@@ -33,9 +38,8 @@ namespace BuildXL.FrontEnd.Script.RuntimeModel.AstBridge
         {
             return new AstConversionConfiguration(
                 policyRules: configuration.EnabledPolicyRules,
-                degreeOfParallelism: configuration.MaxFrontEndConcurrency(),
                 disableLanguagePolicies: configuration.DisableLanguagePolicyAnalysis(),
-                useLegacyOfficeLogic: configuration.UseLegacyOfficeLogic())
+                unsafeOptimized: configuration.UnsafeOptimizedAstConversion)
             {
                 PreserveFullNameSymbols = configuration.PreserveFullNames(),
             };
@@ -48,9 +52,8 @@ namespace BuildXL.FrontEnd.Script.RuntimeModel.AstBridge
         {
             return new AstConversionConfiguration(
                 policyRules: configuration.EnabledPolicyRules,
-                degreeOfParallelism: configuration.MaxFrontEndConcurrency(),
                 disableLanguagePolicies: configuration.DisableLanguagePolicyAnalysis(),
-                useLegacyOfficeLogic: configuration.UseLegacyOfficeLogic())
+                unsafeOptimized: configuration.UnsafeOptimizedAstConversion)
             {
                 PreserveFullNameSymbols = configuration.PreserveFullNames(),
             };

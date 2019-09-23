@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft. All rights reserved.
 // Licensed under the MIT license. See LICENSE file in the project root for full license information.
 
+using System.Collections.Concurrent;
 using System.Diagnostics.ContractsLight;
 using System.IO;
 using System.Text;
@@ -21,6 +22,18 @@ namespace BuildXL.Storage
         private static HashInfo s_hashingAlgorithm;
         private static IContentHasher s_contentHasher;
         private static ContentHash s_zeroHash;
+
+        private static ConcurrentDictionary<HashType, IContentHasher> s_contentHasherByHashType = new ConcurrentDictionary<HashType, IContentHasher>();
+
+        private static IContentHasher GetContentHasher(HashType hashType)
+        {
+            if (hashType == HashInfo.HashType || hashType == HashType.Unknown)
+            {
+                return s_hasher;
+            }
+
+            return s_contentHasherByHashType.GetOrAdd(hashType, (_) => HashInfoLookup.Find(hashType).CreateContentHasher());
+        }
 
         /// <summary>
         /// Selected content hash information.
@@ -87,14 +100,23 @@ namespace BuildXL.Storage
         {
             s_hasher?.Dispose();
             s_hasher = HashInfo.CreateContentHasher();
+            
+            foreach (var hasher in s_contentHasherByHashType.Values)
+            {
+                hasher.Dispose();
+            }
+            s_contentHasherByHashType = new ConcurrentDictionary<HashType, IContentHasher>();
         }
 
         /// <summary>
         /// Clients may switch between hashing algorithms. Must be set at the beginning of the build.
         /// </summary>
-        public static void SetDefaultHashType()
+        public static void SetDefaultHashType(bool force = false)
         {
-            SetDefaultHashType(HashType.Vso0);
+            if (!s_isInitialized || force)
+            {
+                SetDefaultHashType(HashType.Vso0);
+            }
         }
 
         /// <summary>
@@ -218,10 +240,10 @@ namespace BuildXL.Storage
         /// <remarks>
         /// The stream is read from its current location until the end. The stream is not closed or disposed upon completion.
         /// </remarks>
-        public static async Task<ContentHash> HashContentStreamAsync(Stream content)
+        public static async Task<ContentHash> HashContentStreamAsync(Stream content, HashType hashType = HashType.Unknown)
         {
             var result = await ExceptionUtilities.HandleRecoverableIOException(
-                () => s_hasher.GetContentHashAsync(content),
+                () => GetContentHasher(hashType).GetContentHashAsync(content),
                 ex => { throw new BuildXLException(I($"Cannot read from stream '{content.ToString()}'"), ex); });
             Contract.Assert(result.HashType != HashType.Unknown);
             return result;

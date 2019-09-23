@@ -1,7 +1,10 @@
 // Copyright (c) Microsoft. All rights reserved.
 // Licensed under the MIT license. See LICENSE file in the project root for full license information.
 
+using System;
 using System.Collections.Generic;
+using System.Linq;
+using BuildXL.Utilities.Collections;
 using BuildXL.Utilities.Configuration.Resolvers;
 
 namespace BuildXL.Utilities.Configuration
@@ -54,6 +57,26 @@ namespace BuildXL.Utilities.Configuration
         IReadOnlyList<DirectoryArtifact> MsBuildSearchLocations { get; }
 
         /// <summary>
+        /// Whether to use the full framework or dotnet core version of MSBuild. 
+        /// </summary>
+        /// <remarks>
+        /// Selected runtime is used both for build evaluation and execution.
+        /// Default is full framework.
+        /// Observe that using the full framework version means that msbuild.exe is expected to be found in msbuildSearchLocations
+        /// (or PATH if not specified). If using the dotnet core version, the same logic applies but to msbuild.dll
+        /// </remarks>
+        string MsBuildRuntime { get; }
+
+        /// <summary>
+        /// Collection of directories to search for dotnet.exe, when DotNetCore is specified as the msBuildRuntime. 
+        /// </summary>
+        /// <remarks>
+        /// If not specified, locations in %PATH% are used.
+        /// Locations are traversed in specification order.
+        /// </remarks>
+        IReadOnlyList<DirectoryArtifact> DotNetSearchLocations { get; }
+
+        /// <summary>
         /// Optional file paths for the projects or solutions that should be used to start parsing. These are relative 
         /// paths with respect to the root traversal.
         /// </summary>
@@ -75,7 +98,7 @@ namespace BuildXL.Utilities.Configuration
         /// <summary>
         /// The environment that is exposed to the resolver. If not specified, the process environment is used.
         /// </summary>
-        IReadOnlyDictionary<string, string> Environment { get; }
+        IReadOnlyDictionary<string, DiscriminatingUnion<string, UnitValue>> Environment { get; }
 
         /// <summary>
         /// Global properties to use for all projects.
@@ -135,6 +158,69 @@ namespace BuildXL.Utilities.Configuration
         /// <remarks>
         /// By default double writes are only allowed if the produced content is the same.
         /// </remarks>
-        DoubleWritePolicy? DoubleWritePolicy { get; set; }
+        DoubleWritePolicy? DoubleWritePolicy { get; }
+
+        /// <summary>
+        /// Whether projects are allowed to not specify their target protocol.
+        /// </summary>
+        /// <remarks>
+        /// When true, default targets will be used as a heuristic. Defaults to false.
+        /// </remarks>
+        bool? AllowProjectsToNotSpecifyTargetProtocol { get; }
+    }
+
+    /// <nodoc/>
+    public static class MsBuildResolverSettingsExtensions
+    {
+        /// <summary>
+        /// Process <see cref="IMsBuildResolverSettings.Environment"/> and split the specified environment variables that need to be exposed and tracked from the passthrough environment variables
+        /// </summary>
+        /// <remarks>
+        /// When <see cref="IMsBuildResolverSettings.Environment"/> is null, the current environment is defined as the tracked environment, with no passthroughs
+        /// </remarks>
+        public static void ComputeEnvironment(this IMsBuildResolverSettings msBuildResolverSettings, out IDictionary<string, string> trackedEnv, out ICollection<string> passthroughEnv)
+        {
+            if (msBuildResolverSettings.Environment == null)
+            {
+                var allEnvironmentVariables = Environment.GetEnvironmentVariables();
+                trackedEnv = new Dictionary<string, string>(allEnvironmentVariables.Count);
+                foreach (var envVar in allEnvironmentVariables.Keys)
+                {
+                    object value = allEnvironmentVariables[envVar];
+                    trackedEnv[envVar.ToString()] = value.ToString();
+                }
+
+                passthroughEnv = CollectionUtilities.EmptyArray<string>();
+                return;
+            }
+
+            var trackedList = new Dictionary<string, string>();
+            var passthroughList = new List<string>();
+
+            foreach (var kvp in msBuildResolverSettings.Environment)
+            {
+                var valueOrPassthrough = kvp.Value?.GetValue();
+                if (valueOrPassthrough == null || valueOrPassthrough is string)
+                {
+                    trackedList.Add(kvp.Key, (string)valueOrPassthrough);
+                }
+                else
+                {
+                    passthroughList.Add(kvp.Key);
+                }
+            }
+
+            trackedEnv = trackedList;
+            passthroughEnv = passthroughList;
+        }
+
+        /// <summary>
+        /// Whether MSBuildRuntime is DotNetCore.
+        /// </summary>
+        /// <remarks>
+        /// Keep in sync with Public\Sdk\Public\Prelude\Prelude.Configuration.Resolvers.dsc
+        /// If not specified, the default is full framework, so this function returns false in that case.
+        /// </remarks>
+        public static bool ShouldRunDotNetCoreMSBuild(this IMsBuildResolverSettings msBuildResolverSettings) => msBuildResolverSettings.MsBuildRuntime == "DotNetCore";
     }
 }

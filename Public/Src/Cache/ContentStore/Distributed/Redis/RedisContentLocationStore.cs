@@ -185,6 +185,10 @@ namespace BuildXL.Cache.ContentStore.Distributed.Redis
             return _contentRedisDatabaseAdapter.GetRedisInfoAsync(context, Tracer, Counters[ContentLocationStoreCounters.InfoStats], serverId, trace);
         }
 
+        /// <inheritdoc />
+        public void ReportReputation(MachineLocation location, MachineReputation reputation) =>
+            MachineReputationTracker.ReportReputation(location, reputation);
+
         /// <summary>
         /// Remove all redis records with empty machine id set.
         /// </summary>
@@ -1287,11 +1291,11 @@ namespace BuildXL.Cache.ContentStore.Distributed.Redis
         }
 
         /// <inheritdoc />
-        public Task<BoolResult> PutBlobAsync(OperationContext context, ContentHash hash, byte[] blob)
+        public async Task<BoolResult> PutBlobAsync(OperationContext context, ContentHash hash, byte[] blob)
         {
             Contract.Assert(AreBlobsSupported, "PutBlobAsync was called and blobs are not supported.");
 
-            return _blobAdapter.PutBlobAsync(context, hash, blob);
+            return await _blobAdapter.PutBlobAsync(context, hash, blob);
         }
 
         /// <inheritdoc />
@@ -1300,6 +1304,26 @@ namespace BuildXL.Cache.ContentStore.Distributed.Redis
             Contract.Assert(AreBlobsSupported, "GetBlobAsync was called and blobs are not supported.");
 
             return _blobAdapter.GetBlobAsync(context, hash);
+        }
+
+        /// <inheritdoc />
+        public Result<MachineLocation> GetRandomMachineLocation(IReadOnlyList<MachineLocation> except)
+        {
+            // ConcurrentDictionary.Keys is an expensive operation, so make sure to only call it once.
+            var locations = _idsByLocation.Keys;
+            if (locations.Except(except).Any())
+            {
+                MachineLocation location;
+                do
+                {
+                    location = locations.ElementAt(ThreadSafeRandom.Generator.Next(locations.Count));
+                }
+                while (except.Contains(location));
+
+                return new Result<MachineLocation>(location);
+            }
+
+            return new Result<MachineLocation>("Could not select a machine location.");
         }
 
         /// <summary>

@@ -13,18 +13,18 @@ namespace BuildXL.Pips.Operations
     /// <remarks>
     /// This type is internal, as the serialization/deserialization functionality is encapsulated by the PipTable.
     /// </remarks>
-    internal sealed class PipReader : BuildXLReader
+    internal class PipReader : BuildXLReader
     {
-        public PipReader(PageableStore store, Stream stream, bool leaveOpen)
-            : base(store.Debug, stream, leaveOpen)
+        public PipReader(bool debug, StringTable stringTable, Stream stream, bool leaveOpen)
+            : base(debug, stream, leaveOpen)
         {
-            Contract.Requires(store != null);
-            Store = store;
+            Contract.Requires(stringTable != null);
+            StringTable = stringTable;
         }
 
-        public PageableStore Store { get; }
+        public StringTable StringTable { get; }
 
-        public Pip ReadPip()
+        public virtual Pip ReadPip()
         {
             Contract.Ensures(Contract.Result<Pip>() != null);
             Start<Pip>();
@@ -33,7 +33,7 @@ namespace BuildXL.Pips.Operations
             return value;
         }
 
-        public PipProvenance ReadPipProvenance()
+        public virtual PipProvenance ReadPipProvenance()
         {
             Contract.Ensures(Contract.Result<PipProvenance>() != null);
             Start<PipProvenance>();
@@ -42,7 +42,12 @@ namespace BuildXL.Pips.Operations
             return value;
         }
 
-        public PipData ReadPipData()
+        public virtual StringId ReadPipDataEntriesPointer()
+        {
+            return ReadStringId();
+        }
+
+        public virtual PipData ReadPipData()
         {
             Start<PipData>();
             PipData value = PipData.Deserialize(this);
@@ -50,7 +55,7 @@ namespace BuildXL.Pips.Operations
             return value;
         }
 
-        public EnvironmentVariable ReadEnvironmentVariable()
+        public virtual EnvironmentVariable ReadEnvironmentVariable()
         {
             Start<EnvironmentVariable>();
             EnvironmentVariable value = EnvironmentVariable.Deserialize(this);
@@ -58,7 +63,7 @@ namespace BuildXL.Pips.Operations
             return value;
         }
 
-        public RegexDescriptor ReadRegexDescriptor()
+        public virtual RegexDescriptor ReadRegexDescriptor()
         {
             Start<RegexDescriptor>();
             RegexDescriptor value = RegexDescriptor.Deserialize(this);
@@ -66,20 +71,22 @@ namespace BuildXL.Pips.Operations
             return value;
         }
 
-        public PipId ReadPipId()
+        public virtual PipId ReadPipId()
         {
             Start<PipId>();
-            var value = new PipId(ReadUInt32());
+            var value = new PipId(base.ReadUInt32());
             End();
             return value;
         }
 
-        public ProcessSemaphoreInfo ReadProcessSemaphoreInfo()
+        public virtual ProcessSemaphoreInfo ReadProcessSemaphoreInfo()
         {
             Start<ProcessSemaphoreInfo>();
             var value = ProcessSemaphoreInfo.Deserialize(this);
             End();
             return value;
         }
+
+        public virtual PipId RemapPipId(PipId pipId) => pipId;
     }
 }

@@ -21,6 +21,7 @@ using BuildXL.FrontEnd.Workspaces;
 using BuildXL.FrontEnd.Workspaces.Core;
 using BuildXL.Pips;
 using BuildXL.Pips.Operations;
+using BuildXL.Scheduler.Graph;
 using BuildXL.Tracing;
 using BuildXL.Utilities;
 using BuildXL.Utilities.Collections;
@@ -166,7 +167,8 @@ namespace BuildXL.FrontEnd.Core
             Engine = engine;
             FrontEndArtifactManager = CreateFrontEndArtifactManager();
             PipGraph = pipGraph;
-            
+            PipGraphFragmentManager = new PipGraphFragmentManager(LoggingContext, FrontEndContext, pipGraph, configuration.FrontEnd.MaxFrontEndConcurrency);
+
             // TODO: The EngineBasedFileSystem should be replaced with a tracking file system that wraps the passed in filesystem
             // so that the speccache, engine caching/tracking all work for the real and for the fake filesystem.s
             if (FrontEndContext.FileSystem is PassThroughFileSystem)
@@ -261,7 +263,8 @@ namespace BuildXL.FrontEnd.Core
             }
 
             var frontEndConcurrency = resultingConfiguration.FrontEnd.MaxFrontEndConcurrency();
-            m_evaluationScheduler = new EvaluationScheduler(frontEndConcurrency, FrontEndContext.CancellationToken);
+            var enableEvaluationThrottling = resultingConfiguration.FrontEnd.EnableEvaluationThrottling();
+            m_evaluationScheduler = new EvaluationScheduler(frontEndConcurrency, enableEvaluationThrottling, FrontEndContext.CancellationToken);
 
             HostState = State.ConfigInterpreted;
 
@@ -470,7 +473,6 @@ namespace BuildXL.FrontEnd.Core
                     }
 
                     bool evaluateSucceeded = DoPhaseEvaluate(evaluationFilter, qualifiersToEvaluate);
-
                     NotifyResolversEvaluationIsFinished();
                     Engine.FinishTrackingBuildParameters();
 
@@ -567,7 +569,17 @@ namespace BuildXL.FrontEnd.Core
 
             // partially reload graph
             var stats = graph.PartiallyReloadGraph(affectedSpecs: affectedSpecPaths);
-            Logger.GraphPartiallyReloaded(FrontEndContext.LoggingContext, stats, ignoredSpecPaths.Count);
+
+            var numAffectedSpecs = stats.AffectedSpecs.Count();
+            Logger.GraphPartiallyReloaded(
+                FrontEndContext.LoggingContext,
+                numAffectedSpecs,
+                numAffectedSpecs + ignoredSpecPaths.Count,
+                stats.ElapsedMilliseconds,
+                stats.NumPipsReloaded,
+                stats.NumPipsAutomaticallyAdded,
+                stats.NumPipsSkipped,
+                stats.NumPipsNotReloadable);
 
             // log some debugging details
             Func<AbsolutePath, string> toStringFn = p => p.ToString(FrontEndContext.PathTable);
@@ -1059,7 +1071,7 @@ namespace BuildXL.FrontEnd.Core
             var frontEndHost = new FrontEndHostController(
                 frontEndFactory,
                 new DScriptWorkspaceResolverFactory(),
-                new EvaluationScheduler(degreeOfParallelism: 1, cancellationToken: frontEndContext.CancellationToken),
+                new EvaluationScheduler(degreeOfParallelism: 1, false, cancellationToken: frontEndContext.CancellationToken),
                 moduleRegistry,
                 new FrontEndStatistics(),
                 logger ?? Logger.CreateLogger(),
@@ -1340,8 +1352,11 @@ namespace BuildXL.FrontEnd.Core
             // Register the meta pips for the modules and the specs with the graph
             RegisterModuleAndSpecPips(Workspace);
 
-            // Workspace has been converted and is not needed anymore
-            CleanWorkspaceMemory();
+            if (FrontEndConfiguration.ReleaseWorkspaceBeforeEvaluation)
+            {
+                // Workspace has been converted and is not needed anymore
+                CleanWorkspaceMemory();
+            }
 
             // Evaluate with progress reporting
             List<ModuleEvaluationProgress> items = qualifierIds
@@ -1356,7 +1371,25 @@ namespace BuildXL.FrontEnd.Core
                 taskSelector: item => item.Task,
                 action: (elapsed, all, remaining) => LogModuleEvaluationProgress(numSpecs, elapsed, all, remaining),
                 period: EvaluationProgressReportingPeriod);
-            return results.All(b => b);
+            bool success = results.All(b => b);
+            if (!success)
+            {
+                return false;
+            }
+
+            if (PipGraphFragmentManager != null)
+            {
+                var tasks = PipGraphFragmentManager.GetAllFragmentTasks();
+                numSpecs = tasks.Count;
+                results = await TaskUtilities.AwaitWithProgressReporting(
+                    tasks,
+                    taskSelector: item => item.Item2,
+                    action: (elapsed, all, remaining) => LogFragmentEvaluationProgress(numSpecs, elapsed, all, remaining),
+                    period: EvaluationProgressReportingPeriod);
+                return results.All(b => b);
+            }
+
+            return true;
         }
 
         /// <summary>
@@ -1387,25 +1420,39 @@ namespace BuildXL.FrontEnd.Core
                     }
 
                     var moduleLocation = new LocationData(module.Definition.ModuleConfigFile, 0, 0);
-                    PipGraph.AddModule(
-                        new ModulePip(
+
+                    var modulePip = new ModulePip(
                             module: module.Descriptor.Id,
                             identity: StringId.Create(FrontEndContext.StringTable, module.Descriptor.Name),
                             version: StringId.Create(FrontEndContext.StringTable, module.Descriptor.Version),
                             location: moduleLocation,
                             resolverKind: StringId.Create(FrontEndContext.StringTable, module.Descriptor.ResolverKind),
-                            resolverName: StringId.Create(FrontEndContext.StringTable, module.Descriptor.ResolverName)
-                        )
-                    );
+                            resolverName: StringId.Create(FrontEndContext.StringTable, module.Descriptor.ResolverName));
+
+                    if (PipGraphFragmentManager != null)
+                    {
+                        PipGraphFragmentManager.AddModulePip(modulePip);
+                    }
+                    else
+                    {
+                        PipGraph.AddModule(modulePip);
+                    }
 
                     foreach (var spec in module.Specs.Keys)
                     {
-                        PipGraph.AddSpecFile(
-                            new SpecFilePip(
+                        var specFilePip = new SpecFilePip(
                                 FileArtifact.CreateSourceFile(spec),
                                 moduleLocation,
-                                module.Descriptor.Id)
-                        );
+                                module.Descriptor.Id);
+
+                        if (PipGraphFragmentManager != null)
+                        {
+                            PipGraphFragmentManager.AddSpecFilePip(specFilePip);
+                        }
+                        else
+                        {
+                            PipGraph.AddSpecFile(specFilePip);
+                        }
                     }
                 }
             }
@@ -1428,8 +1475,41 @@ namespace BuildXL.FrontEnd.Core
                 remaining: remainingMessage);
         }
 
-        private static string ConstructProgressRemainingMessage(TimeSpan elapsed, IReadOnlyCollection<ModuleEvaluationProgress> remainingItems)
+        private void LogFragmentEvaluationProgress(
+            int numSpecsTotal,
+            TimeSpan elapsed,
+            IReadOnlyCollection<(PipGraphFragmentSerializer, Task<bool>)> allItems,
+            IReadOnlyCollection<(PipGraphFragmentSerializer, Task<bool>)> remainingItems)
         {
+            string remainingMessage = ConstructProgressRemainingMessage(elapsed, remainingItems);
+            m_logger.FrontEndEvaluatePhaseFragmentProgress(
+                FrontEndContext.LoggingContext,
+                numFragmentsDone: allItems.Count - remainingItems.Count,
+                numFragmentsTotal: allItems.Count,
+                remaining: remainingMessage);
+        }
+
+        private static string ConstructProgressRemainingMessage(TimeSpan elapsed, IReadOnlyCollection<(PipGraphFragmentSerializer, Task<bool>)> remainingItems)
+        {
+            var progressMessages = remainingItems
+                .Where(item => item.Item1.PipsDeserialized > 0)
+                .Take(10)
+                .Select(item => FormatProgressMessage(elapsed, $"{item.Item1.FragmentDescription} ({item.Item1.PipsDeserialized}/{item.Item1.TotalPipsToDeserialized})"))
+                .OrderBy(s => s, StringComparer.Ordinal)
+                .ToList();
+
+            return progressMessages.Count > 0
+                ? Environment.NewLine + string.Join(Environment.NewLine, progressMessages)
+                : "0";
+        }
+
+        private string ConstructProgressRemainingMessage(TimeSpan elapsed, IReadOnlyCollection<ModuleEvaluationProgress> remainingItems)
+        {
+            if (Configuration.Logging.OptimizeConsoleOutputForAzureDevOps || Configuration.Logging.OptimizeProgressUpdatingForAzureDevOps)
+            {
+                return remainingItems.Count.ToString(CultureInfo.InvariantCulture);
+            }
+
             var progressMessages = remainingItems
                 .Take(10)
                 .Select(item => FormatProgressMessage(elapsed, item.Module.Descriptor.DisplayName))

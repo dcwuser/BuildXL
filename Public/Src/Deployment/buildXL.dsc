@@ -21,55 +21,57 @@ namespace BuildXL {
             // analyzers
             importFrom("BuildXL.Tools").Execution.Analyzer.exe,
             importFrom("BuildXL.Tools").BxlScriptAnalyzer.exe,
-            ...(qualifier.targetFramework === "netcoreapp2.2" ? [] : [
-                importFrom("BuildXL.Cache.VerticalStore").Analyzer.exe
+            importFrom("BuildXL.Cache.VerticalStore").Analyzer.exe,
+
+            // content placement
+            ...addIfLazy(qualifier.targetFramework === "net472" && qualifier.targetRuntime !== "osx-x64", () => [
+                importFrom("BuildXL.Tools").ContentPlacement.Extraction.exe,
+                importFrom("BuildXL.Tools").ContentPlacement.ML.exe,
+                importFrom("BuildXL.Tools").ContentPlacement.ML.dll,
+                importFrom("BuildXL.Tools").ContentPlacement.OfflineMapping.exe,
+            ]),
+
+            ...addIfLazy(qualifier.targetRuntime !== "osx-x64", () => [
+                importFrom("BuildXL.Tools").SandboxedProcessExecutor.exe,
             ]),
 
             // tools
             ...addIfLazy(qualifier.targetRuntime !== "osx-x64", () => [{
                 subfolder: r`tools`,
                 contents: [
+                    ...addIf(!BuildXLSdk.Flags.genVSSolution && !BuildXLSdk.Flags.excludeBuildXLExplorer,
+                        {
+                            subfolder: r`bxp-server`,
+                            contents: [
+                                importFrom("BuildXL.Explorer").Server.withQualifier(
+                                    Object.merge<BuildXLSdk.NetCoreAppQualifier>(qualifier, {targetFramework: "netcoreapp3.0"})
+                                ).exe
+                            ]
+                        }
+                    ),
+                    importFrom("BuildXL.Tools").MsBuildGraphBuilder.deployment,
                     {
-                        subfolder: r`bxp`,
-                        contents: [
-                            importFrom("BuildXL.Explorer").App.app.appFolder
-                        ]
-                    },
-                    ...(BuildXLSdk.Flags.genVSSolution
-                        ? []
-                        : [ {
-                                subfolder: r`bxp-server`,
-                                    contents: [
-                                    importFrom("BuildXL.Explorer").Server.withQualifier(
-                                        Object.merge<BuildXLSdk.NetCoreAppQualifier>(qualifier, {targetFramework: "netcoreapp2.2"})
-                                    ).exe
-                                ]
-                            } ] ),
-                    {
-                        subfolder: r`MsBuildGraphBuilder`,
-                        contents: qualifier.targetFramework === "netcoreapp2.2" ? [] : [
+                        subfolder: r`bvfs`,
+                        contents: qualifier.targetRuntime !== "win-x64" ? [] : [
                             // If the current qualifier is full framework, this tool has to be built with 472
-                            importFrom("BuildXL.Tools").MsBuildGraphBuilder.withQualifier(
-                                Object.merge<(typeof qualifier) & {targetFramework: "net472"}>(qualifier, {targetFramework: "net472"})).exe
+                            importFrom("BuildXL.Cache.ContentStore").VfsApplication.withQualifier({
+                                configuration: qualifier.configuration,
+                                targetFramework: "net472",
+                                targetRuntime: "win-x64"
+                            }).exe,
+                            importFrom("BuildXL.Cache.ContentStore").App.withQualifier({
+                                configuration: qualifier.configuration,
+                                targetFramework: "net472",
+                                targetRuntime: "win-x64"
+                            }).exe
                         ]
                     },
                     {
-                        subfolder: r`NinjaGraphBuilder`,
-                        contents: [
-                            importFrom("BuildXL.Tools").NinjaGraphBuilder.exe,
-                            importFrom("BuildXL.Tools.Ninjson").pkg.contents
-                        ]
-                    },
-                    {
-                        subfolder: r`CMakeRunner`,
+                        subfolder: r`CMakeNinja`,
                         contents: [
                             importFrom("BuildXL.Tools").CMakeRunner.exe,
-                        ]
-                    },
-                    {
-                        subfolder: r`SandboxedProcessExecutor`,
-                        contents: [
-                            importFrom("BuildXL.Tools").SandboxedProcessExecutor.exe,
+                            importFrom("BuildXL.Tools").NinjaGraphBuilder.exe,
+                            importFrom("BuildXL.Tools.Ninjson").pkg.contents
                         ]
                     },
                 ]
@@ -77,7 +79,7 @@ namespace BuildXL {
         ]
     };
 
-    const frameworkSpecificPart = qualifier.targetFramework === "netcoreapp2.2"
+    const frameworkSpecificPart = BuildXLSdk.isDotNetCoreBuild
         ? qualifier.targetRuntime
         : qualifier.targetFramework;
 

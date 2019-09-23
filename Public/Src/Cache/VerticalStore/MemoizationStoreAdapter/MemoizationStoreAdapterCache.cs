@@ -32,6 +32,8 @@ namespace BuildXL.Cache.MemoizationStoreAdapter
         private readonly IAbsFileSystem m_fileSystem;
         private readonly AbsolutePath m_statsFile;
         private bool m_isShutdown;
+        private readonly bool m_replaceExistingOnPlaceFile;
+        private ImplicitPin m_implicitPin;
 
         /// <summary>
         /// .ctor
@@ -40,7 +42,15 @@ namespace BuildXL.Cache.MemoizationStoreAdapter
         /// <param name="innerCache">A CS2 ICache for which this layer will translate.</param>
         /// <param name="logger">For logging diagnostics.</param>
         /// <param name="statsFile">A file to write stats about the cache into.</param>
-        public MemoizationStoreAdapterCache(string cacheId, BuildXL.Cache.MemoizationStore.Interfaces.Caches.ICache innerCache, ILogger logger, AbsolutePath statsFile)
+        /// <param name="replaceExistingOnPlaceFile">When true, replace existing file when placing file.</param>
+        /// <param name="implicitPin">ImplicitPin to be used when creating sessions.</param>
+        public MemoizationStoreAdapterCache(
+            string cacheId,
+            BuildXL.Cache.MemoizationStore.Interfaces.Caches.ICache innerCache,
+            ILogger logger,
+            AbsolutePath statsFile,
+            bool replaceExistingOnPlaceFile = false,
+            ImplicitPin implicitPin = ImplicitPin.PutAndGet)
         {
             Contract.Requires(cacheId != null);
             Contract.Requires(innerCache != null);
@@ -51,6 +61,8 @@ namespace BuildXL.Cache.MemoizationStoreAdapter
             m_logger = logger;
             m_statsFile = statsFile;
             m_fileSystem = new PassThroughFileSystem(m_logger);
+            m_replaceExistingOnPlaceFile = replaceExistingOnPlaceFile;
+            m_implicitPin = implicitPin;
         }
 
         /// <summary>
@@ -149,14 +161,14 @@ namespace BuildXL.Cache.MemoizationStoreAdapter
             var createSessionResult = m_cache.CreateSession(
                 context,
                 $"{CacheId}-{sessionId}",
-                ImplicitPin.PutAndGet);
+                m_implicitPin);
             if (createSessionResult.Succeeded)
             {
                 var innerCacheSession = createSessionResult.Session;
                 var startupResult = await innerCacheSession.StartupAsync(context);
                 if (startupResult.Succeeded)
                 {
-                    return new MemoizationStoreAdapterCacheCacheSession(innerCacheSession, m_cache, CacheId, m_logger, sessionId);
+                    return new MemoizationStoreAdapterCacheCacheSession(innerCacheSession, m_cache, CacheId, m_logger, sessionId, m_replaceExistingOnPlaceFile);
                 }
                 else
                 {
@@ -176,14 +188,14 @@ namespace BuildXL.Cache.MemoizationStoreAdapter
             Contract.Requires(!IsReadOnly);
 
             var context = new Context(m_logger);
-            var createSessionResult = m_cache.CreateSession(context, $"{CacheId}-Anonymous", ImplicitPin.PutAndGet);
+            var createSessionResult = m_cache.CreateSession(context, $"{CacheId}-Anonymous", m_implicitPin);
             if (createSessionResult.Succeeded)
             {
                 var innerCacheSession = createSessionResult.Session;
                 var startupResult = await innerCacheSession.StartupAsync(context);
                 if (startupResult.Succeeded)
                 {
-                    return new MemoizationStoreAdapterCacheCacheSession(innerCacheSession, m_cache, CacheId, m_logger);
+                    return new MemoizationStoreAdapterCacheCacheSession(innerCacheSession, m_cache, CacheId, m_logger, null, m_replaceExistingOnPlaceFile);
                 }
                 else
                 {
@@ -205,14 +217,14 @@ namespace BuildXL.Cache.MemoizationStoreAdapter
             var createSessionResult = m_cache.CreateReadOnlySession(
                 context,
                 $"{CacheId}-Anonymous",
-                ImplicitPin.PutAndGet);
+                m_implicitPin);
             if (createSessionResult.Succeeded)
             {
                 var innerCacheSession = createSessionResult.Session;
                 var startupResult = await innerCacheSession.StartupAsync(context);
                 if (startupResult.Succeeded)
                 {
-                    return new MemoizationStoreAdapterCacheReadOnlySession(innerCacheSession, m_cache, CacheId, m_logger);
+                    return new MemoizationStoreAdapterCacheReadOnlySession(innerCacheSession, m_cache, CacheId, m_logger, null, m_replaceExistingOnPlaceFile);
                 }
                 else
                 {

@@ -2,9 +2,12 @@
 // Licensed under the MIT license. See LICENSE file in the project root for full license information.
 
 using System;
+using System.Collections.Generic;
 using System.ComponentModel;
 using System.Diagnostics.ContractsLight;
 using System.Threading.Tasks;
+using BuildXL.Cache.ContentStore.Distributed.NuCache;
+using BuildXL.Cache.ContentStore.Interfaces.Logging;
 using BuildXL.Cache.ContentStore.Service.Grpc;
 using BuildXL.Cache.ContentStore.Sessions;
 using BuildXL.Cache.ContentStore.SQLite;
@@ -14,11 +17,6 @@ using BuildXL.Cache.MemoizationStore.Sessions;
 using BuildXL.Cache.MemoizationStore.Stores;
 using BuildXL.Utilities;
 using AbsolutePath = BuildXL.Cache.ContentStore.Interfaces.FileSystem.AbsolutePath;
-
-[module: System.Diagnostics.CodeAnalysis.SuppressMessage("Microsoft.Performance", "CA1812:AvoidUninstantiatedInternalClasses",
-    Scope = "type",
-    Target = "BuildXL.Cache.MemoizationStoreAdapter.CloudStoreLocalCacheServiceFactory+Config",
-    Justification = "Tool is confused - it is constructed generically")]
 
 namespace BuildXL.Cache.MemoizationStoreAdapter
 {
@@ -45,7 +43,8 @@ namespace BuildXL.Cache.MemoizationStoreAdapter
         //     "CheckCacheIntegrityOnStartup":{10}
         //     "SingleInstanceTimeoutInSeconds":{11}
         //     "SynchronizationMode":{12},
-        //     "LogFlushIntervalSeconds":{13}
+        //     "LogFlushIntervalSeconds":{13},
+        //    "ReplaceExistingOnPlaceFile":{14},
         // }
         private sealed class Config
         {
@@ -151,6 +150,21 @@ namespace BuildXL.Cache.MemoizationStoreAdapter
             /// </summary>
             [DefaultValue(0)]
             public uint LogFlushIntervalSeconds { get; set; }
+
+            [DefaultValue(false)]
+            public bool ReplaceExistingOnPlaceFile { get; set; }
+
+            [DefaultValue(false)]
+            public bool EnableMetadataServer { get; set; }
+
+            [DefaultValue(false)]
+            public bool UseRocksDbMemoizationStore { get; set; }
+
+            [DefaultValue(60 * 60)]
+            public int RocksDbMemoizationStoreGarbageCollectionIntervalInSeconds { get; set; }
+
+            [DefaultValue(500_000)]
+            public int RocksDbMemoizationStoreGarbageCollectionMaximumNumberOfEntriesToKeep { get; set; }
         }
 
         /// <inheritdoc />
@@ -174,46 +188,7 @@ namespace BuildXL.Cache.MemoizationStoreAdapter
 
                 logger.Debug($"Creating CASaaS backed LocalCache using cache name: {cacheConfig.CacheName}");
 
-                ServiceClientRpcConfiguration rpcConfiguration;
-                if (cacheConfig.GrpcPort != 0)
-                {
-                    rpcConfiguration = new ServiceClientRpcConfiguration((int)cacheConfig.GrpcPort);
-                }
-                else
-                {
-                    var factory = new MemoryMappedFileGrpcPortSharingFactory(logger, cacheConfig.GrpcPortFileName);
-                    var portReader = factory.GetPortReader();
-                    var port = portReader.ReadPort();
-
-                    rpcConfiguration = new ServiceClientRpcConfiguration(port);
-                }
-
-                var  rootPath = new AbsolutePath(cacheConfig.MetadataRootPath);
-                var memoConfig = new SQLiteMemoizationStoreConfiguration(rootPath)
-                                 {
-                                     MaxRowCount = cacheConfig.MaxStrongFingerprints,
-                                     BackupDatabase = cacheConfig.BackupLKGCache,
-                                     VerifyIntegrityOnStartup = cacheConfig.CheckCacheIntegrityOnStartup,
-                                     SingleInstanceTimeoutSeconds = (int)cacheConfig.SingleInstanceTimeoutInSeconds
-                                 };
-
-                if (!string.IsNullOrEmpty(cacheConfig.SynchronizationMode))
-                {
-                    memoConfig.SyncMode = (SynchronizationMode)Enum.Parse(typeof(SynchronizationMode), cacheConfig.SynchronizationMode, ignoreCase: true);
-                }
-
-                var localCache = new LocalCache(
-                    logger,
-                    cacheConfig.CacheName,
-                    rootPath,
-                    rpcConfiguration,
-                    cacheConfig.ConnectionRetryIntervalSeconds,
-                    cacheConfig.ConnectionRetryCount,
-                    memoConfig,
-                    scenarioName: cacheConfig.ScenarioName);
-
-                var statsFilePath = new AbsolutePath(logPath.Path + ".stats");
-                var cache = new MemoizationStoreAdapterCache(cacheConfig.CacheId, localCache, logger, statsFilePath);
+                var cache = CreateCache(cacheConfig, logPath, logger);
 
                 var startupResult = await cache.StartupAsync();
                 if (!startupResult.Succeeded)
@@ -229,6 +204,98 @@ namespace BuildXL.Cache.MemoizationStoreAdapter
             {
                 return new CacheConstructionFailure(cacheConfig.CacheId, e);
             }
+        }
+
+        private static MemoizationStoreAdapterCache CreateCache(Config cacheConfig, AbsolutePath logPath, ILogger logger)
+        {
+            ServiceClientRpcConfiguration rpcConfiguration;
+            if (cacheConfig.GrpcPort != 0)
+            {
+                rpcConfiguration = new ServiceClientRpcConfiguration((int)cacheConfig.GrpcPort);
+            }
+            else
+            {
+                var factory = new MemoryMappedFileGrpcPortSharingFactory(logger, cacheConfig.GrpcPortFileName);
+                var portReader = factory.GetPortReader();
+                var port = portReader.ReadPort();
+
+                rpcConfiguration = new ServiceClientRpcConfiguration(port);
+            }
+
+            var serviceClientConfiguration = new ServiceClientContentStoreConfiguration(cacheConfig.CacheName, rpcConfiguration, cacheConfig.ScenarioName)
+            {
+                RetryCount = cacheConfig.ConnectionRetryCount,
+                RetryIntervalSeconds = cacheConfig.ConnectionRetryIntervalSeconds,
+            };
+
+            MemoizationStore.Interfaces.Caches.ICache localCache;
+            if (cacheConfig.EnableMetadataServer)
+            {
+                localCache = LocalCache.CreateRpcCache(logger, serviceClientConfiguration);
+            }
+            else
+            {
+                var metadataRootPath = new AbsolutePath(cacheConfig.MetadataRootPath);
+
+                localCache = LocalCache.CreateRpcContentStoreInProcMemoizationStoreCache(logger,
+                    metadataRootPath,
+                    serviceClientConfiguration,
+                    CreateInProcMemoizationStoreConfiguration(cacheConfig, metadataRootPath));
+            }
+
+            var statsFilePath = new AbsolutePath(logPath.Path + ".stats");
+            var cache = new MemoizationStoreAdapterCache(cacheConfig.CacheId, localCache, logger, statsFilePath, cacheConfig.ReplaceExistingOnPlaceFile);
+            return cache;
+        }
+
+        private static MemoizationStoreConfiguration CreateInProcMemoizationStoreConfiguration(Config cacheConfig, AbsolutePath cacheRootPath)
+        {
+            if (cacheConfig.UseRocksDbMemoizationStore)
+            {
+                var memoConfig = new RocksDbMemoizationStoreConfiguration()
+                {
+                    Database = new RocksDbContentLocationDatabaseConfiguration(cacheRootPath / "RocksDbMemoizationStore")
+                    {
+                        CleanOnInitialize = false,
+                        GarbageCollectionInterval = TimeSpan.FromSeconds(cacheConfig.RocksDbMemoizationStoreGarbageCollectionIntervalInSeconds),
+                        MetadataGarbageCollectionEnabled = true,
+                        MetadataGarbageCollectionMaximumNumberOfEntriesToKeep = cacheConfig.RocksDbMemoizationStoreGarbageCollectionMaximumNumberOfEntriesToKeep,
+                    },
+                };
+
+                return memoConfig;
+            }
+            else
+            {
+                var memoConfig = new SQLiteMemoizationStoreConfiguration(cacheRootPath)
+                {
+                    MaxRowCount = cacheConfig.MaxStrongFingerprints,
+                    SingleInstanceTimeoutSeconds = (int)cacheConfig.SingleInstanceTimeoutInSeconds
+                };
+
+                memoConfig.Database.BackupDatabase = cacheConfig.BackupLKGCache;
+                memoConfig.Database.VerifyIntegrityOnStartup = cacheConfig.CheckCacheIntegrityOnStartup;
+
+                if (!string.IsNullOrEmpty(cacheConfig.SynchronizationMode))
+                {
+                    memoConfig.Database.SyncMode = (SynchronizationMode)Enum.Parse(typeof(SynchronizationMode), cacheConfig.SynchronizationMode, ignoreCase: true);
+                }
+
+                return memoConfig;
+            }
+        }
+
+        /// <inheritdoc />
+        public IEnumerable<Failure> ValidateConfiguration(ICacheConfigData cacheData)
+        {
+            return CacheConfigDataValidator.ValidateConfiguration<Config>(cacheData, cacheConfig =>
+            {
+                var failures = new List<Failure>();
+                failures.AddFailureIfNullOrWhitespace(cacheConfig.CacheId, nameof(cacheConfig.CacheId));
+                failures.AddFailureIfNullOrWhitespace(cacheConfig.CacheName, nameof(cacheConfig.CacheName));
+                failures.AddFailureIfNullOrWhitespace(cacheConfig.MetadataLogPath, nameof(cacheConfig.MetadataLogPath));
+                return failures;
+            });
         }
     }
 }

@@ -7,6 +7,7 @@ using System.IO;
 using System.Linq;
 using BuildXL.Pips.Operations;
 using BuildXL.Utilities;
+using BuildXL.Utilities.Qualifier;
 
 namespace BuildXL.Ide.Generator
 {
@@ -18,7 +19,7 @@ namespace BuildXL.Ide.Generator
         /// <summary>
         /// Represents the resgen processes
         /// </summary>
-        public Dictionary<string, List<EmbeddedResource>> ResourcesByQualifier { get; }
+        public Dictionary<QualifierId, List<EmbeddedResource>> ResourcesByQualifier { get; }
 
         private bool m_isTestProject;
         private bool m_isXunitTestProject;
@@ -36,12 +37,24 @@ namespace BuildXL.Ide.Generator
             // We will use this data to find non-compiled "Content" items.
             // I filter *.dll files because there were some dlls as inputs (e.g., System.dll in the project file directory) for the OSGTools
             m_inputs = context.EnumeratePipGraphFilesUnderDirectory(directory).Where(a => a.GetExtension(context.PathTable) != context.DllExtensionName).ToList();
-            ResourcesByQualifier = new Dictionary<string, List<EmbeddedResource>>();
+            ResourcesByQualifier = new Dictionary<QualifierId, List<EmbeddedResource>>();
         }
 
         internal override void VisitProcess(Process process, ProcessType pipCategory)
         {
-            string friendlyQualifier = Context.QualifierTable.GetCanonicalDisplayString(process.Provenance.QualifierId);
+            var qualifier = Context.QualifierTable.GetQualifier(process.Provenance.QualifierId);
+
+            // only consider processes targeting current os in debug configuration
+            // also, additionally exclude projects targeting net451
+            var currentRuntime = OperatingSystemHelper.IsMacOS ? "osx-x64" : "win-x64";
+            if (!QualifierPropertyEquals(qualifier, "targetRuntime", currentRuntime)
+                || !QualifierPropertyEquals(qualifier, QualifierConfigurationPropertyName, "debug")
+                || QualifierPropertyEquals(qualifier, QualifierTargetFrameworkPropertyName, "net451"))
+            {
+                return;
+            }
+
+            var friendlyQualifier = process.Provenance.QualifierId;
 
             switch (pipCategory)
             {
@@ -54,13 +67,8 @@ namespace BuildXL.Ide.Generator
                     break;
                 case ProcessType.Csc:
                     Project project = CreateProject(process);
-
-                    // For now, if there is another csc process from the same spec file, ignore it.
-                    if (ProjectsByQualifier.Count == 0)
-                    {
-                        ProjectsByQualifier[friendlyQualifier] = project;
-                        PopulatePropertiesAndItems(project, process);
-                    }
+                    PopulatePropertiesAndItems(project, process);
+                    ProjectsByQualifier[friendlyQualifier] = project;
 
                     break;
 
@@ -84,10 +92,7 @@ namespace BuildXL.Ide.Generator
 
         internal override void VisitDirectory(SealDirectory sealDirectory)
         {
-            Project project;
-            string friendlyQualifier = Context.QualifierTable.GetCanonicalDisplayString(sealDirectory.Provenance.QualifierId);
-
-            if (ProjectsByQualifier.TryGetValue(friendlyQualifier, out project))
+            if (ProjectsByQualifier.TryGetValue(sealDirectory.Provenance.QualifierId, out var project))
             {
                 if (sealDirectory.Tags.Contains(Context.AssemblyDeploymentTag))
                 {
@@ -102,7 +107,7 @@ namespace BuildXL.Ide.Generator
             }
         }
 
-        private void ExtractOutputPathFromUnitTest(Process process, string qualifier, int position)
+        private void ExtractOutputPathFromUnitTest(Process process, QualifierId qualifier, int position)
         {
             MakeTestProject();
 
@@ -129,7 +134,7 @@ namespace BuildXL.Ide.Generator
             m_projectTypeGuids.Add("{60dc8134-eba5-43b8-bcc9-bb4bc16c2548}");
         }
 
-        private void ExtractResourceFromResGen(Process process, string qualifier)
+        private void ExtractResourceFromResGen(Process process, QualifierId qualifier)
         {
             var arguments = Context.GetArgumentsDataFromProcess(process);
 
@@ -163,7 +168,7 @@ namespace BuildXL.Ide.Generator
             }
         }
 
-        private void AddResourceWithQualifier(string qualifier, EmbeddedResource resource)
+        private void AddResourceWithQualifier(QualifierId qualifier, EmbeddedResource resource)
         {
             if (ResourcesByQualifier.ContainsKey(qualifier))
             {
@@ -201,6 +206,24 @@ namespace BuildXL.Ide.Generator
             base.EndVisitingProject();
         }
 
+        internal override string GenerateConditionalForProject(Project project)
+        {
+            var conjuncts = new List<string>();
+            if (TryGetQualifierProperty(project, QualifierConfigurationPropertyName, out var conf))
+            {
+                conjuncts.Add($"'$(Configuration)' == '{conf}'");
+            }
+
+            if (TryGetQualifierProperty(project, QualifierTargetFrameworkPropertyName, out var targetFramework))
+            {
+                conjuncts.Add($"'$(TargetFramework)' == '{targetFramework}'");
+            }
+
+            return conjuncts.Any()
+                ? string.Join(" And ", conjuncts)
+                : "True";
+        }
+
         private void AddContentItems(Project project)
         {
             foreach (var path in m_inputs)
@@ -212,7 +235,7 @@ namespace BuildXL.Ide.Generator
         private void AddEmbeddedResources(Project project)
         {
             List<EmbeddedResource> resources;
-            if (!ResourcesByQualifier.TryGetValue(project.FriendlyQualifier, out resources))
+            if (!ResourcesByQualifier.TryGetValue(project.QualifierId, out resources))
             {
                 return;
             }
@@ -248,7 +271,11 @@ namespace BuildXL.Ide.Generator
                 else if (type == PipFragmentType.AbsolutePath && !isNested)
                 {
                     var path = GetPathValue(arg);
-                    AddSourceItem(path, project, "Compile");
+                    // paths under the project file are automatically added by the sdk
+                    if (!path.IsWithin(Context.PathTable, Path.GetParent(Context.PathTable)))
+                    {
+                        AddSourceItem(path, project, "Compile");
+                    }
                 }
                 else if (type == PipFragmentType.StringLiteral)
                 {
@@ -260,7 +287,7 @@ namespace BuildXL.Ide.Generator
                             break;
                         case "/r:":
                         case "/link:":
-                            action = (obj) => project.RawReferences.Add((AbsolutePath)obj);
+                            action = (obj) => project.AddRawReference((AbsolutePath)obj);
                             break;
                         case "/langversion:":
                             action = (obj) => project.SetProperty("LangVersion", (string)obj);
@@ -342,10 +369,28 @@ namespace BuildXL.Ide.Generator
                             };
                             break;
                         default:
-                            if (strValue.StartsWith("/target:", StringComparison.OrdinalIgnoreCase))
+                            const string Target = "/target:";
+                            const string Define = "/define:";
+                            const string Reference = "/r:";
+
+                            if (strValue.StartsWith(Target, StringComparison.OrdinalIgnoreCase))
                             {
-                                // BuildXL XML specific
-                                project.SetProperty("OutputType", strValue.Substring(8));
+                                project.SetProperty("OutputType", strValue.Substring(Target.Length));
+                                break;
+                            }
+
+                            if (strValue.StartsWith(Define, StringComparison.OrdinalIgnoreCase))
+                            {
+                                project.SetProperty("DefineConstants", strValue.Substring(Define.Length).Trim('"'));
+                                break;
+                            }
+
+                            if (strValue.StartsWith(Reference, StringComparison.OrdinalIgnoreCase) &&
+                                strValue.EndsWith("="))
+                            {
+                                string alias = strValue.Substring(Reference.Length).Split('=')[0];
+                                action = (obj) => project.AddRawReference((AbsolutePath)obj, alias);
+                                break;
                             }
 
                             break;

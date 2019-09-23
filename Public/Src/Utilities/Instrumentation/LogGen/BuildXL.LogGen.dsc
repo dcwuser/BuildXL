@@ -11,7 +11,6 @@ namespace LogGen {
         references: [
             ...addIfLazy(BuildXLSdk.isFullFramework, () => [
                 NetFx.System.Text.Encoding.dll,
-                importFrom("Microsoft.Diagnostics.Tracing.EventSource.Redist").pkg,
                 importFrom("System.Reflection.Metadata").pkg,
                 importFrom("System.Collections.Immutable").pkg,
             ]),
@@ -20,8 +19,8 @@ namespace LogGen {
             importFrom("BuildXL.Utilities").dll,
             importFrom("BuildXL.Utilities").ToolSupport.dll,
             importFrom("BuildXL.Utilities").CodeGenerationHelper.dll,
-            importFrom("Microsoft.CodeAnalysis.CSharp").pkg,
-            importFrom("Microsoft.CodeAnalysis.Common").pkg,
+            importFrom("Microsoft.CodeAnalysis.CSharp").withQualifier({ targetFramework: "netstandard2.0" }).pkg,
+            importFrom("Microsoft.CodeAnalysis.Common").withQualifier({ targetFramework: "netstandard2.0" }).pkg,
         ],
     });
 

@@ -3,7 +3,6 @@
 
 using System;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.Diagnostics.ContractsLight;
 using System.IO;
 using System.Linq;
@@ -11,7 +10,6 @@ using System.Threading;
 using System.Threading.Tasks;
 using BuildXL.Cache.ContentStore.Distributed.Sessions;
 using BuildXL.Cache.ContentStore.Hashing;
-using BuildXL.Cache.ContentStore.Interfaces.Distributed;
 using BuildXL.Cache.ContentStore.Interfaces.FileSystem;
 using BuildXL.Cache.ContentStore.Interfaces.Results;
 using BuildXL.Cache.ContentStore.Interfaces.Tracing;
@@ -32,12 +30,17 @@ namespace BuildXL.Cache.ContentStore.Distributed.Stores
     public class DistributedContentCopier<T> : StartupShutdownSlimBase, IDistributedContentCopier
         where T : PathBase
     {
-        // Gate to control the maximum number of simultaneously active active IO operations.
+        // Gate to control the maximum number of simultaneously active IO operations.
         private readonly SemaphoreSlim _ioGate;
 
+        // Gate to control the maximum number of simultaneously active proactive copies.
+        private readonly SemaphoreSlim _proactiveCopyIoGate;
+
         private readonly IReadOnlyList<TimeSpan> _retryIntervals;
+        private readonly TimeSpan _timeoutForPoractiveCopies;
         private readonly DisposableDirectory _tempFolderForCopies;
         private readonly IFileCopier<T> _remoteFileCopier;
+        private readonly ICopyRequester _copyRequester;
         private readonly IFileExistenceChecker<T> _remoteFileExistenceChecker;
         private readonly IPathTransformer<T> _pathTransformer;
         private readonly IContentLocationStore _contentLocationStore;
@@ -63,6 +66,7 @@ namespace BuildXL.Cache.ContentStore.Distributed.Stores
             IAbsFileSystem fileSystem,
             IFileCopier<T> fileCopier,
             IFileExistenceChecker<T> fileExistenceChecker,
+            ICopyRequester copyRequester,
             IPathTransformer<T> pathTransformer,
             IContentLocationStore contentLocationStore)
         {
@@ -73,6 +77,7 @@ namespace BuildXL.Cache.ContentStore.Distributed.Stores
             _tempFolderForCopies = new DisposableDirectory(fileSystem, workingDirectory / "Temp");
             _remoteFileCopier = fileCopier;
             _remoteFileExistenceChecker = fileExistenceChecker;
+            _copyRequester = copyRequester;
             _contentLocationStore = contentLocationStore;
             _pathTransformer = pathTransformer;
             _fileSystem = fileSystem;
@@ -83,7 +88,10 @@ namespace BuildXL.Cache.ContentStore.Distributed.Stores
             _hashers = HashInfoLookup.CreateAll();
 
             _ioGate = new SemaphoreSlim(_settings.MaxConcurrentCopyOperations);
+            _proactiveCopyIoGate = new SemaphoreSlim(_settings.MaxConcurrentProactiveCopyOperations);
             _retryIntervals = settings.RetryIntervalForCopies;
+
+            _timeoutForPoractiveCopies = settings.TimeoutForProactiveCopies;
         }
 
         /// <inheritdoc />
@@ -133,9 +141,9 @@ namespace BuildXL.Cache.ContentStore.Distributed.Stores
                 var badContentLocations = new HashSet<MachineLocation>();
                 var missingContentLocations = new HashSet<MachineLocation>();
                 int attemptCount = 0;
+
                 while (attemptCount < _retryIntervals.Count && (putResult == null || !putResult))
                 {
-                    Tracer.Debug(operationContext, $"Attempt #{attemptCount}: Copying {hashInfo.ContentHash} with {hashInfo.Locations.Count} locations");
                     bool retry;
 
                     (putResult, retry) = await WalkLocationsAndCopyAndPutAsync(
@@ -154,28 +162,34 @@ namespace BuildXL.Cache.ContentStore.Distributed.Stores
 
                     if (missingContentLocations.Count == hashInfo.Locations.Count)
                     {
-                        Tracer.Warning(operationContext, $"{AttemptTracePrefix(attemptCount)} All replicas {hashInfo.Locations.Count} are reported missing. Not retrying for hash {hashInfo.ContentHash}.");
+                        Tracer.Warning(operationContext, $"{AttemptTracePrefix(attemptCount)} All replicas {hashInfo.Locations.Count} are reported missing. Not retrying for hash {hashInfo.ContentHash.ToShortString()}.");
                         break;
                     }
 
                     if (!retry)
                     {
-                        Tracer.Warning(operationContext, $"{AttemptTracePrefix(attemptCount)} Cannot place {hashInfo.ContentHash} due to error: {putResult.ErrorMessage}. Not retrying for hash {hashInfo.ContentHash}.");
+                        Tracer.Warning(operationContext, $"{AttemptTracePrefix(attemptCount)} Cannot place {hashInfo.ContentHash.ToShortString()} due to error: {putResult.ErrorMessage}. Not retrying for hash {hashInfo.ContentHash.ToShortString()}.");
                         break;
                     }
-
-                    if (attemptCount == _retryIntervals.Count - 1)
-                    {
-                        // This is the last attempt, no need to wait any more.
-                        break;
-                    }
-
-                    TimeSpan waitDelay = _retryIntervals[attemptCount];
-                    Tracer.Warning(operationContext, $"{AttemptTracePrefix(attemptCount)} All replicas {hashInfo.Locations.Count} failed. Retrying for hash {hashInfo.ContentHash}...");
 
                     attemptCount++;
 
-                    await Task.Delay(waitDelay, cts);
+                    if (attemptCount < _retryIntervals.Count)
+                    {
+                        long waitTicks = _retryIntervals[attemptCount].Ticks;
+
+                        // Randomize the wait delay to `[0.5 * delay, 1.5 * delay)`
+                        TimeSpan waitDelay = TimeSpan.FromTicks((long)((waitTicks / 2) + (waitTicks * ThreadSafeRandom.Generator.NextDouble())));
+
+                        // Log with the original attempt count
+                        Tracer.Warning(operationContext, $"{AttemptTracePrefix(attemptCount - 1)} All replicas {hashInfo.Locations.Count} failed. Retrying for hash {hashInfo.ContentHash.ToShortString()} in {waitDelay.TotalMilliseconds}ms...");
+
+                        await Task.Delay(waitDelay, cts);
+                    }
+                    else
+                    {
+                        break;
+                    }
                 }
 
                 // now that retries are exhausted, combine the missing and bad locations.
@@ -194,7 +208,7 @@ namespace BuildXL.Cache.ContentStore.Distributed.Stores
                 else
                 {
                     Tracer.TrackMetric(operationContext, "RemoteBytesCount", putResult.ContentSize);
-                    _counters[DistributedContentCopierCounters.RemoteBytes].Add((int)putResult.ContentSize);
+                    _counters[DistributedContentCopierCounters.RemoteBytes].Add(putResult.ContentSize);
                     _counters[DistributedContentCopierCounters.RemoteFilesCopied].Increment();
                 }
 
@@ -219,6 +233,39 @@ namespace BuildXL.Cache.ContentStore.Distributed.Stores
             }
         }
 
+        /// <summary>
+        /// Requests another machine to copy from the current machine.
+        /// </summary>
+        public Task<BoolResult> RequestCopyFileAsync(OperationContext context, ContentHash hash, MachineLocation targetLocation)
+        {
+            context.TraceDebug("Waiting on IOGate for RequestCopyFileAsync: " +
+                            $"ContentHash={hash.ToShortString()} " +
+                            $"TargetLocation=[{targetLocation}] " +
+                            $"IOGate.OccupiedCount={_settings.MaxConcurrentProactiveCopyOperations - _proactiveCopyIoGate.CurrentCount} ");
+
+            return _proactiveCopyIoGate.GatedOperationAsync(ts =>
+                {
+                    var cts = new CancellationTokenSource();
+                    cts.CancelAfter(_timeoutForPoractiveCopies);
+                    var innerContext = context.CreateNested(cts.Token);
+                    return context.PerformOperationAsync(
+                        Tracer,
+                        operation: () =>
+                        {
+                            return _copyRequester.RequestCopyFileAsync(innerContext, hash, targetLocation);
+                        },
+                        traceOperationStarted: false,
+                        extraEndMessage: result =>
+                            $"ContentHash={hash.ToShortString()} " +
+                            $"TargetLocation=[{targetLocation}] " +
+                            $"IOGate.OccupiedCount={_settings.MaxConcurrentProactiveCopyOperations - _proactiveCopyIoGate.CurrentCount} " +
+                            $"IOGate.Wait={ts.TotalMilliseconds}ms." +
+                            $"Timeout={cts.Token.IsCancellationRequested}"
+                        );
+                },
+                context.Token);
+        }
+
         private PutResult CreateCanceledPutResult() => new ErrorResult("The operation was canceled").AsResult<PutResult>();
 
         /// <nodoc />
@@ -236,6 +283,7 @@ namespace BuildXL.Cache.ContentStore.Distributed.Stores
             // before each retry, clear the list of bad locations so we can retry them all.
             // this helps isolate transient network errors.
             badContentLocations.Clear();
+            string lastErrorMessage = null;
 
             foreach (MachineLocation location in hashInfo.Locations)
             {
@@ -253,7 +301,7 @@ namespace BuildXL.Cache.ContentStore.Distributed.Stores
                 {
                     Tracer.Debug(
                         context,
-                        $"{AttemptTracePrefix(attemptCount)} Could not copy file with hash {hashInfo.ContentHash} to temp path {tempLocation} because cancellation was requested.");
+                        $"{AttemptTracePrefix(attemptCount)} Could not copy file with hash {hashInfo.ContentHash.ToShortString()} to temp path {tempLocation} because cancellation was requested.");
                     return (result: CreateCanceledPutResult(), retry: false);
                 }
 
@@ -272,7 +320,7 @@ namespace BuildXL.Cache.ContentStore.Distributed.Stores
                     CopyFileResult copyFileResult = null;
                     try
                     {
-                        copyFileResult = await GatedIoOperationAsync(ts => context.PerformOperationAsync(
+                        copyFileResult = await _ioGate.GatedOperationAsync(ts => context.PerformOperationAsync(
                             Tracer,
                             async () =>
                             {
@@ -283,10 +331,11 @@ namespace BuildXL.Cache.ContentStore.Distributed.Stores
                                     reportImmediately: false,
                                     reportAtEnd: false);
                             },
+                            traceOperationStarted: false,
+                            traceOperationFinished: true,
                             // _ioGate.CurrentCount returns the number of free slots, but we need to print the number of occupied slots instead.
-                            extraStartMessage: $"({hashInfo.ContentHash} size={hashInfo.Size} from=[{sourcePath}]) to=[{tempLocation}] trusted={_settings.UseTrustedHash}.",
                             extraEndMessage: (result) =>
-                                $"contentHash=[{hashInfo.ContentHash}] " +
+                                $"contentHash=[{hashInfo.ContentHash.ToShortString()}] " +
                                 $"from=[{sourcePath}] " +
                                 $"size=[{result.Size ?? hashInfo.Size}] " +
                                 $"trusted={_settings.UseTrustedHash} " +
@@ -317,77 +366,101 @@ namespace BuildXL.Cache.ContentStore.Distributed.Stores
                         switch (copyFileResult.Code)
                         {
                             case CopyFileResult.ResultCode.Success:
-                                _contentLocationStore.MachineReputationTracker.ReportReputation(location, MachineReputation.Good);
+                                _contentLocationStore.ReportReputation(location, MachineReputation.Good);
                                 break;
                             case CopyFileResult.ResultCode.FileNotFoundError:
+                                lastErrorMessage = $"Could not copy file with hash {hashInfo.ContentHash.ToShortString()} from path {sourcePath} to path {tempLocation} due to an error with the sourcepath: {copyFileResult}";
                                 Tracer.Warning(
                                     context,
-                                    $"{AttemptTracePrefix(attemptCount)} Could not copy file with hash {hashInfo.ContentHash} from path {sourcePath} to path {tempLocation} due to an error with the sourcepath: {copyFileResult} Trying another replica.");
+                                    $"{AttemptTracePrefix(attemptCount)} {lastErrorMessage} Trying another replica.");
                                 missingContentLocations.Add(location);
-                                _contentLocationStore.MachineReputationTracker.ReportReputation(location, MachineReputation.Missing);
+                                _contentLocationStore.ReportReputation(location, MachineReputation.Missing);
                                 break;
                             case CopyFileResult.ResultCode.SourcePathError:
+                                lastErrorMessage = $"Could not copy file with hash {hashInfo.ContentHash.ToShortString()} from path {sourcePath} to path {tempLocation} due to an error with the sourcepath: {copyFileResult}";
                                 Tracer.Warning(
                                     context,
-                                    $"{AttemptTracePrefix(attemptCount)} Could not copy file with hash {hashInfo.ContentHash} from path {sourcePath} to path {tempLocation} due to an error with the sourcepath: {copyFileResult} Trying another replica.");
-                                _contentLocationStore.MachineReputationTracker.ReportReputation(location, MachineReputation.Bad);
+                                    $"{AttemptTracePrefix(attemptCount)} {lastErrorMessage} Trying another replica.");
+                                _contentLocationStore.ReportReputation(location, MachineReputation.Bad);
                                 badContentLocations.Add(location);
                                 break;
                             case CopyFileResult.ResultCode.DestinationPathError:
+                                lastErrorMessage = $"Could not copy file with hash {hashInfo.ContentHash.ToShortString()} from path {sourcePath} to temp path {tempLocation} due to an error with the destination path: {copyFileResult}";
                                 Tracer.Warning(
                                     context,
-                                    $"{AttemptTracePrefix(attemptCount)} Could not copy file with hash {hashInfo.ContentHash} from path {sourcePath} to temp path {tempLocation} due to an error with the destination path: {copyFileResult} Not trying another replica.");
-                                return (new ErrorResult(copyFileResult).AsResult<PutResult>(), true);
+                                    $"{AttemptTracePrefix(attemptCount)} {lastErrorMessage} Not trying another replica.");
+                                return (result: new ErrorResult(copyFileResult).AsResult<PutResult>(), retry: true);
                             case CopyFileResult.ResultCode.CopyTimeoutError:
+                                lastErrorMessage = $"Could not copy file with hash {hashInfo.ContentHash.ToShortString()} from path {sourcePath} to path {tempLocation} due to copy timeout: {copyFileResult}";
                                 Tracer.Warning(
                                     context,
-                                    $"{AttemptTracePrefix(attemptCount)} Could not copy file with hash {hashInfo.ContentHash} from path {sourcePath} to path {tempLocation} due to copy timeout: {copyFileResult} Trying another replica.");
-                                _contentLocationStore.MachineReputationTracker.ReportReputation(location, MachineReputation.Timeout);
+                                    $"{AttemptTracePrefix(attemptCount)} {lastErrorMessage} Trying another replica.");
+                                _contentLocationStore.ReportReputation(location, MachineReputation.Timeout);
                                 break;
                             case CopyFileResult.ResultCode.CopyBandwidthTimeoutError:
+                                lastErrorMessage = $"Could not copy file with hash {hashInfo.ContentHash.ToShortString()} from path {sourcePath} to path {tempLocation} due to insufficient bandwidth timeout: {copyFileResult}";
                                 Tracer.Warning(
                                     context,
-                                    $"{AttemptTracePrefix(attemptCount)} Could not copy file with hash {hashInfo.ContentHash} from path {sourcePath} to path {tempLocation} due to insufficient bandwidth timeout: {copyFileResult} Trying another replica.");
-                                _contentLocationStore.MachineReputationTracker.ReportReputation(location, MachineReputation.Timeout);
+                                    $"{AttemptTracePrefix(attemptCount)} {lastErrorMessage} Trying another replica.");
+                                _contentLocationStore.ReportReputation(location, MachineReputation.Timeout);
                                 break;
                             case CopyFileResult.ResultCode.InvalidHash:
+                                lastErrorMessage = $"Could not copy file with hash {hashInfo.ContentHash.ToShortString()} from path {sourcePath} to path {tempLocation} due to invalid hash: {copyFileResult}";
                                 Tracer.Warning(
                                     context,
-                                    $"{AttemptTracePrefix(attemptCount)} {copyFileResult}");
+                                    $"{AttemptTracePrefix(attemptCount)} {lastErrorMessage} {copyFileResult}");
                                 break;
                             case CopyFileResult.ResultCode.Unknown:
+                                lastErrorMessage = $"Could not copy file with hash {hashInfo.ContentHash.ToShortString()} from path {sourcePath} to temp path {tempLocation} due to an internal error: {copyFileResult}";
                                 Tracer.Warning(
                                     context,
-                                    $"{AttemptTracePrefix(attemptCount)} Could not copy file with hash {hashInfo.ContentHash} from path {sourcePath} to temp path {tempLocation} due to an internal error: {copyFileResult} Not trying another replica.");
-                                _contentLocationStore.MachineReputationTracker.ReportReputation(location, MachineReputation.Bad);
+                                    $"{AttemptTracePrefix(attemptCount)} {lastErrorMessage} Not trying another replica.");
+                                _contentLocationStore.ReportReputation(location, MachineReputation.Bad);
                                 break;
                             default:
-                                return (new ErrorResult(copyFileResult, $"{AttemptTracePrefix(attemptCount)} File copier result code {copyFileResult.Code} is not recognized").AsResult<PutResult>(), true);
+                                lastErrorMessage = $"File copier result code {copyFileResult.Code} is not recognized";
+                                return (result: new ErrorResult(copyFileResult, $"{AttemptTracePrefix(attemptCount)} {lastErrorMessage}").AsResult<PutResult>(), retry: true);
                         }
 
                         if (copyFileResult.Succeeded)
                         {
+                            // The copy succeeded, but it is possible that the resulting size doesn't match an expected one.
+                            if (hashInfo.Size != -1 && copyFileResult.Size != null && hashInfo.Size != copyFileResult.Size.Value)
+                            {
+                                lastErrorMessage =
+                                    $"Contenthash {hashInfo.ContentHash.ToShortString()} at location {location} has content size {copyFileResult.Size.Value} mismatch from {hashInfo.Size}";
+                                Tracer.Warning(
+                                    context,
+                                    $"{AttemptTracePrefix(attemptCount)} {lastErrorMessage} Trying another replica.");
+                                // Not tracking the source as a machine with bad reputation, because it is possible that we provided the wrong size.
+
+                                continue;
+                            }
+
                             PutResult putResult = await handleCopyAsync((copyFileResult, tempLocation, attemptCount));
 
                             if (putResult.Succeeded)
                             {
                                 // The put succeeded, but this doesn't necessarily mean that we put the content we intended. Check the content hash
                                 // to ensure it's what is expected. This should only go wrong for a small portion of non-trusted puts.
-                                if (putResult.ContentHash == hashInfo.ContentHash)
+                                if (putResult.ContentHash != hashInfo.ContentHash)
                                 {
-                                    // Don't delete the temporary file! It no longer exists after the Put moved it into the cache
-                                    deleteTempFile = false;
-                                    return (putResult, false);
-                                }
-                                else
-                                {
+                                    lastErrorMessage =
+                                        $"Contenthash at location {location} has contenthash {putResult.ContentHash.ToShortString()} mismatch from {hashInfo.ContentHash.ToShortString()}";
                                     // If PutFileAsync re-hashed the file, then it could have found a content hash which differs from the expected content hash.
                                     // If this happens, we should fail this copy and move to the next location.
                                     Tracer.Warning(
                                         context,
-                                        $"{AttemptTracePrefix(attemptCount)} Contenthash at location {location} has contenthash {putResult.ContentHash} mismatch from {hashInfo.ContentHash}");
+                                        $"{AttemptTracePrefix(attemptCount)} {lastErrorMessage}");
                                     badContentLocations.Add(location);
+                                    continue;
                                 }
+
+                                // Don't delete the temporary file! It no longer exists after the Put moved it into the cache
+                                deleteTempFile = false;
+
+                                // Successful case
+                                return (result: putResult, retry: false);
                             }
                             else if (putResult.IsCancelled)
                             {
@@ -397,11 +470,11 @@ namespace BuildXL.Cache.ContentStore.Distributed.Stores
                             {
                                 // Nothing is known about the put's failure. Give up on all locations, do not retry.
                                 // An example of a failure requiring this: Failed to reserve space for content
-                                var errorMessage = $"Put file for content hash {hashInfo.ContentHash} failed";
+                                var errorMessage = $"Put file for content hash {hashInfo.ContentHash.ToShortString()} failed with error {putResult.ErrorMessage} ";
                                 Tracer.Warning(
                                     context,
-                                    $"{AttemptTracePrefix(attemptCount)} {errorMessage} with error {putResult.ErrorMessage} diagnostics {putResult.Diagnostics}");
-                                return (putResult, false);
+                                    $"{AttemptTracePrefix(attemptCount)} {errorMessage} diagnostics {putResult.Diagnostics}");
+                                return (result: putResult, retry: false);
                             }
                         }
                     }
@@ -415,7 +488,12 @@ namespace BuildXL.Cache.ContentStore.Distributed.Stores
                 }
             }
 
-            return (new PutResult(hashInfo.ContentHash, "Unable to copy file"), retry: true);
+            if (lastErrorMessage != null)
+            {
+                lastErrorMessage = ". " + lastErrorMessage;
+            }
+
+            return (new PutResult(hashInfo.ContentHash, $"Unable to copy file{lastErrorMessage}"), retry: true);
         }
 
         private async Task<CopyFileResult> CopyFileAsync(
@@ -450,7 +528,7 @@ namespace BuildXL.Cache.ContentStore.Distributed.Stores
                             var foundHash = hashingStream.GetContentHash();
                             if (foundHash != hashInfo.ContentHash)
                             {
-                                return new CopyFileResult(CopyFileResult.ResultCode.InvalidHash, $"{nameof(CopyFileAsync)} unsuccessful with different hash. Found {foundHash}, expected {hashInfo.ContentHash}. Found size {hashingStream.Length}, expected size {hashInfo.Size}.");
+                                return new CopyFileResult(CopyFileResult.ResultCode.InvalidHash, $"{nameof(CopyFileAsync)} unsuccessful with different hash. Found {foundHash.ToShortString()}, expected {hashInfo.ContentHash.ToShortString()}. Found size {hashingStream.Length}, expected size {hashInfo.Size}.");
                             }
 
                             // Expose the bytes that were copied, so that small files can be put into the ContentLocationStore even when trusted copy is done
@@ -563,12 +641,12 @@ namespace BuildXL.Cache.ContentStore.Distributed.Stores
                 Contract.Assert(verification.IsCompleted);
                 if (verification.IsCanceled && !cancel.IsCancellationRequested)
                 {
-                    Tracer.Info(context, $"During verification, hash {remote.ContentHash} timed out for location {location}.");
+                    Tracer.Info(context, $"During verification, hash {remote.ContentHash.ToShortString()} timed out for location {location}.");
                     unknown.Add(location);
                 }
                 else if (verification.IsFaulted)
                 {
-                    Tracer.Info(context, $"During verification, hash {remote.ContentHash} encountered the error {verification.Exception} while verifying location {location}.");
+                    Tracer.Info(context, $"During verification, hash {remote.ContentHash.ToShortString()} encountered the error {verification.Exception} while verifying location {location}.");
                     unknown.Add(location);
                 }
                 else
@@ -580,7 +658,7 @@ namespace BuildXL.Cache.ContentStore.Distributed.Stores
                     }
                     else if (result.Code == FileExistenceResult.ResultCode.FileNotFound)
                     {
-                        Tracer.Info(context, $"During verification, hash {remote.ContentHash} was not found at location {location}.");
+                        Tracer.Info(context, $"During verification, hash {remote.ContentHash.ToShortString()} was not found at location {location}.");
                         absent.Add(location);
                     }
                     else
@@ -601,27 +679,9 @@ namespace BuildXL.Cache.ContentStore.Distributed.Stores
         /// </summary>
         private Task<FileExistenceResult> GatedCheckFileExistenceAsync(T path, CancellationToken token)
         {
-            return GatedIoOperationAsync(
+            return _ioGate.GatedOperationAsync(
                 (_) => _remoteFileExistenceChecker.CheckFileExistsAsync(path, Timeout.InfiniteTimeSpan, token),
                 token);
-        }
-
-        /// <summary>
-        /// This gated method attempts to limit the number of simultaneous off-machine file IO.
-        /// </summary>
-        private async Task<TResult> GatedIoOperationAsync<TResult>(Func<TimeSpan, Task<TResult>> func, CancellationToken token)
-        {
-            var sw = Stopwatch.StartNew();
-            await _ioGate.WaitAsync(token);
-
-            try
-            {
-                return await func(sw.Elapsed);
-            }
-            finally
-            {
-                _ioGate.Release();
-            }
         }
 
         /// <nodoc />

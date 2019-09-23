@@ -13,6 +13,7 @@ using BuildXL.Utilities;
 using BuildXL.Utilities.Collections;
 using BuildXL.Utilities.Configuration;
 using BuildXL.Utilities.Instrumentation.Common;
+using JetBrains.Annotations;
 using ProjectWithPredictions = BuildXL.FrontEnd.MsBuild.Serialization.ProjectWithPredictions<BuildXL.Utilities.AbsolutePath>;
 
 namespace BuildXL.FrontEnd.MsBuild
@@ -34,19 +35,25 @@ namespace BuildXL.FrontEnd.MsBuild
             FrontEndHost frontEndHost,
             ModuleDefinition moduleDefinition,
             IMsBuildResolverSettings resolverSettings,
-            AbsolutePath pathToMsBuildExe,
-            string frontEndName)
+            AbsolutePath pathToMsBuild,
+            AbsolutePath pathToDotnetExe,
+            string frontEndName,
+            IEnumerable<KeyValuePair<string, string>> userDefinedEnvironment,
+            IEnumerable<string> userDefinedPassthroughVariables)
         {
             Contract.Requires(context != null);
             Contract.Requires(frontEndHost != null);
             Contract.Requires(moduleDefinition != null);
             Contract.Requires(resolverSettings != null);
-            Contract.Requires(pathToMsBuildExe.IsValid);
+            Contract.Requires(pathToMsBuild.IsValid);
+            Contract.Requires(!resolverSettings.ShouldRunDotNetCoreMSBuild() || pathToDotnetExe.IsValid);
             Contract.Requires(!string.IsNullOrEmpty(frontEndName));
+            Contract.Requires(userDefinedEnvironment != null);
+            Contract.Requires(userDefinedPassthroughVariables != null);
 
             m_context = context;
             m_frontEndHost = frontEndHost;
-            m_pipConstructor = new PipConstructor(context, frontEndHost, moduleDefinition, resolverSettings, pathToMsBuildExe, frontEndName);
+            m_pipConstructor = new PipConstructor(context, frontEndHost, moduleDefinition, resolverSettings, pathToMsBuild, pathToDotnetExe, frontEndName, userDefinedEnvironment, userDefinedPassthroughVariables);
         }
 
         /// <summary>
@@ -70,8 +77,8 @@ namespace BuildXL.FrontEnd.MsBuild
                 return new ActionBlock<ProjectWithPredictions>(
                     project =>
                     {
-                        // We only schedule the project if targets to execute couldn't be predicted, or the predicted target collection is non-empty
-                        if (!project.PredictedTargetsToExecute.TargetsAreKnownToBeEmpty)
+                        // We only schedule the project if predicted target collection is non-empty
+                        if (project.PredictedTargetsToExecute.Targets.Count != 0)
                         {
                             if (!m_pipConstructor.TrySchedulePipForFile(project, qualifierId, out _, out _))
                             {

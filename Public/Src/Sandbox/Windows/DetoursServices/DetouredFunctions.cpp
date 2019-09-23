@@ -16,6 +16,7 @@
 #include "UnicodeConverter.h"
 #include "MetadataOverrides.h"
 #include "HandleOverlay.h"
+#include "SubstituteProcessExecution.h"
 
 using std::wstring;
 using std::unique_ptr;
@@ -87,6 +88,30 @@ static DWORD GetReparsePointType(_In_ LPCWSTR lpFileName)
 static bool IsActionableReparsePointType(_In_ const DWORD reparsePointType)
 {
     return reparsePointType == IO_REPARSE_TAG_SYMLINK || reparsePointType == IO_REPARSE_TAG_MOUNT_POINT;
+}
+
+/// <summary>
+/// Checks if flags or attributes has reparse point.
+/// </summary>
+
+static bool AttributesHasReparsePoint(_In_ DWORD dwFlagsAndAttributes)
+{
+    return ((dwFlagsAndAttributes & FILE_FLAG_OPEN_REPARSE_POINT) != 0)
+        || ((dwFlagsAndAttributes & FILE_OPEN_REPARSE_POINT) != 0);
+}
+
+/// <summary>
+/// Checks if Detours should follow symlink chain.
+/// </summary>
+static bool ShouldFollowSymlinkChain(
+    _In_     LPCWSTR               lpFileName,
+    _In_     DWORD                 dwDesiredAccess,
+    _In_     DWORD                 dwFlagsAndAttributes)
+{
+    return !IgnoreReparsePoints() // Reparse point should not be ignored.
+        && IsReparsePoint(lpFileName) // File is a reparse point.
+        && (!WantsProbeOnlyAccess(dwDesiredAccess) // It's not probe-only access.
+            || !AttributesHasReparsePoint(dwFlagsAndAttributes)); // It's a probe-only access, but no reparse point flag is passed.
 }
 
 /// <summary>
@@ -690,7 +715,6 @@ static bool EnforceReparsePointAccess(
         return false;
     }
 
-    // Enforce the access only we are not doing directory probing/enumeration.
     if (enforceAccess)
     {
         if (WantsWriteAccess(dwDesiredAccess))
@@ -705,7 +729,7 @@ static bool EnforceReparsePointAccess(
             }
         }
 
-        if (WantsReadAccess(dwDesiredAccess))
+        if (WantsReadAccess(dwDesiredAccess) || WantsProbeOnlyAccess(dwDesiredAccess))
         {
             FileReadContext readContext;
             WIN32_FIND_DATA findData;
@@ -726,7 +750,8 @@ static bool EnforceReparsePointAccess(
                 (readContext.FileExistence == FileExistence::Existent) 
                 && IsHandleOrPathToDirectory(INVALID_HANDLE_VALUE, fullPath.c_str(), false);
 
-            accessCheck = AccessCheckResult::Combine(accessCheck, policyResult.CheckReadAccess(RequestedReadAccess::Read, readContext));
+            RequestedReadAccess requestedReadAccess = WantsProbeOnlyAccess(dwDesiredAccess) ? RequestedReadAccess::Probe : RequestedReadAccess::Read;
+            accessCheck = AccessCheckResult::Combine(accessCheck, policyResult.CheckReadAccess(requestedReadAccess, readContext));
         }
 
         if (accessCheck.ShouldDenyAccess())
@@ -1791,6 +1816,25 @@ BOOL WINAPI Detoured_CreateProcessW(
     _In_        LPSTARTUPINFOW        lpStartupInfo,
     _Out_       LPPROCESS_INFORMATION lpProcessInformation)
 {
+    bool injectedShim = false;
+    BOOL ret = MaybeInjectSubstituteProcessShim(
+        lpApplicationName,
+        lpCommandLine,
+        lpProcessAttributes,
+        lpThreadAttributes,
+        bInheritHandles,
+        dwCreationFlags,
+        lpEnvironment,
+        lpCurrentDirectory,
+        lpStartupInfo,
+        lpProcessInformation,
+        injectedShim);
+    if (injectedShim)
+    {
+        Dbg(L"Injected shim for lpCommandLine='%s', returning 0x%08X from CreateProcessW", lpCommandLine, ret);
+        return ret;
+    }
+
     if (!MonitorChildProcesses())
     {
         return Real_CreateProcessW(
@@ -2067,17 +2111,24 @@ HANDLE WINAPI Detoured_CreateFileW(
     // read request which may or may not have been approved (due to special exceptions for directories and non-existent files).
     // It is safe to go ahead and perform the real CreateFile() call, and then to reason about the results after the fact.
 
-    // Note that we always add FILE_SHARE_DELETE to dwShareMode. In order to leverage NTFS hardlinks to avoid copying cache
-    // content, we need to be able to delete one of many links to a file. Unfortunately, share-mode is aggregated only per file
-    // rather than per-link, so in order to keep unused links delete-able, we must ensure in-use links are delete-able as well.
+    // Note that we need to add FILE_SHARE_DELETE to dwShareMode to leverage NTFS hardlinks to avoid copying cache
+    // content, i.e., we need to be able to delete one of many links to a file. Unfortunately, share-mode is aggregated only per file
+    // rather than per-link, so in order to keep unused links delete-able, we should ensure in-use links are delete-able as well.
+    // However, adding FILE_SHARE_DELETE may be unexpected, for example, some unit tests may test for sharing violation. Thus,
+    // we only add FILE_SHARE_DELETE if the file is tracked.
     
     // We also add FILE_SHARE_READ when it is safe to do so, since some tools accidentally ask for exclusive access on their inputs.
 
-    DWORD readSharingIfNeeded = policyResult.ShouldForceReadSharing(accessCheck) ? FILE_SHARE_READ : 0UL;
+    DWORD desiredAccess = dwDesiredAccess;
+    DWORD sharedAccess = dwShareMode;
 
-    DWORD desiredAccess = !forceReadOnlyForRequestedRWAccess ? dwDesiredAccess : (dwDesiredAccess & FILE_GENERIC_READ);
-    DWORD sharedAccess = !forceReadOnlyForRequestedRWAccess ? (dwShareMode | FILE_SHARE_DELETE | readSharingIfNeeded) : FILE_SHARE_READ | FILE_SHARE_DELETE;
-    
+    if (!policyResult.IndicateUntracked())
+    {
+        DWORD readSharingIfNeeded = policyResult.ShouldForceReadSharing(accessCheck) ? FILE_SHARE_READ : 0UL;
+        desiredAccess = !forceReadOnlyForRequestedRWAccess ? desiredAccess : (desiredAccess & FILE_GENERIC_READ);
+        sharedAccess = sharedAccess | readSharingIfNeeded | FILE_SHARE_DELETE;
+    }
+
     error = ERROR_SUCCESS;
 
     HANDLE handle = Real_CreateFileW(
@@ -2091,11 +2142,8 @@ HANDLE WINAPI Detoured_CreateFileW(
 
     error = GetLastError();
 
-    if (!IgnoreReparsePoints() && IsReparsePoint(lpFileName) && !WantsProbeOnlyAccess(dwDesiredAccess))
+    if (ShouldFollowSymlinkChain(lpFileName, dwDesiredAccess, dwFlagsAndAttributes))
     {
-        // (1) Reparse point should not be ignored.
-        // (2) File/Directory is a reparse point.
-        // (3) Desired access is not probe only.
         // Note that handle can be invalid because users can CreateFileW of a symlink whose target is non-existent.
 
         // Even though the process CreateFile the file with FILE_FLAG_OPEN_REPARSE_POINT, we need to follow the chain of symlinks
@@ -5128,15 +5176,23 @@ NTSTATUS NTAPI Detoured_ZwCreateFile(
     // read request which may or may not have been approved (due to special exceptions for directories and non-existent files).
     // It is safe to go ahead and perform the real NtCreateFile() call, and then to reason about the results after the fact.
 
-    // Note that we always add FILE_SHARE_DELETE to dwShareMode. In order to leverage NTFS hardlinks to avoid copying cache
-    // content, we need to be able to delete one of many links to a file. Unfortunately, share-mode is aggregated only per file
-    // rather than per-link, so in order to keep unused links delete-able, we must ensure in-use links are delete-able as well.
+    // Note that we need to add FILE_SHARE_DELETE to dwShareMode to leverage NTFS hardlinks to avoid copying cache
+    // content, i.e., we need to be able to delete one of many links to a file. Unfortunately, share-mode is aggregated only per file
+    // rather than per-link, so in order to keep unused links delete-able, we should ensure in-use links are delete-able as well.
+    // However, adding FILE_SHARE_DELETE may be unexpected, for example, some unit tests may test for sharing violation. Thus,
+    // we only add FILE_SHARE_DELETE if the file is tracked.
 
     // We also add FILE_SHARE_READ when it is safe to do so, since some tools accidentally ask for exclusive access on their inputs.
 
-    DWORD readSharingIfNeeded = policyResult.ShouldForceReadSharing(accessCheck) ? FILE_SHARE_READ : 0UL;
-    DWORD desiredAccess = !forceReadOnlyForRequestedRWAccess ? DesiredAccess : (DesiredAccess & FILE_GENERIC_READ);
-    DWORD sharedAccess = !forceReadOnlyForRequestedRWAccess ? (ShareAccess | FILE_SHARE_DELETE | readSharingIfNeeded) : FILE_SHARE_READ | FILE_SHARE_DELETE;
+    DWORD desiredAccess = DesiredAccess;
+    DWORD sharedAccess = ShareAccess;
+
+    if (!policyResult.IndicateUntracked())
+    {
+        DWORD readSharingIfNeeded = policyResult.ShouldForceReadSharing(accessCheck) ? FILE_SHARE_READ : 0UL;
+        desiredAccess = !forceReadOnlyForRequestedRWAccess ? desiredAccess : (desiredAccess & FILE_GENERIC_READ);
+        sharedAccess = sharedAccess | readSharingIfNeeded | FILE_SHARE_DELETE;
+    }
     
     error = ERROR_SUCCESS;
 
@@ -5191,11 +5247,8 @@ NTSTATUS NTAPI Detoured_ZwCreateFile(
         return result;
     }
 
-    if (!IgnoreReparsePoints() && IsReparsePoint(path.GetPathString()) && !WantsProbeOnlyAccess(opContext.DesiredAccess))
+    if (ShouldFollowSymlinkChain(path.GetPathString(), opContext.DesiredAccess, FileAttributes))
     {
-        // (1) Reparse point should not be ignored.
-        // (2) File/Directory is a reparse point.
-        // (3) Desired access is not probe only.
         // Note that handle can be invalid because users can CreateFileW of a symlink whose target is non-existent.
         NTSTATUS ntStatus;
 
@@ -5415,15 +5468,23 @@ NTSTATUS NTAPI Detoured_NtCreateFile(
     // read request which may or may not have been approved (due to special exceptions for directories and non-existent files).
     // It is safe to go ahead and perform the real NtCreateFile() call, and then to reason about the results after the fact.
 
-    // Note that we always add FILE_SHARE_DELETE to dwShareMode. In order to leverage NTFS hardlinks to avoid copying cache
-    // content, we need to be able to delete one of many links to a file. Unfortunately, share-mode is aggregated only per file
-    // rather than per-link, so in order to keep unused links delete-able, we must ensure in-use links are delete-able as well.
+    // Note that we need to add FILE_SHARE_DELETE to dwShareMode to leverage NTFS hardlinks to avoid copying cache
+    // content, i.e., we need to be able to delete one of many links to a file. Unfortunately, share-mode is aggregated only per file
+    // rather than per-link, so in order to keep unused links delete-able, we should ensure in-use links are delete-able as well.
+    // However, adding FILE_SHARE_DELETE may be unexpected, for example, some unit tests may test for sharing violation. Thus,
+    // we only add FILE_SHARE_DELETE if the file is tracked.
 
     // We also add FILE_SHARE_READ when it is safe to do so, since some tools accidentally ask for exclusive access on their inputs.
 
-    DWORD readSharingIfNeeded = policyResult.ShouldForceReadSharing(accessCheck) ? FILE_SHARE_READ : 0UL;
-    DWORD desiredAccess = !forceReadOnlyForRequestedRWAccess ? DesiredAccess : (DesiredAccess & FILE_GENERIC_READ);
-    DWORD sharedAccess = !forceReadOnlyForRequestedRWAccess ? (ShareAccess | FILE_SHARE_DELETE | readSharingIfNeeded) : FILE_SHARE_READ | FILE_SHARE_DELETE;
+    DWORD desiredAccess = DesiredAccess;
+    DWORD sharedAccess = ShareAccess;
+
+    if (!policyResult.IndicateUntracked())
+    {
+        DWORD readSharingIfNeeded = policyResult.ShouldForceReadSharing(accessCheck) ? FILE_SHARE_READ : 0UL;
+        desiredAccess = !forceReadOnlyForRequestedRWAccess ? desiredAccess : (desiredAccess & FILE_GENERIC_READ);
+        sharedAccess = sharedAccess | readSharingIfNeeded | FILE_SHARE_DELETE;
+    }
     
     error = ERROR_SUCCESS;
 
@@ -5479,7 +5540,7 @@ NTSTATUS NTAPI Detoured_NtCreateFile(
         return result;
     }
 
-    if (!IgnoreReparsePoints() && IsReparsePoint(path.GetPathString()) && !WantsProbeOnlyAccess(opContext.DesiredAccess))
+    if (ShouldFollowSymlinkChain(path.GetPathString(), opContext.DesiredAccess, FileAttributes))
     {
         // (1) Reparse point should not be ignored.
         // (2) File/Directory is a reparse point.
@@ -5683,15 +5744,24 @@ NTSTATUS NTAPI Detoured_ZwOpenFile(
     // read request which may or may not have been approved (due to special exceptions for directories and non-existent files).
     // It is safe to go ahead and perform the real NtCreateFile() call, and then to reason about the results after the fact.
 
-    // Note that we always add FILE_SHARE_DELETE to dwShareMode. In order to leverage NTFS hardlinks to avoid copying cache
-    // content, we need to be able to delete one of many links to a file. Unfortunately, share-mode is aggregated only per file
-    // rather than per-link, so in order to keep unused links delete-able, we must ensure in-use links are delete-able as well.
+    // Note that we need to add FILE_SHARE_DELETE to dwShareMode to leverage NTFS hardlinks to avoid copying cache
+    // content, i.e., we need to be able to delete one of many links to a file. Unfortunately, share-mode is aggregated only per file
+    // rather than per-link, so in order to keep unused links delete-able, we should ensure in-use links are delete-able as well.
+    // However, adding FILE_SHARE_DELETE may be unexpected, for example, some unit tests may test for sharing violation. Thus,
+    // we only add FILE_SHARE_DELETE if the file is tracked.
 
     // We also add FILE_SHARE_READ when it is safe to do so, since some tools accidentally ask for exclusive access on their inputs.
 
-    DWORD readSharingIfNeeded = policyResult.ShouldForceReadSharing(accessCheck) ? FILE_SHARE_READ : 0UL;
-    DWORD desiredAccess = !forceReadOnlyForRequestedRWAccess ? DesiredAccess : (DesiredAccess & FILE_GENERIC_READ);
-    DWORD sharedAccess = !forceReadOnlyForRequestedRWAccess ? (ShareAccess | FILE_SHARE_DELETE | readSharingIfNeeded) : FILE_SHARE_READ | FILE_SHARE_DELETE;
+    DWORD desiredAccess = DesiredAccess;
+    DWORD sharedAccess = ShareAccess;
+
+    if (!policyResult.IndicateUntracked())
+    {
+        DWORD readSharingIfNeeded = policyResult.ShouldForceReadSharing(accessCheck) ? FILE_SHARE_READ : 0UL;
+        desiredAccess = !forceReadOnlyForRequestedRWAccess ? desiredAccess : (desiredAccess & FILE_GENERIC_READ);
+        sharedAccess = sharedAccess | readSharingIfNeeded | FILE_SHARE_DELETE;
+    }
+
     DWORD error = ERROR_SUCCESS;
 
     NTSTATUS result = Real_ZwOpenFile(
@@ -5740,7 +5810,7 @@ NTSTATUS NTAPI Detoured_ZwOpenFile(
         return result;
     }
 
-    if (!IgnoreReparsePoints() && IsReparsePoint(path.GetPathString()) && !WantsProbeOnlyAccess(opContext.DesiredAccess))
+    if (ShouldFollowSymlinkChain(path.GetPathString(), opContext.DesiredAccess, OpenOptions))
     {
         // (1) Reparse point should not be ignored.
         // (2) File/Directory is a reparse point.

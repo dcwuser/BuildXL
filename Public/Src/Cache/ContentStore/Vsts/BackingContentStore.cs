@@ -5,12 +5,14 @@ using System;
 using System.Diagnostics.CodeAnalysis;
 using System.Diagnostics.ContractsLight;
 using System.Threading.Tasks;
+using BuildXL.Cache.ContentStore.Hashing;
 using BuildXL.Cache.ContentStore.Interfaces.FileSystem;
 using BuildXL.Cache.ContentStore.Interfaces.Results;
 using BuildXL.Cache.ContentStore.Interfaces.Sessions;
 using BuildXL.Cache.ContentStore.Interfaces.Stores;
 using BuildXL.Cache.ContentStore.Interfaces.Tracing;
-using BuildXL.Cache.ContentStore.UtilitiesCore;
+using BuildXL.Cache.ContentStore.Tracing;
+using BuildXL.Utilities.Tracing;
 using Microsoft.VisualStudio.Services.BlobStore.WebApi;
 using Microsoft.VisualStudio.Services.Content.Common;
 
@@ -21,10 +23,26 @@ namespace BuildXL.Cache.ContentStore.Vsts
     /// </summary>
     public sealed class BackingContentStore : IContentStore
     {
+        /// <nodoc />
+        public enum SessionCounters
+        {
+            /// <summary>
+            /// Pin request had to be made to a remote VSTS store.
+            /// </summary>
+            PinSatisfiedFromRemote,
+
+            /// <summary>
+            /// Pin was satisfied without reaching VSTS based on existing cached data.
+            /// </summary>
+            PinSatisfiedInMemory
+        }
+
+        private readonly CounterTracker _sessionCounterTracker = new CounterTracker();
         private readonly IAbsFileSystem _fileSystem;
         private readonly IArtifactHttpClientFactory _artifactHttpClientFactory;
         private readonly TimeSpan _timeToKeepContent;
-        private readonly BackingContentStoreTracer _backingStoreContentTracer;
+        private readonly TimeSpan _pinInlineThreshold;
+        private readonly TimeSpan _ignorePinThreshold;
         private IArtifactHttpClient _artifactHttpClient;
         private readonly bool _useDedupStore;
 
@@ -39,25 +57,27 @@ namespace BuildXL.Cache.ContentStore.Vsts
         /// <param name="fileSystem">Filesystem used to read/write files.</param>
         /// <param name="artifactHttpClientFactory">Backing Store HTTP client factory.</param>
         /// <param name="timeToKeepContent">Minimum time-to-live for accessed content.</param>
-        /// <param name="backingStoreContentTracer">A tracer for tracking calls to the backing Content Store.</param>
+        /// <param name="pinInlineThreshold">Maximum time-to-live to inline pin calls.</param>
+        /// <param name="ignorePinThreshold">Minimum time-to-live to ignore pin calls.</param>
         /// <param name="downloadBlobsThroughBlobStore">Flag for BlobStore: If enabled, gets blobs through BlobStore. If false, gets blobs from the Azure Uri.</param>
         /// <param name="useDedupStore">Determines whether or not DedupStore is used for content. Must be used in tandem with Dedup hashes.</param>
         public BackingContentStore(
             IAbsFileSystem fileSystem,
             IArtifactHttpClientFactory artifactHttpClientFactory,
             TimeSpan timeToKeepContent,
-            BackingContentStoreTracer backingStoreContentTracer,
+            TimeSpan pinInlineThreshold,
+            TimeSpan ignorePinThreshold,
             bool downloadBlobsThroughBlobStore = false,
             bool useDedupStore = false)
         {
             Contract.Requires(fileSystem != null);
             Contract.Requires(artifactHttpClientFactory != null);
-            Contract.Requires(backingStoreContentTracer != null);
             _fileSystem = fileSystem;
             _artifactHttpClientFactory = artifactHttpClientFactory;
             _timeToKeepContent = timeToKeepContent;
+            _pinInlineThreshold = pinInlineThreshold;
+            _ignorePinThreshold = ignorePinThreshold;
             _downloadBlobsThroughBlobStore = downloadBlobsThroughBlobStore;
-            _backingStoreContentTracer = backingStoreContentTracer;
             _useDedupStore = useDedupStore;
         }
 
@@ -130,11 +150,11 @@ namespace BuildXL.Cache.ContentStore.Vsts
             if (_useDedupStore)
             {
                 return new CreateSessionResult<IReadOnlyContentSession>(new DedupReadOnlyContentSession(
-                    _fileSystem, name, implicitPin, _artifactHttpClient as IDedupStoreHttpClient, _timeToKeepContent, _backingStoreContentTracer));
+                    _fileSystem, name, implicitPin, _artifactHttpClient as IDedupStoreHttpClient, _timeToKeepContent, _pinInlineThreshold, _ignorePinThreshold, _sessionCounterTracker.AddOrGetChildCounterTracker("Dedup.")));
             }
 
             return new CreateSessionResult<IReadOnlyContentSession>(new BlobReadOnlyContentSession(
-                _fileSystem, name, implicitPin, _artifactHttpClient as IBlobStoreHttpClient, _timeToKeepContent, _backingStoreContentTracer, _downloadBlobsThroughBlobStore));
+                _fileSystem, name, implicitPin, _artifactHttpClient as IBlobStoreHttpClient, _timeToKeepContent, _downloadBlobsThroughBlobStore, _sessionCounterTracker.AddOrGetChildCounterTracker("Blob.")));
         }
 
         /// <inheritdoc />
@@ -144,17 +164,23 @@ namespace BuildXL.Cache.ContentStore.Vsts
             if (_useDedupStore)
             {
                 return new CreateSessionResult<IContentSession>(new DedupContentSession(
-                    context, _fileSystem, name, implicitPin, _artifactHttpClient as IDedupStoreHttpClient, _timeToKeepContent, _backingStoreContentTracer));
+                    context, _fileSystem, name, implicitPin, _artifactHttpClient as IDedupStoreHttpClient, _timeToKeepContent, _pinInlineThreshold, _ignorePinThreshold, _sessionCounterTracker.AddOrGetChildCounterTracker("Dedup.")));
             }
 
             return new CreateSessionResult<IContentSession>(new BlobContentSession(
-                _fileSystem, name, implicitPin, _artifactHttpClient as IBlobStoreHttpClient, _timeToKeepContent, _backingStoreContentTracer, _downloadBlobsThroughBlobStore));
+                _fileSystem, name, implicitPin, _artifactHttpClient as IBlobStoreHttpClient, _timeToKeepContent, _downloadBlobsThroughBlobStore, _sessionCounterTracker.AddOrGetChildCounterTracker("Blob.")));
         }
 
         /// <inheritdoc />
-        public Task<GetStatsResult> GetStatsAsync(Context context)
+        public Task<GetStatsResult> GetStatsAsync(Context context) => Task.FromResult(new GetStatsResult(_sessionCounterTracker.ToCounterSet()));
+
+        /// <inheritdoc />
+        public Task<DeleteResult> DeleteAsync(Context context, ContentHash contentHash)
         {
-            return Task.FromResult(new GetStatsResult(new CounterSet()));
+            throw new NotImplementedException();
         }
+
+        /// <inheritdoc />
+        public void PostInitializationCompleted(Context context, BoolResult result) { }
     }
 }

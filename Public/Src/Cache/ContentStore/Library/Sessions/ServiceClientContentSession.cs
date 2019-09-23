@@ -12,6 +12,7 @@ using BuildXL.Cache.ContentStore.Interfaces.Sessions;
 using BuildXL.Cache.ContentStore.Interfaces.Stores;
 using BuildXL.Cache.ContentStore.Service;
 using BuildXL.Cache.ContentStore.Stores;
+using BuildXL.Cache.ContentStore.Tracing;
 using BuildXL.Cache.ContentStore.Tracing.Internal;
 using BuildXL.Utilities.Tracing;
 
@@ -22,6 +23,9 @@ namespace BuildXL.Cache.ContentStore.Sessions
     /// </summary>
     public class ServiceClientContentSession : ReadOnlyServiceClientContentSession, IContentSession
     {
+        /// <inheritdoc />
+        protected override Tracer Tracer { get; } = new Tracer(nameof(ServiceClientContentSession));
+
         /// <summary>
         ///     Initializes a new instance of the <see cref="ServiceClientContentSession"/> class.
         /// </summary>
@@ -38,65 +42,47 @@ namespace BuildXL.Cache.ContentStore.Sessions
         }
 
         /// <inheritdoc />
-        protected override Task<PutResult> PutStreamCoreAsync(
+        protected override async Task<PutResult> PutStreamCoreAsync(
             OperationContext operationContext, HashType hashType, Stream stream, UrgencyHint urgencyHint, Counter retryCounter)
         {
             // We need a seekable stream, that can give its length. If the input stream is seekable, we can use it directly.
             // Otherwise, we need to create a temp file for this purpose.
-            Stream putStream;
-            long position;
-            Stream disposableStream;
-
-            if (stream.CanSeek)
-            {
-                putStream = stream;
-                position = stream.Position;
-                disposableStream = null;
-            }
-            else
+            var putStream = stream;
+            Stream disposableStream = null;
+            if (!stream.CanSeek)
             {
                 putStream = TempFileStreamFactory.Create(operationContext, stream);
-                position = 0;
                 disposableStream = putStream;
             }
 
             using (disposableStream)
             {
-                return PerformRetries(
+                return await PerformRetries(
                     operationContext,
-                    () => RpcClient.PutStreamAsync(operationContext, hashType, stream),
+                    () => RpcClient.PutStreamAsync(operationContext, hashType, putStream),
                     retryCounter: retryCounter);
             }
         }
 
         /// <inheritdoc />
-        protected override Task<PutResult> PutStreamCoreAsync(
+        protected override async Task<PutResult> PutStreamCoreAsync(
             OperationContext operationContext, ContentHash contentHash, Stream stream, UrgencyHint urgencyHint, Counter retryCounter)
         {
             // We need a seekable stream, that can give its length. If the input stream is seekable, we can use it directly.
             // Otherwise, we need to create a temp file for this purpose.
-            Stream putStream;
-            long position;
-            Stream disposableStream;
-
-            if (stream.CanSeek)
-            {
-                putStream = stream;
-                position = stream.Position;
-                disposableStream = null;
-            }
-            else
+            var putStream = stream;
+            Stream disposableStream = null;
+            if (!stream.CanSeek)
             {
                 putStream = TempFileStreamFactory.Create(operationContext, stream);
-                position = 0;
                 disposableStream = putStream;
             }
 
             using (disposableStream)
             {
-                return PerformRetries(
+                return await PerformRetries(
                     operationContext,
-                    () => RpcClient.PutStreamAsync(operationContext, contentHash, stream),
+                    () => RpcClient.PutStreamAsync(operationContext, contentHash, putStream),
                     retryCounter: retryCounter);
             }
         }

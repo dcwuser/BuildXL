@@ -71,7 +71,7 @@ namespace Test.BuildXL.Scheduler
         /// <summary>
         /// FileArtifact for generic TestProcess.exe
         /// </summary>
-        protected readonly FileArtifact TestProcessExecutable;
+        protected FileArtifact TestProcessExecutable { get; set; }
 
         protected readonly AbsolutePath[] TestProcessDependencies;
 
@@ -158,18 +158,19 @@ namespace Test.BuildXL.Scheduler
                     var objectRoot = AbsolutePath.Create(Context.PathTable, ObjectRoot);
                     var redirectedRoot = AbsolutePath.Create(Context.PathTable, RedirectedRoot);
 
-                    ModuleId moduleId = new ModuleId(1);
                     var specPath = objectRoot.Combine(Context.PathTable, "spec.dsc");
 
-                    PipGraphBuilder.AddModule(ModulePip.CreateForTesting(Context.StringTable, specPath, moduleId));
-                    PipGraphBuilder.AddSpecFile(new SpecFilePip(new FileArtifact(specPath), new LocationData(specPath, 0, 0), moduleId));
+                    var modulePip = ModulePip.CreateForTesting(Context.StringTable, specPath);
+                    PipGraphBuilder.AddModule(modulePip);
+                    PipGraphBuilder.AddSpecFile(new SpecFilePip(new FileArtifact(specPath), new LocationData(specPath, 0, 0), modulePip.Module));
 
                     m_pipConstructionHelper = PipConstructionHelper.CreateForTesting(
                         Context,
                         objectRoot: objectRoot,
                         redirectedRoot: redirectedRoot,
                         pipGraph: PipGraphBuilder,
-                        specPath: specPath);
+                        specPath: specPath,
+                        moduleName: modulePip.Identity.ToString(Context.StringTable));
                 }
 
                 return m_pipConstructionHelper;
@@ -211,6 +212,17 @@ namespace Test.BuildXL.Scheduler
             if (description != null)
             {
                 builder.ToolDescription = StringId.Create(Context.StringTable, description);
+            }
+
+            if (OperatingSystemHelper.IsUnixOS)
+            {
+                builder.SetEnvironmentVariable(
+                    StringId.Create(Context.StringTable, "DYLD_LIBRARY_PATH"),
+                    Path.GetDirectoryName(TestProcessExecutable.Path.ToString(Context.PathTable)));
+
+                // untracking this directory as well because dynamic probes are non-deterministic which
+                // can cause some of our FingerprintStore tests to fail.
+                builder.AddUntrackedDirectoryScope(TestProcessExecutable.Path.GetParent(Context.PathTable));
             }
 
             return builder;
@@ -674,11 +686,11 @@ namespace Test.BuildXL.Scheduler
 
         public static void AddMetaPips(PipExecutionContext context, PipProvenance provenance, IPipGraph pipGraph)
         {
-            var moduleId = new ModuleId(1, "TestModuleId");
+            var modulePip = ModulePip.CreateForTesting(context.StringTable, provenance.Token.Path);
             var locationData = new LocationData(provenance.Token.Path, 0, 0);
 
-            pipGraph.AddModule(ModulePip.CreateForTesting(context.StringTable, provenance.Token.Path, moduleId));
-            pipGraph.AddSpecFile(new SpecFilePip(new FileArtifact(provenance.Token.Path), locationData, moduleId));
+            pipGraph.AddModule(modulePip);
+            pipGraph.AddSpecFile(new SpecFilePip(new FileArtifact(provenance.Token.Path), locationData, modulePip.Module));
             pipGraph.AddOutputValue(new ValuePip(provenance.OutputValueSymbol, QualifierId.Unqualified, locationData));
         }
 
@@ -1076,6 +1088,7 @@ namespace Test.BuildXL.Scheduler
                                 break;
 
                             case Operation.Type.ReadFile:
+                            case Operation.Type.WaitUntilFileExists:
                                 dao.Dependencies.Add(op.Path.FileArtifact);
                                 break;
 
@@ -1171,6 +1184,12 @@ namespace Test.BuildXL.Scheduler
 
             PipGraphBuilder.ApplyCurrentOsDefaults(processBuilder);
 
+        }
+
+        protected TestPipGraphFragment CreatePipGraphFragment(string moduleName)
+        {
+            Contract.Requires(!string.IsNullOrEmpty(moduleName));
+            return new TestPipGraphFragment(LoggingContext, SourceRoot, ObjectRoot, RedirectedRoot, moduleName);
         }
 
         #region IO Helpers

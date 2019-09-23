@@ -381,19 +381,20 @@ namespace BuildXL.Native.IO.Windows
         /// Whether the hresult status is one that should be treated as a nonexistent file
         /// </summary>
         /// <remarks>
-        /// This must be in sync with the code in static bool IsPathNonexistent(DWORD error) function on the Detours side in FileAccessHelper.cpp.
+        /// CODESYNC: static bool IsPathNonexistent(DWORD error) function on the Detours side in FileAccessHelper.cpp.
+        /// CODESYNC: <see cref="OpenFileStatusExtensions.IsNonexistent(OpenFileStatus)"/>
         ///
-        /// Also keep this in sync with <see cref="OpenFileStatusExtensions.IsNonexistent(OpenFileStatus)"/>
         /// NotReadyDevice is treated as non-existent probe.
         /// BitLocker locked volume is treated as non-existent probe.
         /// </remarks>
-        public static bool IsHresultNonesixtent(int hr)
+        public static bool IsHresultNonexistent(int hr)
         {
             return hr == NativeIOConstants.ErrorFileNotFound
                 || hr == NativeIOConstants.ErrorPathNotFound
                 || hr == NativeIOConstants.ErrorNotReady
                 || hr == NativeIOConstants.FveLockedVolume
-                || hr == NativeIOConstants.ErrorCantAccessFile;
+                || hr == NativeIOConstants.ErrorCantAccessFile
+                || hr == NativeIOConstants.ErrorBadPathname;
         }
 
         /// <summary>
@@ -873,11 +874,12 @@ namespace BuildXL.Native.IO.Windows
             string lpFileName,
             FileAttributes dwFileAttributes);
 
+        /// <nodoc />
         [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
         [return: MarshalAs(UnmanagedType.U4)]
         [SuppressMessage("Microsoft.Usage", "CA2205:UseManagedEquivalentsOfWin32Api",
             Justification = "We explicitly need to call the native GetFileAttributes as the managed one does not support long paths.")]
-        internal static extern uint GetFileAttributesW(
+        public static extern uint GetFileAttributesW(
             string lpFileName);
 
         /// <summary>
@@ -1331,10 +1333,11 @@ namespace BuildXL.Native.IO.Windows
                     {
                         Contract.Assume(!forceJournalVersion2);
 
-                        Contract.Assume(
-                            currentRecordHeader->RecordLength >= NativeUsnRecordV3.MinimumSize &&
-                            currentRecordHeader->RecordLength <= NativeUsnRecordV3.MaximumSize,
-                            "Size in record header does not correspond to a valid USN_RECORD_V3.");
+                        if (!(currentRecordHeader->RecordLength >= NativeUsnRecordV3.MinimumSize &&
+                             currentRecordHeader->RecordLength <= NativeUsnRecordV3.MaximumSize))
+                        {
+                            Contract.Assert(false, "Size in record header does not correspond to a valid USN_RECORD_V3. Header record length: " + currentRecordHeader->RecordLength);
+                        }
 
                         NativeUsnRecordV3* record = (NativeUsnRecordV3*) currentRecordBase;
                         recordsToReturn.Add(
@@ -1346,10 +1349,11 @@ namespace BuildXL.Native.IO.Windows
                     }
                     else if (currentRecordHeader->MajorVersion == 2)
                     {
-                        Contract.Assume(
-                            currentRecordHeader->RecordLength >= NativeUsnRecordV2.MinimumSize &&
-                            currentRecordHeader->RecordLength <= NativeUsnRecordV2.MaximumSize,
-                            "Size in record header does not correspond to a valid USN_RECORD_V2.");
+                        if (!(currentRecordHeader->RecordLength >= NativeUsnRecordV2.MinimumSize &&
+                              currentRecordHeader->RecordLength <= NativeUsnRecordV2.MaximumSize))
+                        {
+                            Contract.Assert(false, "Size in record header does not correspond to a valid USN_RECORD_V2. Header record length: " + currentRecordHeader->RecordLength);
+                        }
 
                         NativeUsnRecordV2* record = (NativeUsnRecordV2*) currentRecordBase;
                         recordsToReturn.Add(
@@ -1745,7 +1749,7 @@ namespace BuildXL.Native.IO.Windows
 
             int rootLength = GetRootLength(directoryPath);
 
-            if (Directory.Exists(directoryPath))
+            if (Directory.Exists(ToLongPathIfExceedMaxPath(directoryPath)))
             {
                 // Short cut if directory exists
                 return;
@@ -1766,7 +1770,7 @@ namespace BuildXL.Native.IO.Windows
                 while (i >= rootLength && !parentPathExists)
                 {
                     string dir = directoryPath.Substring(0, i + 1);
-                    if (!Directory.Exists(dir))
+                    if (!Directory.Exists(ToLongPathIfExceedMaxPath(dir)))
                     {
                         stackDirs.Push(dir);
                     }
@@ -2868,10 +2872,13 @@ namespace BuildXL.Native.IO.Windows
             }
         }
 
-        /// <summary>
-        /// Thin wrapper for native GetFileAttributesW that checks the win32 error upon failure
-        /// </summary>
-        public bool TryGetFileAttributes(string path, out FileAttributes attributes, out int hr)
+        private bool TryGetFileAttributes(string path, out FileAttributes attributes, out int hr)
+        {
+            return TryGetFileAttributesViaGetFileAttributes(path, out attributes, out hr)
+                || TryGetFileAttributesViaFindFirstFile(path, out attributes, out hr);
+        }
+
+        private bool TryGetFileAttributesViaGetFileAttributes(string path, out FileAttributes attributes, out int hr)
         {
             Contract.Ensures(Contract.Result<bool>() ^ Contract.ValueAtReturn<int>(out hr) != 0);
 
@@ -2889,18 +2896,52 @@ namespace BuildXL.Native.IO.Windows
             return true;
         }
 
+        private bool TryGetFileAttributesViaFindFirstFile(string path, out FileAttributes attributes, out int hr)
+        {
+            WIN32_FIND_DATA findResult;
+
+            using (SafeFindFileHandle findHandle = FindFirstFileW(ToLongPathIfExceedMaxPath(path), out findResult))
+            {
+                if (findHandle.IsInvalid)
+                {
+                    hr = Marshal.GetLastWin32Error();
+                    attributes = FileAttributes.Normal;
+                    return false;
+                }
+
+                hr = 0;
+                attributes = findResult.DwFileAttributes;
+                return true;
+            }
+        }
+
         /// <inheritdoc />
         public Possible<PathExistence, NativeFailure> TryProbePathExistence(string path, bool followSymlink)
         {
-            if (!TryGetFileAttributes(path, out FileAttributes fileAttributes, out int hr))
+            if (!TryGetFileAttributesViaGetFileAttributes(path, out FileAttributes fileAttributes, out int hr))
             {
-                if (IsHresultNonesixtent(hr))
+                if (IsHresultNonexistent(hr))
                 {
                     return PathExistence.Nonexistent;
                 }
                 else
                 {
-                    return new NativeFailure(hr);
+                    // Fall back using more expensive FindFirstFile.
+                    // Getting file attributes for probing file existence with GetFileAttributesW sometimes results in "access denied". 
+                    // This causes problem especially during file materialization. Because such a probe is interpreted as probing non-existent path, 
+                    // the materialization target is not deleted. However, cache, using .NET File.Exist, is able to determine that the file exists. 
+                    // Thus, cache refuses to materialize the file
+                    if (!TryGetFileAttributesViaFindFirstFile(path, out fileAttributes, out hr))
+                    {
+                        if (IsHresultNonexistent(hr))
+                        {
+                            return PathExistence.Nonexistent;
+                        }
+                        else
+                        {
+                            return new NativeFailure(hr);
+                        }
+                    }
                 }
             }
 
@@ -2968,7 +3009,7 @@ namespace BuildXL.Native.IO.Windows
         {
             if (!TryGetFileAttributes(path, out FileAttributes attributes, out int hr))
             {
-                ThrowForNativeFailure(hr, "GetFileAttributesW");
+                ThrowForNativeFailure(hr, "FindFirstFileW", nameof(GetFileAttributes));
             }
 
             return attributes;
@@ -3342,10 +3383,9 @@ namespace BuildXL.Native.IO.Windows
         [System.Diagnostics.CodeAnalysis.SuppressMessage("Microsoft.Naming", "CA2204:Literals should be spelled correctly", MessageId = "GetFileAttributesW")]
         public Possible<ReparsePointType> TryGetReparsePointType(string path)
         {
-            // Not calling GetFileAttributes to avoid throwing an exception in the hot path here
             if (!TryGetFileAttributes(path, out FileAttributes attributes, out int hr))
             {
-                return new Possible<ReparsePointType>(new NativeFailure(hr, "GetFileAttributesW"));
+                return new Possible<ReparsePointType>(new NativeFailure(hr));
             }
 
             if ((attributes & FileAttributes.ReparsePoint) == 0)

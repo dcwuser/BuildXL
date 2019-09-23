@@ -122,9 +122,6 @@ namespace BuildXL
                     ServerDeployment.KillServer(ServerDeployment.ComputeDeploymentDir(lightConfig.ServerDeploymentDirectory));
                     Console.WriteLine(Strings.App_ServerKilled);
                     return ExitCode.FromExitKind(ExitKind.BuildNotRequested);
-                case ServerMode.Reset:
-                    ServerDeployment.PoisonServerDeployment(lightConfig.ServerDeploymentDirectory);
-                    break;
             }
 
             ExitKind exitKind = lightConfig.Server != ServerMode.Disabled
@@ -146,7 +143,7 @@ namespace BuildXL
                     return ExitKind.InvalidCommandLine;
                 }
 
-                string clientPath = Environment.GetCommandLineArgs()[0];
+                string clientPath = AssemblyHelper.GetThisProgramExeLocation();
                 var rawArgsWithExe = new List<string>(rawArgs.Count + 1) { clientPath };
                 rawArgsWithExe.AddRange(rawArgs);
 
@@ -190,7 +187,7 @@ namespace BuildXL
                 {
                     try
                     {
-                        return connection.RunWithArgs(rawArgs, environmentVariablesToPass, serverModeStatusAndPerf);
+                        return connection.RunWithArgs(rawArgs, environmentVariablesToPass, serverModeStatusAndPerf, lightConfig.ServerDeploymentDirectory);
                     }
                     catch (BuildXLException ex)
                     {

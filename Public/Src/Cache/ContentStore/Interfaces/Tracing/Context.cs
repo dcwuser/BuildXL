@@ -13,11 +13,6 @@ namespace BuildXL.Cache.ContentStore.Interfaces.Tracing
     public class Context
     {
         /// <summary>
-        ///     Marks session names that contain build ID.
-        /// </summary>
-        public const string BuildIdPrefix = "BID";
-
-        /// <summary>
         ///     Initializes a new instance of the <see cref="Context"/> class.
         /// </summary>
         /// <param name="logger">
@@ -147,7 +142,7 @@ namespace BuildXL.Cache.ContentStore.Interfaces.Tracing
 
             if (Logger is IOperationLogger operationLogger)
             {
-                var operationResult = new OperationResult(message, operationName, componentName, statusFromResult(result), duration, kind, result.Exception);
+                var operationResult = new OperationResult(message, operationName, componentName, statusFromResult(result), duration, kind, result.Exception, Id, severity);
                 operationLogger.OperationFinished(operationResult);
             }
 
@@ -161,7 +156,7 @@ namespace BuildXL.Cache.ContentStore.Interfaces.Tracing
                 {
                     return OperationStatus.Cancelled;
                 }
-                else if (resultBase.HasException)
+                else if (!resultBase.Succeeded)
                 {
                     return OperationStatus.Failure;
                 }

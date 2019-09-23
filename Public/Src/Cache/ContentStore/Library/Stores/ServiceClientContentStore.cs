@@ -3,6 +3,7 @@
 
 using System.Diagnostics.ContractsLight;
 using System.Threading.Tasks;
+using BuildXL.Cache.ContentStore.Hashing;
 using BuildXL.Cache.ContentStore.Interfaces.FileSystem;
 using BuildXL.Cache.ContentStore.Interfaces.Logging;
 using BuildXL.Cache.ContentStore.Interfaces.Results;
@@ -37,12 +38,12 @@ namespace BuildXL.Cache.ContentStore.Stores
         /// <summary>
         ///     Execution tracer.
         /// </summary>
-        protected readonly ContentStoreTracer ExecutionTracer = new ContentStoreTracer(nameof(ServiceClientContentStore));
+        protected virtual ContentStoreTracer ExecutionTracer { get; } = new ContentStoreTracer(nameof(ServiceClientContentStore));
 
         /// <summary>
         /// Execution tracer for the session.
         /// </summary>
-        protected readonly ServiceClientContentSessionTracer SessionTracer = new ServiceClientContentSessionTracer(nameof(ServiceClientContentSession));
+        protected virtual ServiceClientContentSessionTracer SessionTracer { get; } = new ServiceClientContentSessionTracer(nameof(ServiceClientContentSession));
 
         /// <summary>
         ///     The filesystem to use for temporary files.
@@ -241,5 +242,14 @@ namespace BuildXL.Cache.ContentStore.Stores
                    return new GetStatsResult(aggregatedCounters);
                });
         }
+
+        /// <inheritdoc />
+        public Task<DeleteResult> DeleteAsync(Context context, ContentHash contentHash)
+        {
+            throw new System.NotImplementedException();
+        }
+
+        /// <inheritdoc />
+        public void PostInitializationCompleted(Context context, BoolResult result) { }
     }
 }

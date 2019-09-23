@@ -5,16 +5,12 @@ using System;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Diagnostics.ContractsLight;
+using System.Diagnostics.Tracing;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Security;
 using System.Text;
 using System.Threading.Tasks;
-#if FEATURE_MICROSOFT_DIAGNOSTICS_TRACING
-using Microsoft.Diagnostics.Tracing;
-#else
-using System.Diagnostics.Tracing;
-#endif
 
 #pragma warning disable SA1139 // Use literal suffix notation instead of casting
 
@@ -279,7 +275,8 @@ namespace BuildXL.Utilities
 
             if (ex is FileLoadException ||
                 (ex is FileNotFoundException && ex.Message.Contains(Strings.ExceptionUtilities_MissingDependencyPattern)) ||
-                ex is DllNotFoundException)
+                ex is DllNotFoundException ||
+                ex is TypeLoadException)
             {
                 return ExceptionRootCause.MissingRuntimeDependency;
             }
@@ -363,8 +360,7 @@ namespace BuildXL.Utilities
             Exception innermostException = exception.GetBaseException();
             innermostException = innermostException ?? exception;
 
-            var win32Exception = innermostException as Win32Exception;
-            if (win32Exception != null)
+            if (innermostException is Win32Exception win32Exception)
             {
                 return win32Exception.NativeErrorCode;
             }
@@ -380,8 +376,7 @@ namespace BuildXL.Utilities
             int exHResult = exception.HResult;
             if (exHResult == E_FAIL)
             {
-                var win32Exception = exception as Win32Exception;
-                if (win32Exception != null)
+                if (exception is Win32Exception win32Exception)
                 {
                     exHResult = HResultFromWin32(win32Exception.NativeErrorCode);
                 }
@@ -401,6 +396,22 @@ namespace BuildXL.Utilities
             }
 
             return unchecked((int)0x80070000) | nativeErrorCode;
+        }
+
+        /// <summary>
+        /// Converts HResult back to a Win32 error code.
+        /// </summary>
+        public static int Win32ErrorCodeFromHResult(int hResult)
+        {
+            return (int)unchecked((uint)hResult & (~0x80070000));
+        }
+
+        /// <summary>
+        /// Returns native error code from an exception.
+        /// </summary>
+        public static int NativeErrorCode(this Exception e)
+        {
+            return Win32ErrorCodeFromHResult(e.HResult);
         }
 
         /// <summary>

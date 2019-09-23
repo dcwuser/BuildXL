@@ -1,8 +1,9 @@
 // Copyright (c) Microsoft. All rights reserved.
 // Licensed under the MIT license. See LICENSE file in the project root for full license information.
 
+extern alias Async;
+
 using System;
-using System.Collections.Generic;
 using System.Diagnostics.CodeAnalysis;
 using System.Diagnostics.ContractsLight;
 using System.Linq;
@@ -45,6 +46,7 @@ namespace BuildXL.Cache.MemoizationStore.Vsts
         private readonly int _maxFingerprintsPerIncorporateRequest;
         private readonly BuildCacheCacheTracer _tracer;
         private ContentHashListAdapterFactory _contentHashListAdapterFactory;
+        private readonly bool _overrideUnixFileAccessMode;
 
         private bool _disposed;
 
@@ -57,6 +59,8 @@ namespace BuildXL.Cache.MemoizationStore.Vsts
         /// <param name="backingContentStoreHttpClientFactory">Factory for creating a backing store http client.</param>
         /// <param name="maxFingerprintSelectorsToFetch">Maximum number of selectors to enumerate.</param>
         /// <param name="timeToKeepUnreferencedContent">Initial time-to-live for unreferenced content.</param>
+        /// <param name="pinInlineThreshold">Maximum time-to-live to inline pin calls.</param>
+        /// <param name="ignorePinThreshold">Minimum time-to-live to ignore pin calls.</param>
         /// <param name="minimumTimeToKeepContentHashLists">Minimum time-to-live for created or referenced ContentHashLists.</param>
         /// <param name="rangeOfTimeToKeepContentHashLists">Range of time beyond the minimum for the time-to-live of created or referenced ContentHashLists.</param>
         /// <param name="logger">A logger for tracing.</param>
@@ -68,6 +72,7 @@ namespace BuildXL.Cache.MemoizationStore.Vsts
         /// <param name="useBlobContentHashLists">use blob based content hash lists.</param>
         /// <param name="downloadBlobsThroughBlobStore">If true, gets blobs through BlobStore. If false, gets blobs from the Azure Uri.</param>
         /// <param name="useDedupStore">If true, gets content through DedupStore. If false, gets content from BlobStore.</param>
+        /// <param name="overrideUnixFileAccessMode">If true, overrides default Unix file access modes.</param>
         public BuildCacheCache(
             IAbsFileSystem fileSystem,
             string cacheNamespace,
@@ -75,6 +80,8 @@ namespace BuildXL.Cache.MemoizationStore.Vsts
             IArtifactHttpClientFactory backingContentStoreHttpClientFactory,
             int maxFingerprintSelectorsToFetch,
             TimeSpan timeToKeepUnreferencedContent,
+            TimeSpan pinInlineThreshold,
+            TimeSpan ignorePinThreshold,
             TimeSpan minimumTimeToKeepContentHashLists,
             TimeSpan rangeOfTimeToKeepContentHashLists,
             ILogger logger,
@@ -85,7 +92,8 @@ namespace BuildXL.Cache.MemoizationStore.Vsts
             bool sealUnbackedContentHashLists = false,
             bool useBlobContentHashLists = false,
             bool downloadBlobsThroughBlobStore = false,
-            bool useDedupStore = false)
+            bool useDedupStore = false,
+            bool overrideUnixFileAccessMode = false)
         {
             Contract.Requires(fileSystem != null);
             Contract.Requires(buildCacheHttpClientFactory != null);
@@ -95,9 +103,9 @@ namespace BuildXL.Cache.MemoizationStore.Vsts
             _cacheNamespace = cacheNamespace;
             _buildCacheHttpClientFactory = buildCacheHttpClientFactory;
             _tracer = new BuildCacheCacheTracer(logger, nameof(BuildCacheCache));
-            
+
             _backingContentStore = new BackingContentStore(
-                fileSystem, backingContentStoreHttpClientFactory, timeToKeepUnreferencedContent, _tracer.ContentSessionTracer, downloadBlobsThroughBlobStore, useDedupStore);
+                fileSystem, backingContentStoreHttpClientFactory, timeToKeepUnreferencedContent, pinInlineThreshold, ignorePinThreshold, downloadBlobsThroughBlobStore, useDedupStore);
 
             if (useDedupStore)
             {
@@ -126,6 +134,7 @@ namespace BuildXL.Cache.MemoizationStore.Vsts
             _fingerprintIncorporationEnabled = fingerprintIncorporationEnabled;
             _maxDegreeOfParallelismForIncorporateRequests = maxDegreeOfParallelismForIncorporateRequests;
             _maxFingerprintsPerIncorporateRequest = maxFingerprintsPerIncorporateRequest;
+            _overrideUnixFileAccessMode = overrideUnixFileAccessMode;
         }
 
         /// <inheritdoc />
@@ -317,6 +326,7 @@ namespace BuildXL.Cache.MemoizationStore.Vsts
                         _maxFingerprintsPerIncorporateRequest,
                         writeThroughContentSession,
                         _sealUnbackedContentHashLists,
+                        _overrideUnixFileAccessMode,
                         _tracer));
             });
         }
@@ -362,6 +372,7 @@ namespace BuildXL.Cache.MemoizationStore.Vsts
                         _maxFingerprintsPerIncorporateRequest,
                         writeThroughContentSession,
                         _sealUnbackedContentHashLists,
+                        _overrideUnixFileAccessMode,
                         _tracer));
             });
         }
@@ -383,10 +394,18 @@ namespace BuildXL.Cache.MemoizationStore.Vsts
                 aggregateStats.Merge(cachestats);
                 if (_writeThroughContentStore != null)
                 {
-                    GetStatsResult writeThrouStoreStats = await _writeThroughContentStore.GetStatsAsync(context);
-                    if (writeThrouStoreStats.Succeeded)
+                    var writeThroughStoreStats = await _writeThroughContentStore.GetStatsAsync(context);
+                    if (writeThroughStoreStats.Succeeded)
                     {
-                        aggregateStats.Merge(writeThrouStoreStats.CounterSet, "WriteThroughStore.");
+                        aggregateStats.Merge(writeThroughStoreStats.CounterSet, "WriteThroughStore.");
+                    }
+                }
+                if (_backingContentStore != null)
+                {
+                    var backingContentStoreStats = await _backingContentStore.GetStatsAsync(context);
+                    if (backingContentStoreStats.Succeeded)
+                    {
+                        aggregateStats.Merge(backingContentStoreStats.CounterSet, "BackingContentStore.");
                     }
                 }
 
@@ -402,7 +421,7 @@ namespace BuildXL.Cache.MemoizationStore.Vsts
         public Guid Id { get; private set; }
 
         /// <inheritdoc />
-        public IAsyncEnumerable<StructResult<StrongFingerprint>> EnumerateStrongFingerprints(Context context)
+        public Async::System.Collections.Generic.IAsyncEnumerable<StructResult<StrongFingerprint>> EnumerateStrongFingerprints(Context context)
         {
             return AsyncEnumerable.Empty<StructResult<StrongFingerprint>>();
         }

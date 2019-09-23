@@ -37,7 +37,7 @@ namespace BuildXL.FrontEnd.Sdk
 
         /// <nodoc/>
         protected readonly PathTable m_pathTable;
-        
+
 
         /// <summary>
         /// Mount names defined in the configuration (populated during construction).
@@ -87,7 +87,7 @@ namespace BuildXL.FrontEnd.Sdk
             }
 
             stream =  m_fileSystem.OpenText(AbsolutePath.Create(m_pathTable, physicalPath)).BaseStream;
-            
+
             return true;
         }
 
@@ -98,7 +98,10 @@ namespace BuildXL.FrontEnd.Sdk
             if (TryGetFrontEndFile(path, "dummyFrontEnd", out stream))
             {
                 var result = await FileContent.ReadFromAsync(stream);
+#pragma warning disable AsyncFixer02
                 stream?.Dispose();
+#pragma warning restore AsyncFixer02
+
                 return result;
             }
 
@@ -222,7 +225,7 @@ namespace BuildXL.FrontEnd.Sdk
         }
 
         /// <inheritdoc />
-        public override async Task<ContentHash> GetFileContentHashAsync(string path, bool trackFile = true)
+        public override async Task<ContentHash> GetFileContentHashAsync(string path, bool trackFile = true, HashType hashType = HashType.Unknown)
         {
             using (
                 var fs = FileUtilities.CreateFileStream(
@@ -232,7 +235,7 @@ namespace BuildXL.FrontEnd.Sdk
                     FileShare.Delete | FileShare.Read,
                     FileOptions.SequentialScan))
             {
-                return await ContentHashingUtilities.HashContentStreamAsync(fs);
+                return await ContentHashingUtilities.HashContentStreamAsync(fs, hashType);
             }
         }
 

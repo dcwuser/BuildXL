@@ -19,6 +19,8 @@ using Test.BuildXL.TestUtilities.Xunit;
 using Xunit;
 using Xunit.Abstractions;
 
+using ProcessesLogEventId = BuildXL.Processes.Tracing.LogEventId;
+
 namespace IntegrationTest.BuildXL.Scheduler.Containers
 {
     [Trait("Category", "WindowsOSOnly")]
@@ -31,7 +33,7 @@ namespace IntegrationTest.BuildXL.Scheduler.Containers
         /// Runs two pips under Helium that incur in a double write in a a shared opaque. Tests the interaction between the isolation level and the double write policy regarding caching and filemon violations.
         /// TODO: the case for declared outputs and exclusive opaques is not working yet since the violation is caught at graph construction time. We'd need to relax those static checks as well.
         /// </summary>
-        [TheoryIfSupported(requiresHeliumDriversAvailable: true)]
+        [TheoryIfSupported(requiresHeliumDriversAvailable: true, Skip = "AB#1599591 - Test is failing with newer OS")]
         // When all outputs are isolated and the policy allows for it, both pips get cached and the double write is just a warning
         [InlineData(ContainerIsolationLevel.IsolateAllOutputs, DoubleWritePolicy.UnsafeFirstDoubleWriteWins, true, false)]
         // When all outputs are isolated and the policy does not allow for it, the violator does not get cached and the double write is an error
@@ -85,7 +87,7 @@ namespace IntegrationTest.BuildXL.Scheduler.Containers
             if (expectViolationIsError)
             {
                 AssertErrorEventLogged(EventId.FileMonitoringError);
-                AssertErrorEventLogged(EventId.DisallowedDoubleWriteOnMerge);
+                AssertErrorEventLogged(ProcessesLogEventId.DisallowedDoubleWriteOnMerge);
             }
             else
             {

@@ -41,15 +41,14 @@ namespace Test.Ninja {
             importFrom("BuildXL.Pips").dll,
         ],
         runtimeContent: [
-            importFrom("BuildXL.Sandbox.Windows").Deployment.definition,
             {
                 subfolder: a`tools`,
                 contents: [
                     {
-                        subfolder: a`NinjaGraphBuilder`,
+                        subfolder: a`CMakeNinja`,
                         contents: [
-                        importFrom("BuildXL.Tools").NinjaGraphBuilder.exe,
-                        importFrom("BuildXL.Tools.Ninjson").pkg.contents 
+                            importFrom("BuildXL.Tools").NinjaGraphBuilder.exe,
+                            importFrom("BuildXL.Tools.Ninjson").pkg.contents 
                         ]
                     }
                 ]

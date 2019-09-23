@@ -179,6 +179,25 @@ namespace BuildXL.ToolSupport
         }
 
         /// <summary>
+        /// Parse an option that parses a key value pair and adds it to a dictionary.
+        /// </summary>
+        public static void ParsePropertyOption(Option opt, Dictionary<string, string> map)
+        {
+            Contract.Requires(map != null);
+
+            var keyValuePair = ParseKeyValuePair(opt);
+            if (!string.IsNullOrEmpty(keyValuePair.Value))
+            {
+                map[keyValuePair.Key] = keyValuePair.Value;
+            }
+            else
+            {
+                // a blank property specified after an existing one should blank it out
+                map.Remove(keyValuePair.Key);
+            }
+        }
+
+        /// <summary>
         /// Parse an option that produces a Guid.
         /// </summary>
         public static Guid ParseGuidOption(Option opt)
@@ -334,7 +353,10 @@ namespace BuildXL.ToolSupport
         /// </summary>
         public static IEnumerable<string> ParseRepeatingPathOption(Option opt, string separator) => ParseRepeatingOption(opt, separator, v => GetFullPath(v, opt));
 
-        private static string GetFullPath(string path, Option opt)
+        /// <summary>
+        /// Gets the full path for an option
+        /// </summary>
+        public static string GetFullPath(string path, Option opt)
         {
             string fullPath = null;
 

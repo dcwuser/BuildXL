@@ -1,10 +1,14 @@
 ﻿// Copyright (c) Microsoft. All rights reserved.
 // Licensed under the MIT license. See LICENSE file in the project root for full license information.
 
+using System;
 using System.Threading.Tasks;
 using BuildXL.Cache.ContentStore.Exceptions;
 using BuildXL.Cache.ContentStore.Interfaces.Results;
+using BuildXL.Cache.ContentStore.Interfaces.Stores;
 using BuildXL.Cache.ContentStore.Interfaces.Tracing;
+using BuildXL.Cache.ContentStore.Service;
+using BuildXL.Cache.ContentStore.Utils;
 using BuildXL.Cache.Host.Service.Internal;
 
 namespace BuildXL.Cache.Host.Service
@@ -26,27 +30,23 @@ namespace BuildXL.Cache.Host.Service
             var host = arguments.Host;
             var logger = arguments.Logger;
 
-            var factory = new ContentServerFactory(arguments);
+            var factory = new CacheServerFactory(arguments);
 
-            // await _lifetimeManager.StartingService();
             await host.OnStartingServiceAsync();
 
-            using (var server = factory.Create())
+            var eitherServer = factory.Create();
+            using (var server = ((StartupShutdownBase)eitherServer.cacheServer) ?? eitherServer.contentServer)
             {
                 var context = new Context(logger);
 
                 try
                 {
-                    // Removed this, because it is kind-of useless...
-                    // _serviceHealthyAction(false);
-
                     var startupResult = await server.StartupAsync(context);
                     if (!startupResult)
                     {
                         throw new CacheException(startupResult.ToString());
                     }
 
-                    // _serviceHealthyAction(true);
                     host.OnStartedService();
 
                     logger.Info("Service started");
@@ -57,16 +57,28 @@ namespace BuildXL.Cache.Host.Service
                 }
                 finally
                 {
-                    BoolResult result = await server.ShutdownAsync(context);
+                    var timeoutInMinutes = arguments?.Configuration?.DistributedContentSettings?.MaxShutdownDurationInMinutes ?? 30;
+                    BoolResult result = await ShutdownWithTimeoutAsync(context, server, TimeSpan.FromMinutes(timeoutInMinutes));
                     if (!result)
                     {
                         logger.Warning("Failed to shutdown local content server: {0}", result);
                     }
 
-                    // await _lifetimeManager.TeardownCompleted();
                     host.OnTeardownCompleted();
                 }
             }
+        }
+
+        private static async Task<BoolResult> ShutdownWithTimeoutAsync(Context context, IStartupShutdownSlim server, TimeSpan timeout)
+        {
+            var shutdownTask = server.ShutdownAsync(context);
+            if (await Task.WhenAny(shutdownTask, Task.Delay(timeout)) != shutdownTask)
+            {
+                return new BoolResult($"Server shutdown didn't finished after '{timeout}'.");
+            }
+
+            // shutdownTask is done already. Just getting the result out of it.
+            return await shutdownTask;
         }
     }
 }

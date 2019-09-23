@@ -38,6 +38,8 @@ namespace BuildXL.Cache.MemoizationStore.Vsts
                 new BackingContentStoreHttpClientFactory(new Uri(cacheConfig.CacheServiceContentEndpoint), vssCredentialsFactory, TimeSpan.FromMinutes(cacheConfig.HttpSendTimeoutMinutes), cacheConfig.UseAad),
                 cacheConfig.MaxFingerprintSelectorsToFetch,
                 TimeSpan.FromDays(cacheConfig.DaysToKeepUnreferencedContent),
+                TimeSpan.FromMinutes(cacheConfig.PinInlineThresholdMinutes),
+                TimeSpan.FromHours(cacheConfig.IgnorePinThresholdHours),
                 TimeSpan.FromDays(cacheConfig.DaysToKeepContentBags),
                 TimeSpan.FromDays(cacheConfig.RangeOfDaysToKeepContentBags),
                 logger,
@@ -48,7 +50,8 @@ namespace BuildXL.Cache.MemoizationStore.Vsts
                 cacheConfig.SealUnbackedContentHashLists,
                 cacheConfig.UseBlobContentHashLists,
                 cacheConfig.DownloadBlobsThroughBlobStore,
-                cacheConfig.UseDedupStore);
+                cacheConfig.UseDedupStore,
+                cacheConfig.OverrideUnixFileAccessMode);
         }
     }
 }

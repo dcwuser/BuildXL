@@ -11,11 +11,6 @@ using BuildXL.Utilities;
 using Test.BuildXL.TestUtilities.Xunit;
 using Xunit;
 
-[module: System.Diagnostics.CodeAnalysis.SuppressMessage("Microsoft.Performance", "CA1812:AvoidUninstantiatedInternalClasses",
-    Scope = "type",
-    Target = "BuildXL.Cache.Tests.TestCacheFactory+TestCacheFactoryConfiguration",
-    Justification = "Tool is confused - it is constructed generically")]
-
 namespace BuildXL.Cache.Tests
 {
     /// <summary>
@@ -25,6 +20,10 @@ namespace BuildXL.Cache.Tests
     /// </summary>
     public class TestCacheFactory : ICacheFactory
     {
+        /// <inheritdoc />
+        public IEnumerable<Failure> ValidateConfiguration(ICacheConfigData cacheData)
+            => CacheConfigDataValidator.ValidateConfiguration<TestCacheFactoryConfiguration>(cacheData, cacheConfig => new Failure[] { });
+
         /// <summary>
         /// TestCacheConfig implements ICacheConfigData and it is used by some tests that require an actual ICacheConfigData object instance
         /// </summary>
@@ -37,7 +36,6 @@ namespace BuildXL.Cache.Tests
         /// Since this test class implements ICacheFactory, the TestCacheFactoryConfiguration will be used to store configuration data for a generic cache
         /// that TestCacheFactory can produce.
         /// </summary>
-        [System.Diagnostics.CodeAnalysis.SuppressMessage("Microsoft.Performace", "CA1812", Justification = "Tool is confused - it is constructed")]
         private sealed class TestCacheFactoryConfiguration
         {
             /// <summary>

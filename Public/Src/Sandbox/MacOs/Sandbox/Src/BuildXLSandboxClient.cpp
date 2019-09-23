@@ -222,7 +222,7 @@ IOReturn BuildXLSandboxClient::sDebugCheck(BuildXLSandboxClient *target, void *r
 
 IOReturn BuildXLSandboxClient::sConfigure(BuildXLSandboxClient *target, void *reference, IOExternalMethodArguments *arguments)
 {
-    KextConfig *config = (KextConfig*)arguments->structureInput;
+    KextConfig *config = (KextConfig *) arguments->structureInput;
     target->sandbox_->Configure(config);
     return kIOReturnSuccess;
 }
@@ -366,8 +366,7 @@ IOReturn BuildXLSandboxClient::ProcessPipTerminated(PipStateChangedRequest *data
         proc_name(data->processId, name, sizeof(name));
         log_debug("Killing process %s(%d)", name, pid);
 #endif
-        handler.HandleProcessUntracked(pid);
-        proc_signal(pid, SIGTERM);
+        proc_signal(pid, SIGKILL);
     }
 
     return kIOReturnSuccess;

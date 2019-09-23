@@ -110,8 +110,12 @@ namespace BuildXL.Cache.BuildCacheAdapter
                 MaxDegreeOfParallelismForIncorporateRequests = MaxDegreeOfParallelismForIncorporateRequests,
                 HttpSendTimeoutMinutes = HttpSendTimeoutMinutes,
                 DownloadBlobsThroughBlobStore = DownloadBlobsThroughBlobStore,
-                UseDedupStore = UseDedupStore
-            }; 
+                UseDedupStore = UseDedupStore,
+                OverrideUnixFileAccessMode = OverrideUnixFileAccessMode,
+                ImplicitPin = ImplicitPin,
+                IgnorePinThresholdHours = IgnorePinThresholdHours,
+                PinInlineThresholdMinutes = PinInlineThresholdMinutes
+            };
         }
     }
 }

@@ -36,13 +36,7 @@ namespace BuildXL.Execution.Analyzer
                 else if (opt.Name.Equals("pip", StringComparison.OrdinalIgnoreCase) ||
                          opt.Name.Equals("p", StringComparison.OrdinalIgnoreCase))
                 {
-                    var sshAsString = ParseStringOption(opt);
-                    if (!sshAsString.StartsWith(Pip.SemiStableHashPrefix, StringComparison.OrdinalIgnoreCase))
-                    {
-                        throw Error("Invalid pip: '' {0}. Id must be a semistable hash that starts with Pip i.e.: PipC623BCE303738C69", sshAsString);
-                    }
-
-                    semiStableHash = Convert.ToInt64(sshAsString.Substring(3), 16);
+                    semiStableHash = ParseSemistableHash(opt);
                 }
                 else if (opt.Name.Equals("useOriginalPaths", StringComparison.OrdinalIgnoreCase) ||
                          opt.Name.Equals("u", StringComparison.OrdinalIgnoreCase))
@@ -91,7 +85,7 @@ namespace BuildXL.Execution.Analyzer
         private readonly Dictionary<ModuleId, string> m_moduleIdToFriendlyName = new Dictionary<ModuleId, string>();
         private readonly ConcurrentBigMap<DirectoryArtifact, IReadOnlyList<FileArtifact>> m_directoryContents = new ConcurrentBigMap<DirectoryArtifact, IReadOnlyList<FileArtifact>>();
 
-        private DominoInvocationEventData m_invocationData;
+        private BxlInvocationEventData m_invocationData;
         private readonly bool m_useOriginalPaths;
 
         public DumpPipAnalyzer(AnalysisInput input, string outputFilePath, long semiStableHash, bool useOriginalPaths, bool logProgress = false)
@@ -223,7 +217,7 @@ namespace BuildXL.Execution.Analyzer
             return 0;
         }
 
-        public override void DominoInvocation(DominoInvocationEventData data)
+        public override void BxlInvocation(BxlInvocationEventData data)
         {
             m_invocationData = data;
         }

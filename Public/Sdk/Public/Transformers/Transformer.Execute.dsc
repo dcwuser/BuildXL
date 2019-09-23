@@ -33,7 +33,7 @@ namespace Transformer {
 
         /** Grant permissions permanently, i.e., until the service pip terminates. */
         permanent
-    } 
+    }
 
     @@public
     export interface ExecuteArgumentsCommon extends ExecuteArgumentsComposible {
@@ -83,9 +83,27 @@ namespace Transformer {
 
         /** Regex that would be used to extract warnings from the output. */
         warningRegex?: string;
-        
+
         /** Regex that would be used to extract errors from the output. */
         errorRegex?: string;
+
+        /** 
+         * When false (or not set): process output is scanned for error messages line by line;
+         * 'errorRegex' is applied to each line and if ANY match is found the ENTIRE line is reported.
+         *
+         * When true: process output is scanned in chunks of up to 10000 lines; 'errorRegex' is applied to
+         * each chunk and only the matches are reported.  Furthermore, if 'errorRegex' contains a capture 
+         * group named "ErrorMessage", the value of that group is reported; otherwise, the value of the
+         * entire match is reported.
+         * 
+         *   NOTE: because this scanning is done against chunks of text (instead of the entire process output),
+         *         false negatives are possible if an error message spans across multiple chunks.  The scanning
+         *         is done in chunks because attempting to construct a single string from the entire process
+         *         output can easily lead to OutOfMemory exception.
+         * 
+         * Default: false
+         */
+        enableMultiLineErrorScanning?: boolean;
 
         /** Semaphores to acquire */
         acquireSemaphores?: SemaphoreInfo[];
@@ -180,6 +198,17 @@ namespace Transformer {
          * If a given weight is greater than or equal to # of available process slots, the process will run alone.
          */
         weight?: number;
+
+        /**
+         * The priority of this process.  Processes with a higher priority will be run first.
+         * Minimum value is 0, maximum value is 99
+         */
+        priority?: number;
+
+        /**
+         * File to write the change affected input list of the pip before it execute.
+         */
+        changeAffectedInputListWrittenFile?: Path;
     }
 
     @@public
@@ -213,6 +242,14 @@ namespace Transformer {
         hasUntrackedChildProcesses?: boolean;
         allowPreservedOutputs?: boolean;
         passThroughEnvironmentVariables?: string[];
+        
+        /** 
+         * File/directory output paths that are preserved.
+         * If the list is empty, all file and directory outputs are preserved. 
+         * If the list is not empty, only given paths are preserved and the rest is deleted
+         */
+        preserveOutputWhitelist?: (File | Directory)[];
+        incrementalTool?: boolean;
     }
 
     /**

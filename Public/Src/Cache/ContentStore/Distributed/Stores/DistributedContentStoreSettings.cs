@@ -36,17 +36,17 @@ namespace BuildXL.Cache.ContentStore.Distributed.Stores
         private static readonly List<TimeSpan> CacheCopierDefaultRetryIntervals = new List<TimeSpan>()
         {
             // retry the first 2 times quickly.
+            TimeSpan.FromMilliseconds(20),
             TimeSpan.FromMilliseconds(200),
-            TimeSpan.FromSeconds(1),
 
             // then back-off exponentially.
-            TimeSpan.FromSeconds(3),
+            TimeSpan.FromSeconds(1),
+            TimeSpan.FromSeconds(5),
             TimeSpan.FromSeconds(10),
-            TimeSpan.FromSeconds(25),
-            TimeSpan.FromSeconds(60),
+            TimeSpan.FromSeconds(30),
 
             // Borrowed from Empirical CacheV2 determined to be appropriate for general remote server restarts.
-            TimeSpan.FromSeconds(90),
+            TimeSpan.FromSeconds(60),
             TimeSpan.FromSeconds(120),
         };
 
@@ -126,20 +126,34 @@ namespace BuildXL.Cache.ContentStore.Distributed.Stores
         public int MaxConcurrentCopyOperations { get; set; } = 512;
 
         /// <summary>
+        /// Maximum number of concurrent proactive copies.
+        /// </summary>
+        public int MaxConcurrentProactiveCopyOperations { get; set; } = 512;
+
+        /// <summary>
         /// Maximum number of files to copy locally in parallel for a given operation
         /// </summary>
         public int ParallelCopyFilesLimit { get; set; } = DefaultParallelCopyFilesLimit;
 
-        private IReadOnlyList<TimeSpan> _retryIntervalForCopies = CacheCopierDefaultRetryIntervals;
-
         /// <summary>
         /// Delays for retries for file copies
         /// </summary>
-        public IReadOnlyList<TimeSpan> RetryIntervalForCopies
-        {
-            get => _retryIntervalForCopies ?? CacheCopierDefaultRetryIntervals;
-            set => _retryIntervalForCopies = value;
-        }
+        public IReadOnlyList<TimeSpan> RetryIntervalForCopies { get; set; } = CacheCopierDefaultRetryIntervals;
+
+        /// <summary>
+        /// The mode in which proactive copy should run
+        /// </summary>
+        public ProactiveCopyMode ProactiveCopyMode { get; set; } = ProactiveCopyMode.Disabled;
+
+        /// <summary>
+        /// Maximum number of locations which should trigger a proactive copy.
+        /// </summary>
+        public int ProactiveCopyLocationsThreshold { get; set; } = 1;
+
+        /// <summary>
+        /// Time before a proactive copy times out.
+        /// </summary>
+        public TimeSpan TimeoutForProactiveCopies { get; set; } = TimeSpan.FromMinutes(15);
 
         /// <summary>
         /// Defines pinning behavior
@@ -148,5 +162,15 @@ namespace BuildXL.Cache.ContentStore.Distributed.Stores
 
         /// <nodoc />
         public static DistributedContentStoreSettings DefaultSettings { get; } = new DistributedContentStoreSettings();
+
+        /// <summary>
+        /// Maximum number of PutFile operations that can happen concurrently.
+        /// </summary>
+        public int MaximumConcurrentPutFileOperations { get; set; } = 512;
+
+        /// <summary>
+        /// Name of the blob with the snapshot of the content placement predictions.
+        /// </summary>
+        public string ContentPlacementPredictionsBlob { get; set; } // Can be null.
     }
 }

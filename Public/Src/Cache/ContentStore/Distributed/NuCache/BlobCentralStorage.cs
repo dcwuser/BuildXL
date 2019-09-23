@@ -7,7 +7,6 @@ using System.IO;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
-using BuildXL.Cache.ContentStore.Distributed.Utilities;
 using BuildXL.Cache.ContentStore.Extensions;
 using BuildXL.Cache.ContentStore.FileSystem;
 using BuildXL.Cache.ContentStore.Interfaces.FileSystem;
@@ -16,6 +15,8 @@ using BuildXL.Cache.ContentStore.Tracing;
 using BuildXL.Utilities.Tasks;
 using Microsoft.WindowsAzure.Storage;
 using Microsoft.WindowsAzure.Storage.Blob;
+using static BuildXL.Cache.ContentStore.Utils.DateTimeUtilities;
+using DateTimeUtilities = BuildXL.Cache.ContentStore.Utils.DateTimeUtilities;
 using OperationContext = BuildXL.Cache.ContentStore.Tracing.Internal.OperationContext;
 
 namespace BuildXL.Cache.ContentStore.Distributed.NuCache
@@ -41,22 +42,18 @@ namespace BuildXL.Cache.ContentStore.Distributed.NuCache
         /// <nodoc />
         public BlobCentralStorage(BlobCentralStoreConfiguration configuration)
         {
-            Contract.Requires(configuration.ConnectionStrings.Count != 0);
-
             _configuration = configuration;
 
-            _containers = _configuration.ConnectionStrings.Select(
-                (connectionString, index) =>
+            _containers = _configuration.Credentials.Select(
+                (credentials, index) =>
                 {
-                    var storage = CloudStorageAccount.Parse(connectionString);
-                    var blobClient = storage.CreateCloudBlobClient();
-                    return (blobClient.GetContainerReference(configuration.ContainerName), shardId: index);
+                    Contract.Requires(credentials != null);
+                    var cloudBlobClient = credentials.CreateCloudBlobClient();
+                    return (cloudBlobClient.GetContainerReference(configuration.ContainerName), shardId: index);
                 }).ToArray();
-
-            // Need to shuffle all the connection strings to reduce the traffic over the storage accounts.
             _containers.Shuffle();
 
-            _containersCreated = new bool[_configuration.ConnectionStrings.Count];
+            _containersCreated = new bool[_configuration.Credentials.Count];
         }
 
         /// <inheritdoc />
@@ -132,7 +129,7 @@ namespace BuildXL.Cache.ContentStore.Distributed.NuCache
                     Tracer.Debug(context, $@"Downloading blob '{_configuration.ContainerName}\{blobName}' failed with recoverable exception: {e}.");
                 }
 
-                return AttemptResult.FromException(isRecoverable, e);
+                return AttemptResult.FromException(isRecoverable, e, context.Token);
             }
         }
 
@@ -369,7 +366,11 @@ namespace BuildXL.Cache.ContentStore.Distributed.NuCache
             public static AttemptResult SuccessResult { get; } = new AttemptResult();
             public static AttemptResult FromResult(ResultBase other) => other.Succeeded ? SuccessResult : new AttemptResult(other);
             public static AttemptResult RecoverableError(string errorMessage) => new AttemptResult(canRetry: true, errorMessage: errorMessage);
-            public static AttemptResult FromException(bool isRecoverable, Exception exception) => new AttemptResult(isRecoverable, exception);
+            public static AttemptResult FromException(bool isRecoverable, Exception exception, CancellationToken contextToken) =>
+                new AttemptResult(isRecoverable, exception)
+                {
+                    IsCancelled = contextToken.IsCancellationRequested && NonCriticalForCancellation(exception)
+                };
         }
     }
 }

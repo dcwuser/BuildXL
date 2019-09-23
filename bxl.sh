@@ -32,7 +32,7 @@ function getLkg() {
     fi
 
     local BUILDXL_LKG_VERSION=$(grep "BUILDXL_LKG_VERSION" "$MY_DIR/Shared/Scripts/$LKG_FILE" | cut -d= -f2 | tr -d '\r')
-    local BUILDXL_LKG_NAME=$(grep "BUILDXL_LKG_NAME" "$MY_DIR/Shared/Scripts/$LKG_FILE" | cut -d= -f2 | perl -pe 's/net472/osx-x64/g' | tr -d '\r')
+    local BUILDXL_LKG_NAME=$(grep "BUILDXL_LKG_NAME" "$MY_DIR/Shared/Scripts/$LKG_FILE" | cut -d= -f2 | perl -pe 's/(net472|win-x64)/osx-x64/g' | tr -d '\r')
     local BUILDXL_LKG_FEED_1=$(grep "BUILDXL_LKG_FEED_1" "$MY_DIR/Shared/Scripts/$LKG_FILE" | cut -d= -f2 | tr -d '\r')
 
     print_info "Nuget Feed: $BUILDXL_LKG_FEED_1"
@@ -48,7 +48,17 @@ function setMinimal() {
 }
 
 function setInternal() {
-    arg_Positional+=(/sandboxKind:macOsKext "/p:[Sdk.BuildXL]microsoftInternal=1")
+    arg_Positional+=("/p:[Sdk.BuildXL]microsoftInternal=1")
+    
+    for arg in "$@" 
+    do
+        to_lower=`printf '%s\n' "$arg" | awk '{ print tolower($0) }'`
+        if [[ " $to_lower " == *"endpointsecurity"* ]]; then
+            return
+        fi
+    done
+    
+    arg_Positional+=(/sandboxKind:macOsKext)
 }
 
 function compileWithBxl() {
@@ -123,7 +133,7 @@ if [[ -n "$arg_DeployDev" || -n "$arg_Minimal" ]]; then
 fi
 
 if [[ -n "$arg_Internal" ]]; then
-    setInternal
+    setInternal $@
 fi
 
 if [[ -n "$arg_UseDev" ]]; then

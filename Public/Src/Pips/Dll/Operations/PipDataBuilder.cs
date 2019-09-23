@@ -6,6 +6,7 @@ using System.Collections.Generic;
 using System.Diagnostics.ContractsLight;
 using BuildXL.Ipc.Interfaces;
 using BuildXL.Utilities;
+using BuildXL.Utilities.Collections;
 
 namespace BuildXL.Pips.Operations
 {
@@ -35,6 +36,16 @@ namespace BuildXL.Pips.Operations
     /// VsoHashEntry2RewriteCount | <see cref="FileArtifact.RewriteCount"/>      | Second entry of a <see cref="PipFragmentType.VsoHash"/> fragment.
     ///                           |                                              | Its data holds the <see cref="FileArtifact.RewriteCount"/> property.
     /// --------------------------|----------------------------------------------|----------------------------------------------
+    /// FileId1Path               | <see cref="AbsolutePath.RawValue"/>          | First entry of a <see cref="PipFragmentType.FileId"/> fragment.
+    ///                           |                                              | Its data corresponds to the <see cref="FileArtifact.Path"/> property.
+    /// --------------------------|----------------------------------------------|----------------------------------------------
+    /// FileId2RewriteCount       | <see cref="FileArtifact.RewriteCount"/>      | Second entry of a <see cref="PipFragmentType.FileId"/> fragment.
+    ///                           |                                              | Its data holds the <see cref="FileArtifact.RewriteCount"/> property.
+    /// --------------------------|----------------------------------------------|----------------------------------------------
+    /// DirectoryIdHeaderSealId   | <see cref="DirectoryArtifact.PartialSealId"/>| First entry of a <see cref="PipFragmentType.DirectoryId"/> fragment.
+    ///                           |                                              | Its data corresponds to the <see cref="DirectoryArtifact.PartialSealId"/> property and is
+    ///                           |                                              | followed by a <see cref="PipDataEntryType.AbsolutePath"/> entry representing <see cref="DirectoryArtifact.Path"/>
+    /// --------------------------|----------------------------------------------|----------------------------------------------
     /// NestedDataHeader          | <see cref="StringId.Value"/>                 | Represents the start of a nested pip data.
     ///                           |                                              | Data represents separator between fragments of
     ///                           |                                              | nested pip data. The next entry should be a
@@ -45,10 +56,10 @@ namespace BuildXL.Pips.Operations
     ///                           |                                              | fragments of the nested data entry. This is
     ///                           |                                              | essential a pointer to the last entry.
     /// --------------------------|----------------------------------------------|----------------------------------------------
-    /// NestedDataStart           | <see cref="int"/>                          | Data is number entries in nested pip data excluding header.
+    /// NestedDataStart           | <see cref="int"/>                            | Data is number entries in nested pip data excluding header.
     ///                           |                                              | The nested data end entry is located at (NestedDataStartIndex + Data - 1).
     /// --------------------------|----------------------------------------------|----------------------------------------------
-    /// NestedDataEnd             | <see cref="int"/>                          | Data is number of fragments in nested pip data excluding header).
+    /// NestedDataEnd             | <see cref="int"/>                            | Data is number of fragments in nested pip data excluding header).
     /// --------------------------|----------------------------------------------|----------------------------------------------
     /// </remarks>
     public sealed class PipDataBuilder
@@ -128,33 +139,40 @@ namespace BuildXL.Pips.Operations
 
             // Add 2 for start and end entries
             var entryLength = m_entries.Count - startIndexOfFirstFragment + 2;
+            var entriesBinarySegment = WriteEntries(GetEntries(), entryLength, ref m_entriesBinaryStringBuffer);
 
-            var entryBytesLength = entryLength * PipDataEntry.BinarySize;
+            // NOTE: The raw value is added to string table backing byte buffers without being converted to a CLR string object
+            var pipDataId = StringTable.AddString(entriesBinarySegment);
 
-            var newLength = m_entriesBinaryStringBuffer.Length;
+            return PipData.CreateInternal(
+                PipDataEntry.CreateNestedDataHeader(escaping, separator),
+                new PipDataEntryList(StringTable.GetBytes(pipDataId)),
+                pipDataId);
 
-            // Increase the size of the array if needed
-            while (newLength < entryBytesLength)
+            IEnumerable<PipDataEntry> GetEntries()
             {
-                newLength *= 2;
-            }
+                yield return PipDataEntry.CreateNestedDataStart(entryLength);
 
-            Array.Resize(ref m_entriesBinaryStringBuffer, newLength);
+                for(int i = startIndexOfFirstFragment; i < m_entries.Count; i++)
+                {
+                    yield return m_entries[i];
+                }
+
+                var fragmentCount = m_currentPipDataCountInfo.FragmentCount - startMarker.PrecedingFragmentCount;
+                yield return PipDataEntry.CreateNestedDataEnd(fragmentCount);
+            }
+        }
+
+        internal static BinaryStringSegment WriteEntries(IEnumerable<PipDataEntry> entries, int entryLength, ref byte[] buffer)
+        {
+            var entryBytesLength = entryLength * PipDataEntry.BinarySize;
+            CollectionUtilities.GrowArrayIfNecessary(ref buffer, entryBytesLength);
 
             int byteIndex = 0;
-
-            // Write start entry to buffer
-            PipDataEntry.CreateNestedDataStart(entryLength).Write(m_entriesBinaryStringBuffer, ref byteIndex);
-
-            // Write entries to buffer
-            for (int i = startIndexOfFirstFragment; i < m_entries.Count; i++)
+            foreach (var entry in entries)
             {
-                m_entries[i].Write(m_entriesBinaryStringBuffer, ref byteIndex);
+                entry.Write(buffer, ref byteIndex);
             }
-
-            // Write end entry to buffer
-            var fragmentCount = m_currentPipDataCountInfo.FragmentCount - startMarker.PrecedingFragmentCount;
-            PipDataEntry.CreateNestedDataEnd(fragmentCount).Write(m_entriesBinaryStringBuffer, ref byteIndex);
 
             Contract.Assert(byteIndex == entryBytesLength);
             if ((byteIndex % 2) != 0)
@@ -164,14 +182,7 @@ namespace BuildXL.Pips.Operations
             }
 
             // Convert the bytes to a binary string segment (i.e. represent raw entry bytes as UTF-16 string)
-            // and add to string table directly.
-            // NOTE: The raw value is added to string table backing byte buffers without being converted to a CLR string object
-            var pipDataId = StringTable.AddString(new BinaryStringSegment(m_entriesBinaryStringBuffer, 0, byteIndex, isAscii: false));
-
-            return PipData.CreateInternal(
-                PipDataEntry.CreateNestedDataHeader(escaping, separator),
-                new PipDataEntryList(StringTable.GetBytes(pipDataId)),
-                pipDataId);
+            return new BinaryStringSegment(buffer, 0, byteIndex, isAscii: false);
         }
 
         /// <summary>
@@ -244,6 +255,36 @@ namespace BuildXL.Pips.Operations
             PipDataEntry entry1;
             PipDataEntry entry2;
             PipDataEntry.CreateVsoHashEntry(file, out entry1, out entry2);
+            m_entries.Add(entry1);
+            m_entries.Add(entry2);
+        }
+
+        /// <summary>
+        /// Adds a file id of a file to the pip data.
+        /// </summary>
+        public void AddFileId(FileArtifact file)
+        {
+            Contract.Requires(file.IsValid);
+
+            m_currentPipDataCountInfo.FragmentCount++;
+            PipDataEntry entry1;
+            PipDataEntry entry2;
+            PipDataEntry.CreateFileIdEntry(file, out entry1, out entry2);
+            m_entries.Add(entry1);
+            m_entries.Add(entry2);
+        }
+
+        /// <summary>
+        /// Adds a file id of a file to the pip data.
+        /// </summary>
+        public void AddDirectoryId(DirectoryArtifact directory)
+        {
+            Contract.Requires(directory.IsValid);
+
+            m_currentPipDataCountInfo.FragmentCount++;
+            PipDataEntry entry1;
+            PipDataEntry entry2;
+            PipDataEntry.CreateDirectoryIdEntries(directory, out entry1, out entry2);
             m_entries.Add(entry1);
             m_entries.Add(entry2);
         }

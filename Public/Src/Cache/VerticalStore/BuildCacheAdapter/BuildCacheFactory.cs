@@ -2,6 +2,7 @@
 // Licensed under the MIT license. See LICENSE file in the project root for full license information.
 
 using System;
+using System.Collections.Generic;
 using System.ComponentModel;
 using System.Diagnostics.ContractsLight;
 using System.Threading.Tasks;
@@ -10,10 +11,6 @@ using BuildXL.Cache.MemoizationStoreAdapter;
 using BuildXL.Utilities;
 using AbsolutePath = BuildXL.Cache.ContentStore.Interfaces.FileSystem.AbsolutePath;
 
-[module: System.Diagnostics.CodeAnalysis.SuppressMessage("Microsoft.Performance", "CA1812:AvoidUninstantiatedInternalClasses",
-    Scope = "type",
-    Target = "BuildXL.Cache.BuildCacheAdapter.BuildCacheFactory+Config",
-    Justification = "Tool is confused - it is constructed generically")]
 namespace BuildXL.Cache.BuildCacheAdapter
 {
     /// <summary>
@@ -50,8 +47,11 @@ namespace BuildXL.Cache.BuildCacheAdapter
         //     "MaxFingerprintsPerIncorporateRequest":{22},
         //     "HttpSendTimeoutMinutes":{23},
         //     "LogFlushIntervalSeconds":{24}
-        //     "DownloadBlobsThroughBlobStore":{25}  
-        //     "UseDedupStore":{26}   
+        //     "DownloadBlobsThroughBlobStore":{25}
+        //     "UseDedupStore":{26}
+        //     "OverrideUnixFileAccessMode":{27}
+        //     "DefaultPinInlineThresholdMinutes":{28}
+        //     "DefaultIgnorePinThresholdHours":{29}
         // }
         private sealed class Config : BuildCacheCacheConfig
         {
@@ -99,6 +99,29 @@ namespace BuildXL.Cache.BuildCacheAdapter
             {
                 return new CacheConstructionFailure(cacheConfig.CacheId, e);
             }
+        }
+
+        /// <inheritdoc />
+        public IEnumerable<Failure> ValidateConfiguration(ICacheConfigData cacheData)
+        {
+            return CacheConfigDataValidator.ValidateConfiguration<Config>(cacheData, cacheConfig =>
+            {
+                var failures = new List<Failure>();
+                failures.AddFailureIfNullOrWhitespace(cacheConfig.CacheLogPath, nameof(cacheConfig.CacheLogPath));
+                failures.AddFailureIfNullOrWhitespace(cacheConfig.CacheId, nameof(cacheConfig.CacheId));
+
+                if (!Uri.IsWellFormedUriString(cacheConfig.CacheServiceContentEndpoint, UriKind.Absolute))
+                {
+                    failures.Add(new IncorrectJsonConfigDataFailure($"{nameof(cacheConfig.CacheServiceContentEndpoint)}=[{cacheConfig.CacheServiceContentEndpoint}] is not a valid Uri."));
+                }
+
+                if (!Uri.IsWellFormedUriString(cacheConfig.CacheServiceFingerprintEndpoint, UriKind.Absolute))
+                {
+                    failures.Add(new IncorrectJsonConfigDataFailure($"{nameof(cacheConfig.CacheServiceFingerprintEndpoint)}=[{cacheConfig.CacheServiceFingerprintEndpoint}] is not a valid Uri."));
+                }
+
+                return failures;
+            });
         }
     }
 }
